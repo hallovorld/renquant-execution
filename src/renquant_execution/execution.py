@@ -53,9 +53,10 @@ class ValidateOrderIntentsTask(Task):
         if not ctx.broker_name:
             raise ValueError("broker_name is required")
         for idx, intent in enumerate(ctx.order_intents):
-            for key in ("ticker", "action"):
-                if not intent.get(key):
-                    raise ValueError(f"order_intents[{idx}] missing {key}")
+            try:
+                normalize_order_intent(intent)
+            except ValueError as exc:
+                raise ValueError(f"order_intents[{idx}] {exc}") from exc
         return True
 
 

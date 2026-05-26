@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["renquant-common>=0.1.0"]
 
+[project.optional-dependencies]
+alpaca = ["alpaca-py>=0.30"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

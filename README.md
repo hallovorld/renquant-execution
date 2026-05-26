@@ -17,6 +17,10 @@ This repo owns broker adapters, order submission/cancel/reconcile workflows,
 execution audit, and notifications. It consumes order intents from
 `renquant-pipeline`; it does not train models or decide alpha.
 
+Broker SDKs are optional imports. `paper` and `alpaca-shadow` modes must be
+importable without live broker credentials; live `alpaca` mode requires
+`RENQUANT_EXPECTED_LIVE_ACCOUNT` before connect.
+
 ## Pipeline Rule
 
 Execution workflows are `renquant-common` Task/Job/Pipeline chains.

@@ -62,16 +62,18 @@ class BaseBroker(ABC):
 def normalize_order_intent(intent: dict[str, Any]) -> dict[str, Any]:
     """Normalize a pipeline order intent into broker-facing fields."""
     symbol = intent.get("symbol") or intent.get("ticker")
-    action = str(intent.get("action", "")).upper()
+    raw_action = intent.get("action")
     quantity = intent.get("quantity", intent.get("qty"))
     if not symbol:
         raise ValueError("order intent missing symbol/ticker")
+    if raw_action is None or str(raw_action).strip() == "":
+        raise ValueError("order intent missing action")
+    action = str(raw_action).upper()
     if action not in {"BUY", "SELL"}:
-        raise ValueError(f"order intent has unsupported action: {intent.get('action')!r}")
+        raise ValueError(f"order intent has unsupported action: {raw_action!r}")
     if quantity is None:
         raise ValueError("order intent missing quantity/qty")
     quantity_f = float(quantity)
     if quantity_f <= 0:
         raise ValueError(f"order intent quantity must be positive: {quantity!r}")
     return {"symbol": str(symbol), "action": action, "quantity": quantity_f}
-
