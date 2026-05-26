@@ -1,0 +1,36 @@
+schema_version: 1
+name: renquant-execution
+role: broker execution and order audit pipeline
+operating_model: https://github.com/hallovorld/RenQuant/blob/main/doc/arch/subrepo-operating-model.md
+repo_map: RENQUANT_REPOS.md
+pipeline_required: true
+branch_policy:
+  main: stable interface for downstream repos and automation
+  feature_branches: experiments, optimizations, and large upgrades
+source_repo:
+  name: RenQuant
+  never_delete: true
+dependencies:
+  - renquant-common
+  - renquant-pipeline
+inputs:
+  - order intents
+  - broker account snapshot
+  - explicit broker mode
+outputs:
+  - submitted orders
+  - cancel/reconcile audit
+  - notification records
+owns:
+  - broker adapters
+  - order submission
+  - order cancellation
+  - reconcile and notification workflows
+forbidden:
+  - alpha decision logic
+  - model training
+  - QP optimization logic
+  - raw data or model artifact ownership
+automation:
+  test: make test
+  doctor: make doctor

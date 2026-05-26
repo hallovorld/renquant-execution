@@ -2,6 +2,17 @@
 
 Broker execution repository for RenQuant.
 
+Operating model: https://github.com/hallovorld/RenQuant/blob/main/doc/arch/subrepo-operating-model.md
+
+Repository map: [RENQUANT_REPOS.md](RENQUANT_REPOS.md)
+
+Local automation:
+
+```bash
+make test
+make doctor
+```
+
 This repo owns broker adapters, order submission/cancel/reconcile workflows,
 execution audit, and notifications. It consumes order intents from
 `renquant-pipeline`; it does not train models or decide alpha.
