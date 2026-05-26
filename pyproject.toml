@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renquant-execution"
+version = "0.1.0"
+description = "Broker execution workflows for RenQuant."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["renquant-common>=0.1.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../renquant-common/src"]
+testpaths = ["tests"]
