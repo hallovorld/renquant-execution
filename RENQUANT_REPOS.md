@@ -22,6 +22,7 @@ emptied, or rewritten as part of this split.
 | `renquant-backtesting` | `/Users/renhao/git/github/renquant-backtesting` | `https://github.com/hallovorld/renquant-backtesting` | Simulation, LEAN assembly, WF validation, forensics |
 | `renquant-base-data` | `/Users/renhao/git/github/renquant-base-data` | `https://github.com/hallovorld/renquant-base-data` | Data manifests, freshness, fingerprints, materialization policy |
 | `renquant-artifacts` | `/Users/renhao/git/github/renquant-artifacts` | `https://github.com/hallovorld/renquant-artifacts` | Model/artifact manifests, metrics, promotion registry |
+| `renquant-orchestrator` | `/Users/renhao/git/github/renquant-orchestrator` | `https://github.com/hallovorld/renquant-orchestrator` | Pinned-subrepo daily orchestration and run bundles |
 
 ## System Flow
 
@@ -36,17 +37,18 @@ emptied, or rewritten as part of this split.
    actions with audit records.
 6. `renquant-backtesting` consumes the same manifests and pipeline contracts for
    simulation, LEAN assembly, acceptance, and trade forensics.
-7. `RenQuant` pins the whole assembly in `subrepos.lock.json` and runs local
-   daily/full orchestration.
+7. `renquant-orchestrator` stitches the pinned repos into one daily run and
+   persists an auditable run bundle.
+8. `RenQuant` pins the whole assembly in `subrepos.lock.json` and remains the
+   permanent integration harness and rollback source.
 
 ## Cross-Repo Rules
 
 - Use `renquant-common` pipeline primitives for every workflow.
 - Do not duplicate ownership: strategy config stays in strategy, data in data,
   artifact metadata in artifacts, alpha training in model repos, order intents
-  in pipeline, broker mutation in execution.
+  in pipeline, broker mutation in execution, daily composition in orchestrator.
 - Large data, checkpoints, DBs, and experiment dumps are referenced by manifest
   and fingerprint, not committed to normal Git.
 - A subrepo commit is not production-active until the umbrella repo pins it and
   integration checks pass.
-
