@@ -11,6 +11,8 @@ from typing import Any
 
 from renquant_common import Job, Pipeline, Task
 
+from .broker import BaseBroker, normalize_order_intent
+
 
 @dataclass
 class ExecutionContext:
@@ -22,6 +24,28 @@ class ExecutionContext:
 
 
 BrokerSubmitter = Callable[[str, list[dict[str, Any]], bool], list[dict[str, Any]]]
+
+
+def broker_submitter(broker: BaseBroker) -> BrokerSubmitter:
+    """Build a submitter that executes normalized order intents on a broker."""
+
+    def submit(broker_name: str, order_intents: list[dict[str, Any]], dry_run: bool) -> list[dict[str, Any]]:
+        if broker_name != broker.broker_name:
+            raise ValueError(f"broker_name mismatch: ctx={broker_name} broker={broker.broker_name}")
+        orders: list[dict[str, Any]] = []
+        for intent in order_intents:
+            normalized = normalize_order_intent(intent)
+            if dry_run:
+                orders.append({
+                    "order_id": f"dry-{len(orders) + 1}",
+                    "status": "dry_run",
+                    **normalized,
+                })
+            else:
+                orders.append(broker.place_order(**normalized))
+        return orders
+
+    return submit
 
 
 class ValidateOrderIntentsTask(Task):
@@ -67,3 +91,10 @@ class ExecutionJob(Job):
 class ExecutionPipeline(Pipeline):
     def __init__(self, submitter: BrokerSubmitter) -> None:
         super().__init__([ExecutionJob(submitter)], name="execution")
+
+
+class BrokerExecutionPipeline(ExecutionPipeline):
+    """Execution pipeline wired directly to a BaseBroker implementation."""
+
+    def __init__(self, broker: BaseBroker) -> None:
+        super().__init__(broker_submitter(broker))
