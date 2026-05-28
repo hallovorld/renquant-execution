@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from .alpaca_broker import AlpacaBroker
 from .broker import BaseBroker
+from .ibkr_broker import IBKRBroker
 from .paper_broker import PaperBroker
 from .readonly_broker import ReadOnlyBrokerWrapper
 
@@ -20,4 +21,6 @@ def get_broker(broker_type: str, *, initial_cash: float = 100_000.0) -> BaseBrok
         return AlpacaBroker(paper=True, env_prefix="ALPACA_SHORTS", label="alpaca-shorts")
     if broker in {"alpaca-shadow", "readonly-alpaca"}:
         return ReadOnlyBrokerWrapper(AlpacaBroker(paper=False))
+    if broker == "ibkr":
+        return IBKRBroker()
     raise ValueError(f"unsupported broker_type: {broker_type!r}")
