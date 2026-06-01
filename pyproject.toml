@@ -12,6 +12,12 @@ dependencies = ["renquant-common>=0.1.0"]
 
 [project.optional-dependencies]
 alpaca = ["alpaca-py>=0.30"]
+preopen = [
+    "alpaca-py>=0.30",
+    "pandas>=2",
+    "pandas-market-calendars>=4",
+    "yfinance>=0.2",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
