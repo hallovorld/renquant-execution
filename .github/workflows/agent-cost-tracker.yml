@@ -1,0 +1,20 @@
+name: agent-cost-tracker
+# Per-PR LLM cost cap (Phase D). Wraps RenQuant umbrella's reusable
+# template per doc/ops/agent-automation-v2-design.md §3.8.
+
+on:
+  workflow_run:
+    workflows: [agent-review, agent-autofix]
+    types: [completed]
+
+concurrency:
+  group: agent-cost-tracker-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  track:
+    uses: hallovorld/RenQuant/.github/workflows/_agent-cost-tracker-template.yml@main
+    permissions:
+      pull-requests: write
+      issues: write
+      actions: read
