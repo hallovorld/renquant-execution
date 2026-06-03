@@ -20,6 +20,12 @@ concurrency:
   group: agent-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write   # claude-code-action@v1 + codex-action@v1 OIDC setup (2026-06-03 fix)
+
 jobs:
   claude-review:
     # MANDATORY size gate: skip mega-PRs (human-only review territory).
