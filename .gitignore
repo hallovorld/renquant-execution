@@ -11,3 +11,7 @@ build/
 .env
 logs/
 live_state*.json
+# IGV short-plan: operator live config + runtime state (never commit)
+igv_short_plan.json
+configs/igv_short_plan.json
+igv_state/
