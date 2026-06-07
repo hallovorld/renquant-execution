@@ -15,8 +15,9 @@ state machine that drives it.
 
 | IGV action | Plan response |
 |---|---|
-| bounce $97.5–99, hourly close back < 97.5 (rejection) | **enter** 98/90 put debit spread |
-| break < $94.8, then bounce $95–96 rejects (close < 95) | **enter** (path B) |
+| bounce $97.5–99, hourly close back < 97.5 (rejection) | **enter** 98/90 put debit spread (path A — the only entry) |
+| gap down to $94–95 | do **not** chase — wait for the bounce |
+| break < $94 and accelerates | existing positions only — **no new entry** (`enable_path_b: false`) |
 | reclaim $100 | stand down — do not enter this bounce |
 | recover $101.5–102 | **void** the plan |
 | in position, $92–93 | take profit: close **half** |
@@ -25,12 +26,18 @@ state machine that drives it.
 | in position, daily **close** ≥ $101.5 | stop: **exit all** → done |
 
 "Rejection" = zone touched in the recent window AND the latest **closed hourly
-bar** closes back below the zone low.
+bar** closes back below the zone low. Only **path A** is enabled for new entries
+(`enable_path_b: false`); chasing a break < $94 is for existing positions only.
+
+**Entry pricing (operator caps):** fixed expiry **2026-07-17**, 98/90 puts. Net
+debit target ≤ **$2.50**, hard limit **$2.70** (`max_debit` — the order is placed
+at this cap and fills only at/below it), and **abort entirely if the net mid >
+$3.00** (`do_not_exceed_debit`). No quote ⇒ entry skipped (fail closed). An
+aborted entry stays in WATCH and can re-trigger on a cheaper re-test.
 
 ## Modules
 
-- `renquant_execution/igv_short_state.py` — PURE state machine (no I/O); 15
-  tests in `tests/test_igv_short_monitor.py` cover every transition.
+- `renquant_execution/igv_short_state.py` — PURE state machine (no I/O); 22 tests in `tests/test_igv_short_monitor.py` cover every transition.
 - `renquant_execution/options_executor.py` — narrow Alpaca multi-leg layer:
   resolves the 98/90 puts at the nearest weekly expiry from the live chain (no
   hand-built OCC), submits a **limit** spread, enforces a hard contract cap +

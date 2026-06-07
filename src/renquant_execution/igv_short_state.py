@@ -68,6 +68,7 @@ class PlanConfig:
     sl_half_at: float = 100.5           # price >= -> cut half
     sl_exit_close_at: float = 101.5     # daily close >= -> exit all
     reject_lookback_bars: int = 6       # window to look for the zone "touch"
+    enable_path_b: bool = True          # post-breakdown failed-bounce (95-96) entry
 
 
 @dataclass
@@ -139,7 +140,7 @@ def step(state: PlanState, mkt: Market, cfg: PlanConfig) -> tuple[PlanState, lis
             s.state = "IN_POSITION"
             s.entry_path = "A"
             actions.append(Action(ENTER, f"path A: rejected {rlo}-{rhi} (hourly close {mkt.hourly_bars[-1].close} < {rlo})"))
-        elif s.broke_below_breakdown and _rejected(mkt.hourly_bars, blo, bhi, cfg.reject_lookback_bars):
+        elif cfg.enable_path_b and s.broke_below_breakdown and _rejected(mkt.hourly_bars, blo, bhi, cfg.reject_lookback_bars):
             s.state = "IN_POSITION"
             s.entry_path = "B"
             actions.append(Action(ENTER, f"path B: post-breakdown failed bounce {blo}-{bhi} (hourly close {mkt.hourly_bars[-1].close} < {blo})"))
