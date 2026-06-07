@@ -21,6 +21,7 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 log = logging.getLogger("renquant_execution.options_executor")
 
@@ -106,8 +107,23 @@ def _check_caps(contracts: int, limit_price: float, width: float) -> None:
 def _submit_mleg(client, *, long_occ, short_occ, contracts, limit_price,
                  opening: bool, client_order_id: str):
     """Build + submit the two-leg limit order. opening=True: BUY long / SELL short."""
-    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest  # noqa: PLC0415
-    from alpaca.trading.enums import OrderSide, OrderClass, TimeInForce, PositionIntent  # noqa: PLC0415
+    try:
+        from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest  # noqa: PLC0415
+        from alpaca.trading.enums import OrderSide, OrderClass, TimeInForce, PositionIntent  # noqa: PLC0415
+    except ModuleNotFoundError:
+        # Unit tests use a fake client in environments without alpaca-py. Real
+        # submission without alpaca-py is impossible because _client() imports it
+        # before reaching here.
+        LimitOrderRequest = OptionLegRequest = SimpleNamespace
+        OrderSide = SimpleNamespace(BUY="buy", SELL="sell")
+        OrderClass = SimpleNamespace(MLEG="mleg")
+        TimeInForce = SimpleNamespace(DAY="day")
+        PositionIntent = SimpleNamespace(
+            BUY_TO_OPEN="buy_to_open",
+            SELL_TO_OPEN="sell_to_open",
+            SELL_TO_CLOSE="sell_to_close",
+            BUY_TO_CLOSE="buy_to_close",
+        )
 
     if opening:
         long_side, short_side = OrderSide.BUY, OrderSide.SELL

@@ -219,7 +219,8 @@ def run_once() -> int:
         return 0
     mkt = get_market()
     new_state, actions = step(state, mkt, pcfg)
-    extra = (load_state().to_dict().get("_position") if STATE_PATH.exists() else None)
+    existing_extra = load_state().to_dict().get("_position") if STATE_PATH.exists() else None
+    extra = existing_extra
     for a in actions:
         order_note = "no order (dry-run)" if not armed else "LIVE order submitted"
         try:
@@ -230,6 +231,9 @@ def run_once() -> int:
         except Exception as exc:  # noqa: BLE001 — never let an order error skip the alert
             order_note = f"ORDER ERROR: {exc}"
             log.exception("order execution failed for %s", a.kind)
+            if armed and a.kind in (ENTER, CLOSE_HALF, CLOSE_MOST, CLOSE_ALL):
+                new_state = state
+                extra = existing_extra
         alert(a, mkt, armed=armed, order_note=order_note)
     save_state(new_state, extra)
     log.info("state %s -> %s (%d actions, armed=%s)", state.state, new_state.state, len(actions), armed)

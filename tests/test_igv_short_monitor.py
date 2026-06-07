@@ -6,6 +6,7 @@ from renquant_execution.igv_short_state import (
     ENTER, CLOSE_HALF, CLOSE_MOST, CLOSE_ALL, VOID,
 )
 from renquant_execution import options_executor as ox
+from renquant_execution import igv_short_monitor as monitor
 
 CFG = PlanConfig()
 
@@ -126,3 +127,39 @@ def test_open_is_idempotent_client_order_id():
     ox.open_put_spread(_legs(), 1, 3.0, plan_id="t", paper=True, client=c)
     coids = {o.client_order_id for o in c.submitted}
     assert len(coids) == 1  # same deterministic id -> broker dedupes the resubmit
+
+
+def test_live_order_error_does_not_advance_position_state(tmp_path, monkeypatch):
+    cfg = tmp_path / "igv_short_plan.json"
+    state = tmp_path / "igv_state.json"
+    kill = tmp_path / "IGV_KILL"
+    cfg.write_text(
+        """{
+          "plan_id": "t",
+          "mode": "live",
+          "contracts": 1,
+          "max_debit": 3.0,
+          "long_strike": 98.0,
+          "short_strike": 90.0
+        }"""
+    )
+
+    monkeypatch.setattr(monitor, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(monitor, "STATE_PATH", state)
+    monkeypatch.setattr(monitor, "KILL_FILE", kill)
+    monkeypatch.setenv("IGV_LIVE_ARMED", "1")
+    monkeypatch.setenv("IGV_IGNORE_HOURS", "1")
+    monkeypatch.setattr(
+        monitor,
+        "get_market",
+        lambda: Market(price=97.0, hourly_bars=_bars((98.2, 98.4, 97.6), (97.1, 97.9, 96.9))),
+    )
+    monkeypatch.setattr(monitor, "execute", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("broker down")))
+    alerts = []
+    monkeypatch.setattr(monitor, "alert", lambda *args, **kwargs: alerts.append((args, kwargs)))
+
+    assert monitor.run_once() == 0
+    saved = PlanState.from_dict(__import__("json").loads(state.read_text()))
+    assert saved.state == "WATCH"
+    assert saved.contracts == 0
+    assert alerts
