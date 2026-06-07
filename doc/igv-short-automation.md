@@ -39,8 +39,8 @@ aborted entry stays in WATCH and can re-trigger on a cheaper re-test.
 
 - `renquant_execution/igv_short_state.py` — PURE state machine (no I/O); 22 tests in `tests/test_igv_short_monitor.py` cover every transition.
 - `renquant_execution/options_executor.py` — narrow Alpaca multi-leg layer:
-  resolves the 98/90 puts at the nearest weekly expiry from the live chain (no
-  hand-built OCC), submits a **limit** spread, enforces a hard contract cap +
+  resolves the 98/90 puts at a fixed/explicit expiry from the live chain
+  (no hand-built OCC; defaults to a DTE window if no expiry pinned), submits a **limit** spread, enforces a hard contract cap +
   debit-sanity bound, deterministic `client_order_id` (idempotent).
 - `renquant_execution/igv_short_monitor.py` — orchestrator (cron entry):
   kill-switch + market-clock guard, fetch bars/price, `step()`, persist, alert,
@@ -60,7 +60,7 @@ one-entry (the machine never re-enters), debit bound `0 < debit < strike width`.
 
 1. **Enable options** (level 2 / spreads) on the Alpaca account.
 2. `cp configs/igv_short_plan.example.json configs/igv_short_plan.json` and edit:
-   set `contracts`, `max_debit`, `dte_min/max`. Leave `mode: "paper"` to start.
+   set `contracts`, `max_debit`, `do_not_exceed_debit`, and `expiry`. Leave `mode: "paper"` to start.
    (`configs/igv_short_plan.json` + `igv_state/` are gitignored.)
 3. Dry-run / paper first (creds via your `.env`):
    ```bash
