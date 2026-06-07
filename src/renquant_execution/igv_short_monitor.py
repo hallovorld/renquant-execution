@@ -41,6 +41,11 @@ KILL_FILE = _STATE_DIR / "IGV_KILL"
 UNDERLYING = "IGV"
 
 
+class EntryAborted(Exception):
+    """Raised when an ENTER must be skipped (too expensive / no quote) so the
+    orchestrator reverts to WATCH instead of recording a phantom position."""
+
+
 # ── config / state ──────────────────────────────────────────────────────────
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
@@ -67,6 +72,7 @@ def plan_config(cfg: dict) -> PlanConfig:
         tp_most_at=z.get("tp_most_at", base.tp_most_at),
         sl_half_at=z.get("sl_half_at", base.sl_half_at),
         sl_exit_close_at=z.get("sl_exit_close_at", base.sl_exit_close_at),
+        enable_path_b=cfg.get("enable_path_b", base.enable_path_b),
     )
 
 
@@ -157,11 +163,20 @@ def execute(action: Action, cfg: dict, state: PlanState, paper: bool, armed: boo
     pos = (load_state().to_dict().get("_position") if STATE_PATH.exists() else None) or {}
 
     if action.kind == ENTER:
+        import datetime as _dt  # noqa: PLC0415
+        exp = _dt.date.fromisoformat(cfg["expiry"]) if cfg.get("expiry") else None
         legs = ox.resolve_put_spread(UNDERLYING, cfg["long_strike"], cfg["short_strike"],
-                                     dte_min=cfg.get("dte_min", 0), dte_max=cfg.get("dte_max", 7),
-                                     paper=paper)
+                                     expiry=exp, dte_min=cfg.get("dte_min", 0),
+                                     dte_max=cfg.get("dte_max", 7), paper=paper)
         mid = spread_net_mid(legs, paper)
-        debit = min(cfg["max_debit"], (mid + cfg.get("slippage", 0.10)) if mid else cfg["max_debit"])
+        debit = ox.decide_entry_debit(mid, max_debit=cfg["max_debit"],
+                                      do_not_exceed=cfg.get("do_not_exceed_debit", cfg["max_debit"]))
+        if debit is None:
+            # too expensive (> do_not_exceed) or no quote -> ABORT, stay WATCH
+            raise EntryAborted(
+                f"net mid {mid} > do_not_exceed {cfg.get('do_not_exceed_debit')}"
+                if mid is not None else "no spread quote (fail closed)"
+            )
         contracts = int(cfg["contracts"])
         if armed:
             ox.open_put_spread(legs, contracts, debit, plan_id=plan_id, paper=paper)
@@ -227,6 +242,13 @@ def run_once() -> int:
                 extra = execute(a, cfg, new_state, paper, armed) or extra
             elif a.kind == VOID:
                 order_note = "plan voided (no position)"
+        except EntryAborted as exc:
+            # too-expensive / no-quote entry: do NOT take the position — revert
+            # to WATCH so a cheaper re-test can still trigger next tick.
+            new_state.state = "WATCH"
+            new_state.entry_path = None
+            order_note = f"ENTRY SKIPPED: {exc}"
+            log.warning("entry aborted, staying WATCH: %s", exc)
         except Exception as exc:  # noqa: BLE001 — never let an order error skip the alert
             order_note = f"ORDER ERROR: {exc}"
             log.exception("order execution failed for %s", a.kind)
