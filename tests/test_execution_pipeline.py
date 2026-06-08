@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from renquant_execution import (
@@ -10,8 +12,10 @@ from renquant_execution import (
     ExecutionPipeline,
     PaperBroker,
     ReadOnlyBrokerWrapper,
+    execution_payload,
     get_broker,
     normalize_order_intent,
+    write_execution_payload,
 )
 
 
@@ -33,6 +37,28 @@ def test_execution_pipeline_submits_via_injected_broker() -> None:
     assert calls == [("paper", True, 1)]
     assert ctx.submitted_orders[0]["ticker"] == "AAPL"
     assert ctx.audit_rows == [{"broker": "paper", "dry_run": True, "n_intents": 1, "n_submitted": 1}]
+
+
+def test_execution_payload_is_native_bundle_ready(tmp_path) -> None:
+    ctx = ExecutionContext(
+        broker_name="paper",
+        order_intents=[{"ticker": "AAPL", "action": "buy", "quantity": 1}],
+        dry_run=True,
+    )
+    ExecutionPipeline(lambda _broker, intents, _dry: [{"id": "dry-1", **intents[0]}]).run(ctx)
+    out = tmp_path / "execution.json"
+
+    payload = execution_payload(ctx)
+    written = write_execution_payload(ctx, out)
+
+    assert payload["source"] == "renquant_execution.execution"
+    assert payload["broker_name"] == "paper"
+    assert payload["dry_run"] is True
+    assert payload["order_intents"] == ctx.order_intents
+    assert payload["submitted_orders"] == ctx.submitted_orders
+    assert payload["execution_audit"] == ctx.audit_rows
+    assert written == out
+    assert json.loads(out.read_text(encoding="utf-8")) == payload
 
 
 def test_execution_pipeline_rejects_malformed_intent() -> None:

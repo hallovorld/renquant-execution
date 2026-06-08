@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
 from typing import Any
 
 from renquant_common import Job, Pipeline, Task
@@ -99,3 +101,27 @@ class BrokerExecutionPipeline(ExecutionPipeline):
 
     def __init__(self, broker: BaseBroker) -> None:
         super().__init__(broker_submitter(broker))
+
+
+def execution_payload(ctx: ExecutionContext) -> dict[str, Any]:
+    """Return the JSON payload consumed by native live-bundle tooling."""
+    return {
+        "schema_version": 1,
+        "source": "renquant_execution.execution",
+        "broker_name": ctx.broker_name,
+        "dry_run": bool(ctx.dry_run),
+        "order_intents": list(ctx.order_intents),
+        "submitted_orders": list(ctx.submitted_orders),
+        "execution_audit": list(ctx.audit_rows),
+    }
+
+
+def write_execution_payload(ctx: ExecutionContext, path: str | Path) -> Path:
+    """Write the execution payload as deterministic JSON."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(execution_payload(ctx), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return out
