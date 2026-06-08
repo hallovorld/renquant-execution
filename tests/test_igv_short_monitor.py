@@ -163,3 +163,36 @@ def test_live_order_error_does_not_advance_position_state(tmp_path, monkeypatch)
     assert saved.state == "WATCH"
     assert saved.contracts == 0
     assert alerts
+
+
+# ── refinement: path A only (path B disabled by config) ─────────────────────
+def test_path_b_disabled_blocks_post_breakdown_entry():
+    cfg = PlanConfig(enable_path_b=False)
+    bars = _bars((95.5, 95.9, 95.1), (94.6, 95.4, 94.4))  # would be a path-B reject
+    seeded = PlanState(broke_below_breakdown=True)
+    st, actions = step(seeded, Market(price=94.6, hourly_bars=bars), cfg)
+    assert st.state == "WATCH" and actions == []  # path B off -> no new short
+
+
+def test_path_a_still_fires_with_path_b_disabled():
+    cfg = PlanConfig(enable_path_b=False)
+    bars = _bars((98.2, 98.4, 97.6), (97.1, 97.9, 96.9))
+    st, actions = step(PlanState(), Market(price=97.0, hourly_bars=bars), cfg)
+    assert st.state == "IN_POSITION" and [a.kind for a in actions] == [ENTER]
+
+
+# ── refinement: entry debit gate (limit <= 2.70, abort > 3.00 / no quote) ────
+def test_debit_gate_places_at_cap_when_affordable():
+    assert ox.decide_entry_debit(2.40, max_debit=2.70, do_not_exceed=3.00) == 2.70
+
+
+def test_debit_gate_places_at_cap_between_cap_and_limit():
+    assert ox.decide_entry_debit(2.85, max_debit=2.70, do_not_exceed=3.00) == 2.70
+
+
+def test_debit_gate_aborts_above_do_not_exceed():
+    assert ox.decide_entry_debit(3.10, max_debit=2.70, do_not_exceed=3.00) is None
+
+
+def test_debit_gate_aborts_when_no_quote():
+    assert ox.decide_entry_debit(None, max_debit=2.70, do_not_exceed=3.00) is None

@@ -46,31 +46,51 @@ def _client(paper: bool):
     return TradingClient(api_key=key, secret_key=sec, paper=paper)
 
 
+def decide_entry_debit(
+    mid: float | None, *, max_debit: float, do_not_exceed: float
+) -> float | None:
+    """Pure entry-debit gate. Returns the limit price to place, or None to ABORT.
+
+    * mid is None (no quote) -> abort (fail closed; never place blind).
+    * mid > do_not_exceed    -> abort (too expensive, e.g. > $3.00).
+    * otherwise              -> place a limit at max_debit (the hard cap, e.g.
+      $2.70); it only fills at or below the cap, so we never overpay and never
+      chase between the cap and do_not_exceed.
+    """
+    if mid is None or mid > do_not_exceed:
+        return None
+    return round(max_debit, 2)
+
+
 def resolve_put_spread(
     underlying: str,
     long_strike: float,
     short_strike: float,
     *,
+    expiry: "date | None" = None,
     dte_min: int = 0,
     dte_max: int = 7,
     paper: bool = True,
     client=None,
 ) -> SpreadLegs:
-    """Find the nearest expiry in [dte_min, dte_max] where BOTH puts are listed.
+    """Resolve the two OCC put symbols.
 
-    Returns the resolved OCC symbols straight from Alpaca (no hand-built OCC),
-    so strike/expiry formatting can't drift. Raises if no expiry has both.
+    If `expiry` is given, require that EXACT expiry to list both strikes
+    (raises otherwise). Else pick the nearest expiry in [dte_min, dte_max].
+    OCC symbols come straight from Alpaca (no hand-built OCC).
     """
     from alpaca.trading.requests import GetOptionContractsRequest  # noqa: PLC0415
     from alpaca.trading.enums import ContractType  # noqa: PLC0415
 
     client = client or _client(paper)
     today = datetime.now(timezone.utc).date()
+    exp_gte = expiry if expiry else today + timedelta(days=dte_min)
+    exp_lte = expiry if expiry else today + timedelta(days=dte_max)
     req = GetOptionContractsRequest(
         underlying_symbols=[underlying],
         type=ContractType.PUT,
-        expiration_date_gte=today + timedelta(days=dte_min),
-        expiration_date_lte=today + timedelta(days=dte_max),
+        expiration_date_gte=exp_gte,
+        expiration_date_lte=exp_lte,
         strike_price_gte=str(min(long_strike, short_strike)),
         strike_price_lte=str(max(long_strike, short_strike)),
         limit=10000,
@@ -90,8 +110,9 @@ def resolve_put_spread(
                 long_strike=long_strike,
                 short_strike=short_strike,
             )
+    where = f"expiry {expiry.isoformat()}" if expiry else f"{dte_min}-{dte_max} DTE"
     raise RuntimeError(
-        f"no expiry in {dte_min}-{dte_max} DTE lists both {long_strike}/{short_strike} puts on {underlying}"
+        f"no {where} lists both {long_strike}/{short_strike} puts on {underlying}"
     )
 
 
