@@ -2,7 +2,14 @@
 
 from .alpaca_broker import AlpacaBroker
 from .broker import BaseBroker, normalize_order_intent
-from .execution import BrokerExecutionPipeline, ExecutionContext, ExecutionPipeline, broker_submitter
+from .execution import (
+    BrokerExecutionPipeline,
+    ExecutionContext,
+    ExecutionPipeline,
+    broker_submitter,
+    execution_payload,
+    write_execution_payload,
+)
 from .factory import get_broker
 from .order_lifecycle import (
     LIFECYCLE_SCHEMA_VERSION,
@@ -25,7 +32,9 @@ __all__ = [
     "VALID_LIFECYCLE_EVENTS",
     "broker_submitter",
     "build_order_lifecycle_event",
+    "execution_payload",
     "get_broker",
     "lifecycle_event_from_confirmation",
     "normalize_order_intent",
+    "write_execution_payload",
 ]
