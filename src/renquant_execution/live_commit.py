@@ -57,18 +57,17 @@ def _list_of_dicts(value: Any, *, field_name: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _sell_first_key(intent: dict[str, Any]) -> tuple[int, str]:
+def _intent_priority(intent: dict[str, Any]) -> int:
     normalized = normalize_order_intent(intent)
     action = normalized["action"]
-    priority = 0 if action in {"SELL", "SELL_SHORT", "BUY_TO_COVER"} else 1
-    return priority, normalized["symbol"]
+    return 0 if action in {"SELL", "SELL_SHORT", "BUY_TO_COVER"} else 1
 
 
 def sell_first_order_intents(order_intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return normalized order intents in commit-safe sell-before-buy order."""
+    """Return normalized intents with sells first and original class order intact."""
     return [
         normalize_order_intent(intent)
-        for intent in sorted(order_intents, key=_sell_first_key)
+        for intent in sorted(order_intents, key=_intent_priority)
     ]
 
 
@@ -108,14 +107,19 @@ def build_live_commit_plan(
         execution_payload.get("submitted_orders"),
         field_name="submitted_orders",
     )
-    audit_rows = _list_of_dicts(
-        execution_payload.get("execution_audit") or execution_payload.get("audit_rows"),
-        field_name="execution_audit/audit_rows",
+    raw_audit_rows = (
+        execution_payload["execution_audit"]
+        if "execution_audit" in execution_payload
+        else execution_payload.get("audit_rows")
     )
-    state_mutations = _list_of_dicts(
-        execution_payload.get("state_mutations"),
-        field_name="state_mutations",
-    ) or _planned_state_mutations(submitted_orders)
+    audit_rows = _list_of_dicts(raw_audit_rows, field_name="execution_audit/audit_rows")
+    if "state_mutations" in execution_payload:
+        state_mutations = _list_of_dicts(
+            execution_payload["state_mutations"],
+            field_name="state_mutations",
+        )
+    else:
+        state_mutations = _planned_state_mutations(submitted_orders)
     return LiveCommitPlan(
         broker_name=str(broker_name),
         order_intents=order_intents,
