@@ -14,6 +14,7 @@ from .factory import get_broker
 from .live_commit import (
     LiveCommitPlan,
     build_live_commit_plan,
+    classify_broker_result,
     sell_first_order_intents,
     write_live_commit_plan,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "broker_submitter",
     "build_order_lifecycle_event",
     "build_live_commit_plan",
+    "classify_broker_result",
     "execution_payload",
     "get_broker",
     "lifecycle_event_from_confirmation",

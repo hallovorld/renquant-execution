@@ -71,20 +71,51 @@ def sell_first_order_intents(order_intents: list[dict[str, Any]]) -> list[dict[s
     ]
 
 
+def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
+    """Classify a broker order result for live state-mutation planning."""
+    status = str(order.get("status", "") or "unknown").lower()
+    requested_qty = float(order.get("quantity", order.get("qty", 0.0)) or 0.0)
+    filled_qty = float(order.get("filled_qty", order.get("filled_quantity", 0.0)) or 0.0)
+    filled_avg_price = float(
+        order.get("filled_avg_price", order.get("avg_price", order.get("price", 0.0))) or 0.0
+    )
+    rejected = status in {"rejected", "canceled", "cancelled", "expired", "failed"}
+    filled = status == "filled" or (filled_qty > 0.0 and requested_qty > 0.0 and filled_qty >= requested_qty)
+    partial = (status in {"partially_filled", "partial"} or (
+        filled_qty > 0.0 and requested_qty > 0.0 and filled_qty < requested_qty
+    ))
+    pending = not (filled or partial or rejected)
+    return {
+        "status": status,
+        "filled": filled,
+        "partial": partial,
+        "pending": pending,
+        "rejected": rejected,
+        "filled_qty": filled_qty,
+        "filled_avg_price": filled_avg_price,
+    }
+
+
 def _planned_state_mutations(submitted_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
     mutations: list[dict[str, Any]] = []
     for idx, order in enumerate(submitted_orders, start=1):
         symbol = order.get("symbol") or order.get("ticker")
         action = str(order.get("action", "")).upper()
-        status = str(order.get("status", "unknown"))
+        result = classify_broker_result(order)
         mutations.append({
             "mutation_id": f"planned-order-{idx}",
             "mutation_type": "order_submission",
             "readonly": True,
             "symbol": symbol,
             "action": action,
-            "status": status,
+            "status": result["status"],
             "order_id": order.get("order_id") or order.get("id"),
+            "filled": result["filled"],
+            "partial": result["partial"],
+            "pending": result["pending"],
+            "rejected": result["rejected"],
+            "filled_qty": result["filled_qty"],
+            "filled_avg_price": result["filled_avg_price"],
         })
     return mutations
 
@@ -148,6 +179,7 @@ def write_live_commit_plan(
 __all__ = [
     "LiveCommitPlan",
     "build_live_commit_plan",
+    "classify_broker_result",
     "sell_first_order_intents",
     "write_live_commit_plan",
 ]

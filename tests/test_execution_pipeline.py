@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from renquant_execution.alpaca_broker import _order_to_dict
 from renquant_execution import (
     AlpacaBroker,
     BaseBroker,
@@ -79,6 +81,38 @@ def test_normalize_order_intent_accepts_ticker_or_symbol() -> None:
         "action": "SELL",
         "quantity": 1.0,
     }
+    assert normalize_order_intent({"ticker": "NVDA", "action": "BUY", "shares": 3}) == {
+        "symbol": "NVDA",
+        "action": "BUY",
+        "quantity": 3.0,
+    }
+
+
+def test_alpaca_order_to_dict_exposes_live_execution_aliases() -> None:
+    order = SimpleNamespace(
+        id="ord-1",
+        status="partially_filled",
+        symbol="AAPL",
+        side="sell",
+        qty="5",
+        filled_qty="2",
+        filled_avg_price="101.25",
+        created_at="2026-06-09T16:00:00Z",
+        submitted_at="2026-06-09T16:01:00Z",
+        filled_at="",
+    )
+
+    payload = _order_to_dict(order)
+
+    assert payload["order_id"] == "ord-1"
+    assert payload["side"] == "SELL"
+    assert payload["action"] == "SELL"
+    assert payload["quantity"] == pytest.approx(5.0)
+    assert payload["qty"] == pytest.approx(5.0)
+    assert payload["filled_qty"] == pytest.approx(2.0)
+    assert payload["filled_avg_price"] == pytest.approx(101.25)
+    assert payload["avg_price"] == pytest.approx(101.25)
+    assert payload["partial"] is True
 
 
 def test_broker_execution_pipeline_dry_run_does_not_mutate_broker() -> None:

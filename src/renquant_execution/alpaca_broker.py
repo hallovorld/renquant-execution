@@ -229,12 +229,22 @@ def _parse_datetime(value: str) -> datetime:
 
 
 def _order_to_dict(order: Any) -> dict[str, Any]:
+    side = str(getattr(order, "side", "") or "").upper()
+    quantity = float(getattr(order, "qty", getattr(order, "quantity", 0.0)) or 0.0)
+    filled_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
+    filled_avg_price = float(getattr(order, "filled_avg_price", 0.0) or 0.0)
     return {
         "order_id": str(getattr(order, "id", "")),
         "status": str(getattr(order, "status", "")),
         "symbol": str(getattr(order, "symbol", "")),
-        "filled_qty": float(getattr(order, "filled_qty", 0.0) or 0.0),
-        "filled_avg_price": float(getattr(order, "filled_avg_price", 0.0) or 0.0),
+        "side": side,
+        "action": side,
+        "quantity": quantity,
+        "qty": quantity,
+        "filled_qty": filled_qty,
+        "filled_avg_price": filled_avg_price,
+        "avg_price": filled_avg_price,
+        "partial": 0.0 < filled_qty < quantity,
         "created_at": str(getattr(order, "created_at", "")),
         "submitted_at": str(getattr(order, "submitted_at", "")),
         "filled_at": str(getattr(order, "filled_at", "")),
