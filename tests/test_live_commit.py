@@ -49,11 +49,15 @@ def test_sell_first_order_intents_normalizes_and_orders_sells_before_buys() -> N
     intents = sell_first_order_intents([
         {"ticker": "AAPL", "action": "buy", "quantity": 2},
         {"symbol": "MSFT", "action": "SELL", "qty": 1},
+        {"ticker": "TSLA", "action": "buy", "quantity": 3},
+        {"ticker": "IBM", "action": "sell", "quantity": 4},
     ])
 
     assert intents == [
         {"symbol": "MSFT", "action": "SELL", "quantity": 1.0},
+        {"symbol": "IBM", "action": "SELL", "quantity": 4.0},
         {"symbol": "AAPL", "action": "BUY", "quantity": 2.0},
+        {"symbol": "TSLA", "action": "BUY", "quantity": 3.0},
     ]
 
 
@@ -99,6 +103,18 @@ def test_build_live_commit_plan_preserves_existing_state_mutations() -> None:
     assert plan.state_mutations == [
         {"mutation_type": "live_state_write", "path": "live_state.alpaca_shadow.json"}
     ]
+
+
+def test_build_live_commit_plan_preserves_explicit_empty_audit_and_mutations() -> None:
+    payload = _execution_payload()
+    payload["execution_audit"] = []
+    payload["audit_rows"] = [{"broker": "fallback", "dry_run": True}]
+    payload["state_mutations"] = []
+
+    plan = build_live_commit_plan(payload)
+
+    assert plan.execution_audit == []
+    assert plan.state_mutations == []
 
 
 def test_build_live_commit_plan_rejects_live_mode() -> None:
