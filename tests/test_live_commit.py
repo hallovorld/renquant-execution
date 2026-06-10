@@ -8,6 +8,7 @@ import pytest
 from renquant_execution import (
     LiveCommitPlan,
     build_live_commit_plan,
+    classify_broker_result,
     sell_first_order_intents,
     write_live_commit_plan,
 )
@@ -78,6 +79,12 @@ def test_build_live_commit_plan_is_readonly_and_auditable() -> None:
             "action": "SELL",
             "status": "dry_run",
             "order_id": "readonly-dry-1",
+            "filled": False,
+            "partial": False,
+            "pending": True,
+            "rejected": False,
+            "filled_qty": 0.0,
+            "filled_avg_price": 0.0,
         },
         {
             "mutation_id": "planned-order-2",
@@ -87,9 +94,40 @@ def test_build_live_commit_plan_is_readonly_and_auditable() -> None:
             "action": "BUY",
             "status": "dry_run",
             "order_id": "readonly-dry-2",
+            "filled": False,
+            "partial": False,
+            "pending": True,
+            "rejected": False,
+            "filled_qty": 0.0,
+            "filled_avg_price": 0.0,
         },
     ]
     assert plan.to_payload()["source"] == "renquant_execution.live_commit_plan"
+
+
+def test_classify_broker_result_covers_live_order_statuses() -> None:
+    assert classify_broker_result({
+        "status": "filled",
+        "quantity": 3,
+        "filled_qty": 3,
+        "filled_avg_price": 101.5,
+    }) == {
+        "status": "filled",
+        "filled": True,
+        "partial": False,
+        "pending": False,
+        "rejected": False,
+        "filled_qty": 3.0,
+        "filled_avg_price": 101.5,
+    }
+    assert classify_broker_result({
+        "status": "partially_filled",
+        "quantity": 3,
+        "filled_qty": 1,
+        "avg_price": 100,
+    })["partial"] is True
+    assert classify_broker_result({"status": "new", "quantity": 3})["pending"] is True
+    assert classify_broker_result({"status": "rejected", "quantity": 3})["rejected"] is True
 
 
 def test_build_live_commit_plan_preserves_existing_state_mutations() -> None:

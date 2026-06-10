@@ -63,7 +63,7 @@ def normalize_order_intent(intent: dict[str, Any]) -> dict[str, Any]:
     """Normalize a pipeline order intent into broker-facing fields."""
     symbol = intent.get("symbol") or intent.get("ticker")
     raw_action = intent.get("action")
-    quantity = intent.get("quantity", intent.get("qty"))
+    quantity = intent.get("quantity", intent.get("qty", intent.get("shares")))
     if not symbol:
         raise ValueError("order intent missing symbol/ticker")
     if raw_action is None or str(raw_action).strip() == "":
@@ -72,7 +72,7 @@ def normalize_order_intent(intent: dict[str, Any]) -> dict[str, Any]:
     if action not in {"BUY", "SELL"}:
         raise ValueError(f"order intent has unsupported action: {raw_action!r}")
     if quantity is None:
-        raise ValueError("order intent missing quantity/qty")
+        raise ValueError("order intent missing quantity/qty/shares")
     quantity_f = float(quantity)
     if quantity_f <= 0:
         raise ValueError(f"order intent quantity must be positive: {quantity!r}")
