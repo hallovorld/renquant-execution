@@ -9,10 +9,12 @@ import pytest
 from renquant_execution import (
     BaseBroker,
     LiveCommitPlan,
+    build_live_persistence_alert_event,
     build_live_commit_plan,
     classify_broker_result,
     commit_live_persistence,
     execute_live_commit,
+    post_live_persistence_alert,
     sell_first_order_intents,
     write_live_commit_plan,
 )
@@ -386,6 +388,7 @@ def test_commit_live_persistence_updates_state_and_trade_journal(tmp_path: Path)
         "trade_journal_path": str(journal_path),
         "lifecycle_journal_path": None,
         "runs_db_path": None,
+        "run_id": "run-1",
         "timestamp": "2026-06-12T05:00:00+00:00",
     }
 
@@ -466,6 +469,61 @@ def test_commit_live_persistence_records_db_snapshot_and_lifecycle_journal(
     assert committed["persistence_audit"]["live_state_snapshot_row_count"] == 1
     assert committed["persistence_audit"]["lifecycle_journal_path"] == str(lifecycle_path)
     assert committed["persistence_audit"]["runs_db_path"] == str(db_path)
+    assert committed["persistence_audit"]["run_id"] == "run-db-1"
+
+
+def test_live_persistence_alert_event_summarizes_commit_payload(tmp_path: Path) -> None:
+    state_path = tmp_path / "live_state.alpaca.json"
+    journal_path = tmp_path / "trades.jsonl"
+    broker = RecordingBroker()
+    plan = execute_live_commit(
+        broker=broker,
+        order_intents=[{"ticker": "AAPL", "action": "buy", "quantity": 2}],
+    )
+    committed = commit_live_persistence(
+        plan,
+        live_state_path=state_path,
+        trade_journal_path=journal_path,
+        run_id="run-alert-1",
+        timestamp="2026-06-12T05:00:00+00:00",
+    )
+
+    event = build_live_persistence_alert_event(committed)
+
+    assert event.taxonomy == "LIVE_PERSISTENCE"
+    assert event.title == "RenQuant native live persistence committed (recording)"
+    assert "committed_mutations=2" in event.body
+    assert "trade_rows=1" in event.body
+    assert str(state_path) in event.body
+    assert event.key
+    assert event.force is True
+
+
+def test_post_live_persistence_alert_respects_env_suppression(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RENQUANT_NO_NOTIFY", "1")
+    payload = {
+        "broker_name": "recording",
+        "persistence_audit": {
+            "committed_mutation_count": 2,
+            "trade_journal_row_count": 1,
+            "lifecycle_journal_row_count": 0,
+            "live_state_snapshot_row_count": 0,
+            "live_state_path": "live_state.alpaca.json",
+            "trade_journal_path": "trades.jsonl",
+            "run_id": "run-alert-2",
+            "timestamp": "2026-06-12T05:00:00+00:00",
+        },
+    }
+
+    ok = post_live_persistence_alert(
+        "https://ntfy.sh/unused",
+        payload,
+        state_path=tmp_path / "alert-state.json",
+    )
+
+    assert ok is False
+    alert_log = (tmp_path / "alert-state.jsonl").read_text(encoding="utf-8")
+    assert "suppressed_env" in alert_log
 
 
 def test_commit_live_persistence_full_sell_removes_position_and_stamps_wash_sale(
