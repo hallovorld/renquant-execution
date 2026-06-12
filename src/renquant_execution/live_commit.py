@@ -85,6 +85,8 @@ def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
     partial = (status in {"partially_filled", "partial"} or (
         filled_qty > 0.0 and requested_qty > 0.0 and filled_qty < requested_qty
     ))
+    if filled and filled_qty <= 0.0:
+        filled_qty = requested_qty
     pending = not (filled or partial or rejected)
     return {
         "status": status,
@@ -95,6 +97,50 @@ def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
         "filled_qty": filled_qty,
         "filled_avg_price": filled_avg_price,
     }
+
+
+def _persistence_effect(action: str) -> str:
+    if action == "BUY":
+        return "increase_position"
+    if action == "SELL":
+        return "decrease_position"
+    return "unknown"
+
+
+def _planned_persistence_mutations(
+    *,
+    idx: int,
+    order: dict[str, Any],
+    result: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not (result["filled"] or result["partial"]):
+        return []
+    symbol = order.get("symbol") or order.get("ticker")
+    action = str(order.get("action", "")).upper()
+    order_id = order.get("order_id") or order.get("id")
+    common = {
+        "readonly": True,
+        "committed": False,
+        "symbol": symbol,
+        "action": action,
+        "source_order_id": order_id,
+        "status": result["status"],
+        "filled_qty": result["filled_qty"],
+        "filled_avg_price": result["filled_avg_price"],
+    }
+    return [
+        {
+            "mutation_id": f"planned-order-{idx}-live-state",
+            "mutation_type": "planned_live_state_update",
+            "effect": _persistence_effect(action),
+            **common,
+        },
+        {
+            "mutation_id": f"planned-order-{idx}-trade-log",
+            "mutation_type": "planned_trade_log_append",
+            **common,
+        },
+    ]
 
 
 def _planned_state_mutations(
@@ -122,6 +168,13 @@ def _planned_state_mutations(
             "filled_qty": result["filled_qty"],
             "filled_avg_price": result["filled_avg_price"],
         })
+        mutations.extend(
+            _planned_persistence_mutations(
+                idx=idx,
+                order=order,
+                result=result,
+            )
+        )
     return mutations
 
 
