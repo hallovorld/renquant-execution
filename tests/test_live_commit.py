@@ -130,6 +130,11 @@ def test_classify_broker_result_covers_live_order_statuses() -> None:
     })["partial"] is True
     assert classify_broker_result({"status": "new", "quantity": 3})["pending"] is True
     assert classify_broker_result({"status": "rejected", "quantity": 3})["rejected"] is True
+    assert classify_broker_result({
+        "status": "filled",
+        "quantity": 4,
+        "filled_avg_price": 50.0,
+    })["filled_qty"] == pytest.approx(4.0)
 
 
 def test_build_live_commit_plan_preserves_existing_state_mutations() -> None:
@@ -211,7 +216,40 @@ def test_execute_live_commit_submits_sell_first_and_returns_non_readonly_plan() 
     assert plan.readonly is False
     assert plan.broker_name == "recording"
     assert [row["action"] for row in plan.submitted_orders] == ["SELL", "BUY"]
-    assert all(row["readonly"] is False for row in plan.state_mutations)
+    assert [row["mutation_type"] for row in plan.state_mutations] == [
+        "order_submission",
+        "planned_live_state_update",
+        "planned_trade_log_append",
+        "order_submission",
+        "planned_live_state_update",
+        "planned_trade_log_append",
+    ]
+    assert plan.state_mutations[0]["readonly"] is False
+    assert plan.state_mutations[1] == {
+        "mutation_id": "planned-order-1-live-state",
+        "mutation_type": "planned_live_state_update",
+        "readonly": True,
+        "committed": False,
+        "effect": "decrease_position",
+        "symbol": "MSFT",
+        "action": "SELL",
+        "source_order_id": "ord-1",
+        "status": "filled",
+        "filled_qty": 1.0,
+        "filled_avg_price": 10.0,
+    }
+    assert plan.state_mutations[2] == {
+        "mutation_id": "planned-order-1-trade-log",
+        "mutation_type": "planned_trade_log_append",
+        "readonly": True,
+        "committed": False,
+        "symbol": "MSFT",
+        "action": "SELL",
+        "source_order_id": "ord-1",
+        "status": "filled",
+        "filled_qty": 1.0,
+        "filled_avg_price": 10.0,
+    }
     assert plan.execution_audit == [
         {"broker": "recording", "dry_run": False, "n_intents": 2, "n_submitted": 2}
     ]
@@ -237,7 +275,36 @@ def test_execute_live_commit_dry_run_does_not_mutate_broker() -> None:
             "quantity": 2.0,
         }
     ]
+    assert [row["mutation_type"] for row in plan.state_mutations] == ["order_submission"]
     assert plan.state_mutations[0]["readonly"] is True
+
+
+class RejectingBroker(RecordingBroker):
+    broker_name = "rejecting"
+
+    def place_order(self, symbol: str, action: str, quantity: float) -> dict:
+        self.orders.append((symbol, action, quantity))
+        return {
+            "order_id": f"rej-{len(self.orders)}",
+            "status": "rejected",
+            "symbol": symbol,
+            "action": action,
+            "quantity": quantity,
+            "reject_reason": "test rejection",
+        }
+
+
+def test_execute_live_commit_does_not_plan_persistence_for_rejected_orders() -> None:
+    broker = RejectingBroker()
+
+    plan = execute_live_commit(
+        broker=broker,
+        order_intents=[{"ticker": "AAPL", "action": "buy", "quantity": 2}],
+    )
+
+    assert [row["mutation_type"] for row in plan.state_mutations] == ["order_submission"]
+    assert plan.state_mutations[0]["rejected"] is True
+    assert plan.state_mutations[0]["readonly"] is False
 
 
 def test_live_commit_plan_requires_broker_name() -> None:
