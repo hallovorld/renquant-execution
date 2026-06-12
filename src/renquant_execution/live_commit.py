@@ -1,4 +1,4 @@
-"""Readonly live commit-plan contract for native trading cutover."""
+"""Live commit-plan contract for native trading cutover."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,15 +6,16 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .broker import normalize_order_intent
+from .broker import BaseBroker, normalize_order_intent
+from .execution import BrokerExecutionPipeline, ExecutionContext
 
 
 @dataclass(frozen=True)
 class LiveCommitPlan:
     """Auditable plan for live execution commit semantics.
 
-    The plan is intentionally readonly. It is the contract boundary used while
-    umbrella RunnerAdapter.commit semantics are lifted into renquant-execution.
+    ``readonly=True`` plans are rehearsal artifacts. ``readonly=False`` plans are
+    produced only after a caller executes against an already-connected broker.
     """
 
     broker_name: str
@@ -96,7 +97,11 @@ def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _planned_state_mutations(submitted_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _planned_state_mutations(
+    submitted_orders: list[dict[str, Any]],
+    *,
+    readonly: bool,
+) -> list[dict[str, Any]]:
     mutations: list[dict[str, Any]] = []
     for idx, order in enumerate(submitted_orders, start=1):
         symbol = order.get("symbol") or order.get("ticker")
@@ -105,7 +110,7 @@ def _planned_state_mutations(submitted_orders: list[dict[str, Any]]) -> list[dic
         mutations.append({
             "mutation_id": f"planned-order-{idx}",
             "mutation_type": "order_submission",
-            "readonly": True,
+            "readonly": readonly,
             "symbol": symbol,
             "action": action,
             "status": result["status"],
@@ -150,7 +155,7 @@ def build_live_commit_plan(
             field_name="state_mutations",
         )
     else:
-        state_mutations = _planned_state_mutations(submitted_orders)
+        state_mutations = _planned_state_mutations(submitted_orders, readonly=True)
     return LiveCommitPlan(
         broker_name=str(broker_name),
         order_intents=order_intents,
@@ -158,6 +163,41 @@ def build_live_commit_plan(
         state_mutations=state_mutations,
         execution_audit=audit_rows,
         readonly=True,
+    )
+
+
+def execute_live_commit(
+    *,
+    broker: BaseBroker,
+    order_intents: list[dict[str, Any]],
+    dry_run: bool = False,
+) -> LiveCommitPlan:
+    """Execute normalized order intents on an already-connected broker.
+
+    The function owns the native live commit boundary: normalize and sell-first
+    order the intents, submit them through ``BrokerExecutionPipeline``, and return
+    an auditable commit plan. Broker connection/account safety remains the
+    caller's responsibility so live account preflight cannot be hidden here.
+    """
+    normalized = sell_first_order_intents(order_intents)
+    ctx = ExecutionContext(
+        broker_name=broker.broker_name,
+        order_intents=normalized,
+        dry_run=dry_run,
+    )
+    result = BrokerExecutionPipeline(broker).run(ctx)
+    if not result.ok:
+        raise RuntimeError(f"live commit execution failed: {result}")
+    return LiveCommitPlan(
+        broker_name=broker.broker_name,
+        order_intents=normalized,
+        submitted_orders=list(ctx.submitted_orders),
+        state_mutations=_planned_state_mutations(
+            ctx.submitted_orders,
+            readonly=dry_run,
+        ),
+        execution_audit=list(ctx.audit_rows),
+        readonly=dry_run,
     )
 
 
@@ -180,6 +220,7 @@ __all__ = [
     "LiveCommitPlan",
     "build_live_commit_plan",
     "classify_broker_result",
+    "execute_live_commit",
     "sell_first_order_intents",
     "write_live_commit_plan",
 ]

@@ -15,6 +15,7 @@ from .live_commit import (
     LiveCommitPlan,
     build_live_commit_plan,
     classify_broker_result,
+    execute_live_commit,
     sell_first_order_intents,
     write_live_commit_plan,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "build_live_commit_plan",
     "classify_broker_result",
     "execution_payload",
+    "execute_live_commit",
     "get_broker",
     "lifecycle_event_from_confirmation",
     "normalize_order_intent",
