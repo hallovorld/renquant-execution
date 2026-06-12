@@ -19,6 +19,7 @@ from .live_commit import (
     sell_first_order_intents,
     write_live_commit_plan,
 )
+from .live_persistence import commit_live_persistence
 from .order_lifecycle import (
     LIFECYCLE_SCHEMA_VERSION,
     VALID_LIFECYCLE_EVENTS,
@@ -43,6 +44,7 @@ __all__ = [
     "build_order_lifecycle_event",
     "build_live_commit_plan",
     "classify_broker_result",
+    "commit_live_persistence",
     "execution_payload",
     "execute_live_commit",
     "get_broker",

@@ -10,6 +10,7 @@ from renquant_execution import (
     LiveCommitPlan,
     build_live_commit_plan,
     classify_broker_result,
+    commit_live_persistence,
     execute_live_commit,
     sell_first_order_intents,
     write_live_commit_plan,
@@ -305,6 +306,159 @@ def test_execute_live_commit_does_not_plan_persistence_for_rejected_orders() -> 
     assert [row["mutation_type"] for row in plan.state_mutations] == ["order_submission"]
     assert plan.state_mutations[0]["rejected"] is True
     assert plan.state_mutations[0]["readonly"] is False
+
+
+def test_commit_live_persistence_updates_state_and_trade_journal(tmp_path: Path) -> None:
+    state_path = tmp_path / "live_state.alpaca.json"
+    journal_path = tmp_path / "trades.jsonl"
+    state_path.write_text(
+        json.dumps({
+            "account_snapshot": {
+                "positions": {
+                    "MSFT": {
+                        "ticker": "MSFT",
+                        "quantity": 3,
+                        "avg_entry_price": 8.0,
+                    }
+                }
+            }
+        }),
+        encoding="utf-8",
+    )
+    broker = RecordingBroker()
+    plan = execute_live_commit(
+        broker=broker,
+        order_intents=[
+            {"ticker": "AAPL", "action": "buy", "quantity": 2},
+            {"ticker": "MSFT", "action": "sell", "quantity": 1},
+        ],
+    )
+
+    committed = commit_live_persistence(
+        plan,
+        live_state_path=state_path,
+        trade_journal_path=journal_path,
+        run_id="run-1",
+        timestamp="2026-06-12T05:00:00+00:00",
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    positions = state["account_snapshot"]["positions"]
+    assert positions["MSFT"]["quantity"] == pytest.approx(2.0)
+    assert positions["MSFT"]["avg_entry_price"] == pytest.approx(8.0)
+    assert positions["AAPL"] == {
+        "ticker": "AAPL",
+        "quantity": 2.0,
+        "avg_entry_price": 10.0,
+    }
+    assert state["native_persistence"] == {
+        "schema_version": 1,
+        "last_commit_timestamp": "2026-06-12T05:00:00+00:00",
+        "last_commit_run_id": "run-1",
+        "last_commit_broker": "recording",
+    }
+
+    journal_rows = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [
+        (row["symbol"], row["action"], row["filled_qty"], row["order_id"])
+        for row in journal_rows
+    ] == [
+        ("MSFT", "SELL", 1.0, "ord-1"),
+        ("AAPL", "BUY", 2.0, "ord-2"),
+    ]
+    committed_persistence = [
+        row for row in committed["state_mutations"]
+        if row["mutation_type"].startswith("planned_")
+    ]
+    assert all(row["committed"] is True for row in committed_persistence)
+    assert all(row["readonly"] is False for row in committed_persistence)
+    assert committed["persistence_audit"] == {
+        "schema_version": 1,
+        "committed_mutation_count": 4,
+        "trade_journal_row_count": 2,
+        "live_state_path": str(state_path),
+        "trade_journal_path": str(journal_path),
+        "timestamp": "2026-06-12T05:00:00+00:00",
+    }
+
+
+def test_commit_live_persistence_full_sell_removes_position_and_stamps_wash_sale(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "live_state.alpaca.json"
+    journal_path = tmp_path / "trades.jsonl"
+    state_path.write_text(
+        json.dumps({
+            "account_snapshot": {
+                "positions": {
+                    "MSFT": {
+                        "ticker": "MSFT",
+                        "quantity": 1,
+                        "avg_entry_price": 8.0,
+                    }
+                }
+            },
+            "last_sell_dates": {},
+        }),
+        encoding="utf-8",
+    )
+    plan = LiveCommitPlan(
+        broker_name="recording",
+        readonly=False,
+        order_intents=[{"symbol": "MSFT", "action": "SELL", "quantity": 1.0}],
+        submitted_orders=[],
+        state_mutations=[
+            {
+                "mutation_id": "planned-order-1-live-state",
+                "mutation_type": "planned_live_state_update",
+                "readonly": True,
+                "committed": False,
+                "symbol": "MSFT",
+                "action": "SELL",
+                "source_order_id": "ord-1",
+                "status": "filled",
+                "filled_qty": 1.0,
+                "filled_avg_price": 10.0,
+            },
+            {
+                "mutation_id": "planned-order-1-trade-log",
+                "mutation_type": "planned_trade_log_append",
+                "readonly": True,
+                "committed": False,
+                "symbol": "MSFT",
+                "action": "SELL",
+                "source_order_id": "ord-1",
+                "status": "filled",
+                "filled_qty": 1.0,
+                "filled_avg_price": 10.0,
+            },
+        ],
+    )
+
+    commit_live_persistence(
+        plan,
+        live_state_path=state_path,
+        trade_journal_path=journal_path,
+        timestamp="2026-06-12T05:00:00+00:00",
+    )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["account_snapshot"]["positions"] == {}
+    assert state["last_sell_dates"] == {"MSFT": "2026-06-12"}
+
+
+def test_commit_live_persistence_rejects_readonly_plan(tmp_path: Path) -> None:
+    plan = build_live_commit_plan(_execution_payload())
+
+    with pytest.raises(ValueError, match="readonly"):
+        commit_live_persistence(
+            plan,
+            live_state_path=tmp_path / "live_state.alpaca.json",
+            trade_journal_path=tmp_path / "trades.jsonl",
+        )
 
 
 def test_live_commit_plan_requires_broker_name() -> None:
