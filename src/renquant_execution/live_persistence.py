@@ -14,6 +14,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any
 
+from .alerts import AlertEvent, post_ntfy_alert, stable_alert_key
 from .live_commit import LiveCommitPlan
 from .order_lifecycle import build_order_lifecycle_event
 
@@ -372,9 +373,68 @@ def commit_live_persistence(
         "trade_journal_path": str(journal_path),
         "lifecycle_journal_path": str(lifecycle_journal_path) if lifecycle_journal_path else None,
         "runs_db_path": str(runs_db_path) if runs_db_path else None,
+        "run_id": run_id,
         "timestamp": asof.isoformat(),
     }
     return out
 
 
-__all__ = ["commit_live_persistence"]
+def build_live_persistence_alert_event(
+    committed_payload: dict[str, Any],
+    *,
+    taxonomy: str = "LIVE_PERSISTENCE",
+) -> AlertEvent:
+    """Build a deterministic operator summary for committed live persistence."""
+    audit = committed_payload.get("persistence_audit") or {}
+    if not isinstance(audit, dict):
+        raise ValueError("committed payload persistence_audit must be a JSON object")
+    broker_name = str(committed_payload.get("broker_name") or "unknown")
+    committed = int(audit.get("committed_mutation_count") or 0)
+    trade_rows = int(audit.get("trade_journal_row_count") or 0)
+    lifecycle_rows = int(audit.get("lifecycle_journal_row_count") or 0)
+    snapshot_rows = int(audit.get("live_state_snapshot_row_count") or 0)
+    run_id = audit.get("run_id")
+    title = f"RenQuant native live persistence committed ({broker_name})"
+    body = (
+        f"committed_mutations={committed} trade_rows={trade_rows} "
+        f"lifecycle_rows={lifecycle_rows} state_snapshots={snapshot_rows} "
+        f"live_state={audit.get('live_state_path')} "
+        f"trade_journal={audit.get('trade_journal_path')}"
+    )
+    return AlertEvent(
+        taxonomy=taxonomy,
+        title=title,
+        body=body,
+        key=stable_alert_key(
+            taxonomy,
+            broker_name,
+            run_id or audit.get("timestamp"),
+            committed,
+            trade_rows,
+            lifecycle_rows,
+            snapshot_rows,
+        ),
+        priority="default",
+        force=True,
+    )
+
+
+def post_live_persistence_alert(
+    ntfy_url: str,
+    committed_payload: dict[str, Any],
+    *,
+    state_path: str | Path | None = None,
+) -> bool:
+    """Best-effort operator alert for a completed native persistence commit."""
+    return post_ntfy_alert(
+        ntfy_url,
+        build_live_persistence_alert_event(committed_payload),
+        state_path=Path(state_path) if state_path is not None else None,
+    )
+
+
+__all__ = [
+    "build_live_persistence_alert_event",
+    "commit_live_persistence",
+    "post_live_persistence_alert",
+]
