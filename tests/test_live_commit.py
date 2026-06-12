@@ -6,9 +6,11 @@ from pathlib import Path
 import pytest
 
 from renquant_execution import (
+    BaseBroker,
     LiveCommitPlan,
     build_live_commit_plan,
     classify_broker_result,
+    execute_live_commit,
     sell_first_order_intents,
     write_live_commit_plan,
 )
@@ -158,6 +160,84 @@ def test_build_live_commit_plan_preserves_explicit_empty_audit_and_mutations() -
 def test_build_live_commit_plan_rejects_live_mode() -> None:
     with pytest.raises(ValueError, match="readonly-only"):
         build_live_commit_plan(_execution_payload(), readonly=False)
+
+
+class RecordingBroker(BaseBroker):
+    broker_name = "recording"
+
+    def __init__(self) -> None:
+        self.orders: list[tuple[str, str, float]] = []
+
+    def connect(self) -> None:
+        return None
+
+    def disconnect(self) -> None:
+        return None
+
+    def get_position(self, symbol: str) -> float:
+        return 0.0
+
+    def get_account_value(self) -> float:
+        return 1000.0
+
+    def get_cash(self) -> float:
+        return 1000.0
+
+    def place_order(self, symbol: str, action: str, quantity: float) -> dict:
+        self.orders.append((symbol, action, quantity))
+        return {
+            "order_id": f"ord-{len(self.orders)}",
+            "status": "filled",
+            "symbol": symbol,
+            "action": action,
+            "quantity": quantity,
+            "filled_qty": quantity,
+            "filled_avg_price": 10.0,
+        }
+
+
+def test_execute_live_commit_submits_sell_first_and_returns_non_readonly_plan() -> None:
+    broker = RecordingBroker()
+
+    plan = execute_live_commit(
+        broker=broker,
+        order_intents=[
+            {"ticker": "AAPL", "action": "buy", "quantity": 2},
+            {"ticker": "MSFT", "action": "sell", "quantity": 1},
+        ],
+    )
+
+    assert broker.orders == [("MSFT", "SELL", 1.0), ("AAPL", "BUY", 2.0)]
+    assert plan.readonly is False
+    assert plan.broker_name == "recording"
+    assert [row["action"] for row in plan.submitted_orders] == ["SELL", "BUY"]
+    assert all(row["readonly"] is False for row in plan.state_mutations)
+    assert plan.execution_audit == [
+        {"broker": "recording", "dry_run": False, "n_intents": 2, "n_submitted": 2}
+    ]
+
+
+def test_execute_live_commit_dry_run_does_not_mutate_broker() -> None:
+    broker = RecordingBroker()
+
+    plan = execute_live_commit(
+        broker=broker,
+        order_intents=[{"ticker": "AAPL", "action": "buy", "quantity": 2}],
+        dry_run=True,
+    )
+
+    assert broker.orders == []
+    assert plan.readonly is True
+    assert plan.submitted_orders == [
+        {
+            "order_id": "dry-1",
+            "status": "dry_run",
+            "symbol": "AAPL",
+            "action": "BUY",
+            "quantity": 2.0,
+        }
+    ]
+    assert plan.state_mutations[0]["readonly"] is True
 
 
 def test_live_commit_plan_requires_broker_name() -> None:
