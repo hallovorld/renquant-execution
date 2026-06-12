@@ -11,9 +11,11 @@ import datetime as dt
 import json
 import math
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 from .live_commit import LiveCommitPlan
+from .order_lifecycle import build_order_lifecycle_event
 
 _PERSISTENCE_MUTATIONS = {
     "planned_live_state_update",
@@ -57,6 +59,60 @@ def _append_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("a", encoding="utf-8") as fh:
         for row in rows:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _ensure_live_state_snapshot_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS live_state_snapshots (
+            run_id          TEXT PRIMARY KEY,
+            run_date        DATE NOT NULL,
+            strategy        TEXT,
+            regime          TEXT,
+            confidence      REAL,
+            high_water_mark REAL,
+            cash            REAL,
+            portfolio_value REAL,
+            n_holdings      INTEGER,
+            state_json      TEXT NOT NULL,
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lss_date ON live_state_snapshots(run_date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lss_strategy ON live_state_snapshots(strategy)")
+
+
+def _record_live_state_snapshot(
+    *,
+    db_path: Path,
+    run_id: str,
+    run_date: dt.date,
+    strategy: str,
+    state: dict[str, Any],
+) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    positions = ((state.get("account_snapshot") or {}).get("positions") or {})
+    n_holdings = len(positions) if isinstance(positions, dict) else None
+    with sqlite3.connect(db_path) as conn:
+        _ensure_live_state_snapshot_schema(conn)
+        conn.execute(
+            """INSERT OR REPLACE INTO live_state_snapshots
+                  (run_id, run_date, strategy, regime, confidence,
+                   high_water_mark, cash, portfolio_value, n_holdings, state_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                run_id,
+                run_date.isoformat(),
+                strategy,
+                state.get("regime"),
+                state.get("regime_confidence"),
+                state.get("high_water_mark"),
+                state.get("cash"),
+                state.get("portfolio_value"),
+                n_holdings,
+                json.dumps(state, sort_keys=True),
+            ),
+        )
+        conn.commit()
 
 
 def _positions(state: dict[str, Any]) -> dict[str, Any]:
@@ -166,6 +222,40 @@ def _trade_journal_row(
     }
 
 
+def _lifecycle_event_from_mutation(
+    mutation: dict[str, Any],
+    *,
+    broker_name: str,
+    run_id: str | None,
+    asof: dt.datetime,
+    source_job: str,
+    source_task: str,
+) -> dict[str, Any]:
+    status = str(mutation.get("status") or "").lower()
+    event = "partially_filled" if status in {"partial", "partially_filled"} else "filled"
+    return build_order_lifecycle_event(
+        event=event,
+        source_job=source_job,
+        source_task=source_task,
+        broker=broker_name,
+        symbol=str(mutation.get("symbol") or ""),
+        action=str(mutation.get("action") or ""),
+        quantity=float(mutation.get("filled_qty") or 0.0),
+        order_id=(
+            str(mutation["source_order_id"])
+            if mutation.get("source_order_id") is not None
+            else None
+        ),
+        run_id=run_id,
+        timestamp=asof,
+        status=status or None,
+        fill={
+            "filled_qty": mutation.get("filled_qty"),
+            "filled_avg_price": mutation.get("filled_avg_price"),
+        },
+    )
+
+
 def _payload_from_plan(plan: LiveCommitPlan | dict[str, Any]) -> dict[str, Any]:
     return plan.to_payload() if isinstance(plan, LiveCommitPlan) else dict(plan)
 
@@ -177,6 +267,11 @@ def commit_live_persistence(
     trade_journal_path: str | Path,
     run_id: str | None = None,
     timestamp: dt.datetime | str | None = None,
+    runs_db_path: str | Path | None = None,
+    strategy: str = "renquant_104",
+    lifecycle_journal_path: str | Path | None = None,
+    lifecycle_source_job: str = "native_live_run_candidate",
+    lifecycle_source_task: str = "commit_live_persistence",
 ) -> dict[str, Any]:
     """Commit filled live orders to native state and trade-journal artifacts.
 
@@ -200,6 +295,7 @@ def commit_live_persistence(
     state = _load_state(state_path)
     committed_ids: set[str] = set()
     journal_rows: list[dict[str, Any]] = []
+    lifecycle_rows: list[dict[str, Any]] = []
 
     for mutation in mutations:
         if not isinstance(mutation, dict):
@@ -221,6 +317,16 @@ def commit_live_persistence(
                     asof=asof,
                 )
             )
+            lifecycle_rows.append(
+                _lifecycle_event_from_mutation(
+                    mutation,
+                    broker_name=broker_name,
+                    run_id=run_id,
+                    asof=asof,
+                    source_job=lifecycle_source_job,
+                    source_task=lifecycle_source_task,
+                )
+            )
         committed_ids.add(str(mutation_id))
 
     state["native_persistence"] = {
@@ -231,6 +337,16 @@ def commit_live_persistence(
     }
     _write_json_atomic(state_path, state)
     _append_jsonl(journal_path, journal_rows)
+    if lifecycle_journal_path is not None:
+        _append_jsonl(Path(lifecycle_journal_path), lifecycle_rows)
+    if runs_db_path is not None and run_id is not None:
+        _record_live_state_snapshot(
+            db_path=Path(runs_db_path),
+            run_id=run_id,
+            run_date=asof.date(),
+            strategy=strategy,
+            state=state,
+        )
 
     committed_mutations: list[dict[str, Any]] = []
     for mutation in mutations:
@@ -250,8 +366,12 @@ def commit_live_persistence(
         "schema_version": 1,
         "committed_mutation_count": len(committed_ids),
         "trade_journal_row_count": len(journal_rows),
+        "lifecycle_journal_row_count": len(lifecycle_rows) if lifecycle_journal_path else 0,
+        "live_state_snapshot_row_count": 1 if runs_db_path is not None and run_id else 0,
         "live_state_path": str(state_path),
         "trade_journal_path": str(journal_path),
+        "lifecycle_journal_path": str(lifecycle_journal_path) if lifecycle_journal_path else None,
+        "runs_db_path": str(runs_db_path) if runs_db_path else None,
         "timestamp": asof.isoformat(),
     }
     return out

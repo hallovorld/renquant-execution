@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -379,10 +380,92 @@ def test_commit_live_persistence_updates_state_and_trade_journal(tmp_path: Path)
         "schema_version": 1,
         "committed_mutation_count": 4,
         "trade_journal_row_count": 2,
+        "lifecycle_journal_row_count": 0,
+        "live_state_snapshot_row_count": 0,
         "live_state_path": str(state_path),
         "trade_journal_path": str(journal_path),
+        "lifecycle_journal_path": None,
+        "runs_db_path": None,
         "timestamp": "2026-06-12T05:00:00+00:00",
     }
+
+
+def test_commit_live_persistence_records_db_snapshot_and_lifecycle_journal(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "live_state.alpaca.json"
+    journal_path = tmp_path / "trades.jsonl"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    db_path = tmp_path / "runs.alpaca.db"
+    state_path.write_text(
+        json.dumps({
+            "regime": "BULL_CALM",
+            "regime_confidence": 0.61,
+            "high_water_mark": 12000.0,
+            "cash": 900.0,
+            "portfolio_value": 12050.0,
+            "account_snapshot": {"positions": {}},
+        }),
+        encoding="utf-8",
+    )
+    broker = RecordingBroker()
+    plan = execute_live_commit(
+        broker=broker,
+        order_intents=[{"ticker": "AAPL", "action": "buy", "quantity": 2}],
+    )
+
+    committed = commit_live_persistence(
+        plan,
+        live_state_path=state_path,
+        trade_journal_path=journal_path,
+        lifecycle_journal_path=lifecycle_path,
+        runs_db_path=db_path,
+        run_id="run-db-1",
+        strategy="renquant_104_live",
+        timestamp="2026-06-12T05:00:00+00:00",
+    )
+
+    lifecycle_rows = [
+        json.loads(line)
+        for line in lifecycle_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(lifecycle_rows) == 1
+    assert lifecycle_rows[0]["schema_version"] == "order-lifecycle-v1"
+    assert lifecycle_rows[0]["event"] == "filled"
+    assert lifecycle_rows[0]["run_id"] == "run-db-1"
+    assert lifecycle_rows[0]["broker"] == "recording"
+    assert lifecycle_rows[0]["order_id"] == "ord-1"
+    assert lifecycle_rows[0]["symbol"] == "AAPL"
+    assert lifecycle_rows[0]["action"] == "BUY"
+    assert lifecycle_rows[0]["quantity"] == pytest.approx(2.0)
+    assert lifecycle_rows[0]["attribution"] == {
+        "source_job": "native_live_run_candidate",
+        "source_task": "commit_live_persistence",
+    }
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """SELECT run_id, run_date, strategy, regime, confidence,
+                      high_water_mark, cash, portfolio_value, n_holdings, state_json
+                 FROM live_state_snapshots"""
+        ).fetchone()
+    assert row[:9] == (
+        "run-db-1",
+        "2026-06-12",
+        "renquant_104_live",
+        "BULL_CALM",
+        0.61,
+        12000.0,
+        900.0,
+        12050.0,
+        1,
+    )
+    snapshot_state = json.loads(row[9])
+    assert snapshot_state["account_snapshot"]["positions"]["AAPL"]["quantity"] == 2.0
+    assert committed["persistence_audit"]["lifecycle_journal_row_count"] == 1
+    assert committed["persistence_audit"]["live_state_snapshot_row_count"] == 1
+    assert committed["persistence_audit"]["lifecycle_journal_path"] == str(lifecycle_path)
+    assert committed["persistence_audit"]["runs_db_path"] == str(db_path)
 
 
 def test_commit_live_persistence_full_sell_removes_position_and_stamps_wash_sale(
