@@ -143,10 +143,11 @@ def test_severity_above_threshold_cancels_market_orders(tmp_path, monkeypatch):
         "stale_minutes": 1.0,
     }
     client = MagicMock()
+    # severity is a gap-DOWN (-12 sigma) -> the adverse side is SELLs.
     client.get_orders.return_value = [
-        _mock_order(symbol="META", id="o-1"),
-        _mock_order(symbol="TXN", id="o-2"),
-        _mock_order(symbol="AAPL", order_type="OrderType.LIMIT", id="o-3"),
+        _mock_order(symbol="META", side="sell", id="o-1"),
+        _mock_order(symbol="TXN", side="sell", id="o-2"),
+        _mock_order(symbol="AAPL", order_type="OrderType.LIMIT", side="sell", id="o-3"),
     ]
     monkeypatch.setenv("ALPACA_API_KEY", "k")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
@@ -168,6 +169,69 @@ def test_severity_above_threshold_cancels_market_orders(tmp_path, monkeypatch):
     ntfy.assert_called_once()
     event = ntfy.call_args.args[1]
     assert event.taxonomy == "PREOPEN_CANCEL"
+
+
+def _run_gate(client, metrics, monkeypatch, tmp_path, **kw):
+    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "s")
+    monkeypatch.setenv("RENQUANT_PREOPEN_CANCEL_LEDGER", str(tmp_path / "ledger.jsonl"))
+    with patch.object(gate, "compute_overnight_severity", return_value=metrics), \
+            patch.object(gate, "post_ntfy_alert"):
+        return gate.cancel_stale_market_orders(
+            threshold_sigma=2.0, dry_run=False,
+            trading_client_factory=_client_factory(client),
+            orders_request_factory=_orders_request, open_status="open", **kw)
+
+
+def _metrics(severity):
+    return {"source": "ES=F", "prior_close": 5000.0, "latest": 4900.0, "current_pct": severity * 0.005,
+            "sigma_60d": 0.005, "severity": severity, "n_obs": 100, "stale_minutes": 1.0}
+
+
+def test_gap_down_keeps_buys_cancels_sells(tmp_path, monkeypatch):
+    """The 2026-06-23 incident fix: a severe gap-DOWN must NOT cancel buy orders
+    (a cheaper entry); it cancels only the sells."""
+    client = MagicMock()
+    client.get_orders.return_value = [
+        _mock_order(symbol="CRWD", side="buy", id="b-1"),
+        _mock_order(symbol="AVGO", side="buy", id="b-2"),
+        _mock_order(symbol="MU", side="sell", id="s-1"),
+    ]
+    result = _run_gate(client, _metrics(-2.52), monkeypatch, tmp_path)
+    assert result["cancelled"] == ["MU"]
+    assert result["kept"] == 2
+    assert [c.args[0] for c in client.cancel_order_by_id.call_args_list] == ["s-1"]
+
+
+def test_gap_up_cancels_buys_keeps_sells(tmp_path, monkeypatch):
+    client = MagicMock()
+    client.get_orders.return_value = [
+        _mock_order(symbol="CRWD", side="buy", id="b-1"),
+        _mock_order(symbol="MU", side="sell", id="s-1"),
+    ]
+    result = _run_gate(client, _metrics(+2.52), monkeypatch, tmp_path)
+    assert result["cancelled"] == ["CRWD"]
+    assert result["kept"] == 1
+    assert [c.args[0] for c in client.cancel_order_by_id.call_args_list] == ["b-1"]
+
+
+def test_gap_down_all_buys_keeps_all(tmp_path, monkeypatch):
+    client = MagicMock()
+    client.get_orders.return_value = [_mock_order(symbol="CRWD", side="buy", id="b-1")]
+    result = _run_gate(client, _metrics(-2.52), monkeypatch, tmp_path)
+    assert result["cancelled"] == []
+    assert result["action"] == "triggered_all_favorable_kept"
+    client.cancel_order_by_id.assert_not_called()
+
+
+def test_cancel_both_sides_flag_cancels_everything(tmp_path, monkeypatch):
+    client = MagicMock()
+    client.get_orders.return_value = [
+        _mock_order(symbol="CRWD", side="buy", id="b-1"),
+        _mock_order(symbol="MU", side="sell", id="s-1"),
+    ]
+    result = _run_gate(client, _metrics(-2.52), monkeypatch, tmp_path, cancel_both_sides=True)
+    assert sorted(result["cancelled"]) == ["CRWD", "MU"]
 
 
 def test_dry_run_does_not_actually_cancel(monkeypatch):
@@ -216,8 +280,8 @@ def test_cancel_failure_does_not_abort_batch(tmp_path, monkeypatch):
     }
     client = MagicMock()
     client.get_orders.return_value = [
-        _mock_order(symbol="META", id="o-1"),
-        _mock_order(symbol="TXN", id="o-2"),
+        _mock_order(symbol="META", side="sell", id="o-1"),
+        _mock_order(symbol="TXN", side="sell", id="o-2"),
     ]
     client.cancel_order_by_id.side_effect = [Exception("alpaca timeout"), None]
     monkeypatch.setenv("ALPACA_API_KEY", "k")
@@ -255,8 +319,8 @@ def test_all_cancel_failures_send_failure_alert(monkeypatch):
     }
     client = MagicMock()
     client.get_orders.return_value = [
-        _mock_order(symbol="META", id="o-1"),
-        _mock_order(symbol="TXN", id="o-2"),
+        _mock_order(symbol="META", side="sell", id="o-1"),
+        _mock_order(symbol="TXN", side="sell", id="o-2"),
     ]
     client.cancel_order_by_id.side_effect = Exception("alpaca timeout")
     monkeypatch.setenv("ALPACA_API_KEY", "k")
