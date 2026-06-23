@@ -4,6 +4,12 @@ The gate runs shortly before the NYSE open. It measures the current ES futures
 move from the prior NYSE cash close, normalizes it by recent SPY cash
 close-to-open overnight volatility, and cancels pending live Alpaca market
 orders when the move exceeds the configured sigma threshold.
+
+The cancel is DIRECTION-AWARE: it cancels only the side whose fill the gap makes
+adverse — buys on a severe gap-UP (filling high), sells on a severe gap-DOWN
+(filling low) — and keeps the favorable side (a buy into a gap-down is a cheaper
+entry, not a catastrophe). Pass ``--cancel-both-sides`` for the legacy "cancel
+everything" behaviour. Rationale + the 2026-06-23 incident: see ``_is_adverse_fill``.
 """
 from __future__ import annotations
 
@@ -276,15 +282,50 @@ def _is_market_order(order: Any) -> bool:
     return normalized in {"market", "market_on_open", "moo"}
 
 
+def _order_side(order: Any) -> str:
+    """Return 'buy' / 'sell' from an order's side (enum or string)."""
+    side = getattr(order, "side", "")
+    value = getattr(side, "value", side)
+    return str(value).rsplit(".", 1)[-1].lower()
+
+
+def _is_adverse_fill(order: Any, severity: float) -> bool:
+    """True iff this order would fill at a price ADVERSE to its own intent given the
+    overnight gap. The gate's purpose is to stop fills at catastrophic gap prices RELATIVE
+    TO INTENT — so it cancels only the side the gap hurts, and leaves the side it helps:
+
+      - severe gap UP   (severity > 0): a BUY fills HIGH (adverse) -> cancel buys; a SELL
+        fills HIGH (favorable) -> keep.
+      - severe gap DOWN (severity < 0): a SELL fills LOW (adverse) -> cancel sells; a BUY
+        fills LOW (favorable, a cheaper entry) -> keep.
+
+    Cancelling a BUY into a gap-DOWN (a cheaper entry) is backwards for the gate's stated
+    purpose and was the 2026-06-23 incident (a -2.5 sigma gap-down cancelled 5 live buys).
+    """
+    side = _order_side(order)
+    if severity > 0:
+        return side == "buy"
+    if severity < 0:
+        return side == "sell"
+    return False
+
+
 def cancel_stale_market_orders(
     *,
     threshold_sigma: float,
     dry_run: bool,
+    cancel_both_sides: bool = False,
     trading_client_factory: Callable[..., Any] | None = None,
     orders_request_factory: Callable[..., Any] | None = None,
     open_status: Any = None,
 ) -> dict[str, Any]:
-    """Cancel pending market orders if overnight severity exceeds threshold."""
+    """Cancel pending market orders if overnight severity exceeds threshold.
+
+    By default the cancel is DIRECTION-AWARE: only orders that would fill at a price adverse
+    to their own intent are cancelled (gap-up -> buys; gap-down -> sells). Orders the gap
+    helps are kept (a buy into a gap-down is a cheaper entry, not a catastrophe). Pass
+    ``cancel_both_sides=True`` for the legacy "cancel every pending order" behaviour.
+    """
     try:
         metrics = compute_overnight_severity()
     except ValueError as exc:
@@ -330,18 +371,28 @@ def cancel_stale_market_orders(
     req = orders_request_factory(status=open_status, limit=200)
     orders = client.get_orders(filter=req)
     pending_market = [order for order in orders if _is_market_order(order)]
+    if cancel_both_sides:
+        to_cancel = list(pending_market)
+    else:
+        to_cancel = [o for o in pending_market if _is_adverse_fill(o, sev)]
+    kept = [o for o in pending_market if o not in to_cancel]
     log.warning(
-        "PREOPEN-GATE: TRIGGERED - severity=%+.2f sigma >= +/-%.1f sigma; "
-        "evaluating %d pending market order(s) for cancel.",
+        "PREOPEN-GATE: TRIGGERED - severity=%+.2f sigma >= +/-%.1f sigma; %s: "
+        "%d/%d pending market order(s) fill ADVERSELY -> cancel; keeping %d favorable-side "
+        "(%s) order(s).",
         sev,
         threshold_sigma,
+        "cancel-both-sides" if cancel_both_sides else "direction-aware",
+        len(to_cancel),
         len(pending_market),
+        len(kept),
+        ",".join(sorted({_order_side(o) for o in kept})) or "none",
     )
 
     cancelled: list[str] = []
     cancelled_rows: list[dict[str, str]] = []
     failed: list[dict[str, str]] = []
-    for order in pending_market:
+    for order in to_cancel:
         log.warning(
             "  -> CANCEL %s %s qty=%s (id=%s, intent=%s)",
             getattr(order, "side", ""),
@@ -419,6 +470,8 @@ def cancel_stale_market_orders(
         action = "partial_cancelled"
     elif cancelled:
         action = "cancelled"
+    elif pending_market and not to_cancel:
+        action = "triggered_all_favorable_kept"
     else:
         action = "triggered_no_market_orders"
     return {
@@ -426,6 +479,8 @@ def cancel_stale_market_orders(
         "cancelled": cancelled,
         "failed": failed,
         "considered": len(pending_market),
+        "to_cancel": len(to_cancel),
+        "kept": len(kept),
         "action": action,
     }
 
@@ -510,6 +565,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compute severity and list cancelables, but do not submit cancels.",
     )
     parser.add_argument(
+        "--cancel-both-sides",
+        action="store_true",
+        help=(
+            "Legacy behaviour: on a severe gap, cancel EVERY pending market order regardless "
+            "of side. Default is direction-aware (cancel only the side that fills adversely: "
+            "buys on a gap-up, sells on a gap-down)."
+        ),
+    )
+    parser.add_argument(
         "--ignore-calendar",
         action="store_true",
         help="Run even when today is not an NYSE trading session.",
@@ -526,12 +590,14 @@ def main(argv: list[str] | None = None) -> int:
     result = cancel_stale_market_orders(
         threshold_sigma=args.severity_threshold_sigma,
         dry_run=args.dry_run,
+        cancel_both_sides=args.cancel_both_sides,
     )
     log.info(
-        "Done. Action=%s, cancelled=%s, considered=%d.",
+        "Done. Action=%s, cancelled=%s, considered=%d, kept=%d.",
         result["action"],
         result["cancelled"],
         result["considered"],
+        result.get("kept", 0),
     )
     return 0
 
