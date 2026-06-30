@@ -256,3 +256,113 @@ def test_alpaca_broker_names_are_explicit() -> None:
 def test_get_broker_rejects_unknown_mode() -> None:
     with pytest.raises(ValueError, match="unsupported broker_type"):
         get_broker("mystery")
+
+
+# ── Fractional-share fractionable guard (renquant-pipeline #35) ─────────────
+
+
+class _FakeAsset:
+    def __init__(self, fractionable: bool) -> None:
+        self.fractionable = fractionable
+
+
+class _FakeAccount:
+    status = "ACTIVE"
+    portfolio_value = 10000.0
+    cash = 10000.0
+    non_marginable_buying_power = 10000.0
+
+
+class _FakeAlpacaClient:
+    """Minimal stand-in for alpaca-py TradingClient covering place_order."""
+
+    def __init__(self, fractionable: dict[str, bool]) -> None:
+        self._fractionable = fractionable
+        self.submitted: list[Any] = []
+        self.get_asset_calls: list[str] = []
+
+    def get_account(self):  # noqa: D401
+        return _FakeAccount()
+
+    def get_asset(self, symbol: str):
+        self.get_asset_calls.append(symbol)
+        if symbol not in self._fractionable:
+            raise RuntimeError(f"unknown asset {symbol}")
+        return _FakeAsset(self._fractionable[symbol])
+
+    def submit_order(self, order_data):
+        self.submitted.append(order_data)
+        return SimpleNamespace(
+            id="ord-1",
+            status="accepted",
+            symbol=getattr(order_data, "symbol", ""),
+            side="BUY",
+            qty=getattr(order_data, "qty", 0.0),
+            filled_qty=0.0,
+            filled_avg_price=0.0,
+        )
+
+
+def _broker_with_client(client: _FakeAlpacaClient) -> AlpacaBroker:
+    broker = AlpacaBroker(paper=True)
+    broker._trading_client = client  # noqa: SLF001 — inject fake, skip connect()
+    return broker
+
+
+def test_fractionable_symbol_passes_fractional_qty_through() -> None:
+    client = _FakeAlpacaClient({"BLK": True})
+    broker = _broker_with_client(client)
+
+    result = broker.place_order("BLK", "buy", 0.435578)
+
+    assert len(client.submitted) == 1
+    assert client.submitted[0].qty == 0.435578
+    assert result["quantity"] == 0.435578
+    # fractionable lookup is cached — a second order does not re-fetch the asset.
+    broker.place_order("BLK", "buy", 0.2)
+    assert client.get_asset_calls == ["BLK"]
+
+
+def test_non_fractionable_symbol_floors_qty_to_whole_share() -> None:
+    client = _FakeAlpacaClient({"GS": False})
+    broker = _broker_with_client(client)
+
+    result = broker.place_order("GS", "buy", 2.7)
+
+    assert len(client.submitted) == 1
+    assert client.submitted[0].qty == 2.0  # floored down, never up
+    assert result["quantity"] == 2.0
+
+
+def test_non_fractionable_sub_one_share_is_skipped_not_submitted() -> None:
+    client = _FakeAlpacaClient({"GS": False})
+    broker = _broker_with_client(client)
+
+    result = broker.place_order("GS", "buy", 0.4)
+
+    assert client.submitted == []  # never reaches the broker
+    assert result["status"] == "skipped_non_fractionable_dust"
+    assert result["quantity"] == 0.0
+
+
+def test_whole_share_qty_skips_fractionable_lookup_entirely() -> None:
+    client = _FakeAlpacaClient({})  # get_asset would raise if called
+    broker = _broker_with_client(client)
+
+    result = broker.place_order("AAPL", "buy", 3)
+
+    assert client.get_asset_calls == []  # integral qty → no lookup
+    assert client.submitted[0].qty == 3.0
+    assert result["quantity"] == 3.0
+
+
+def test_asset_lookup_failure_degrades_to_whole_share() -> None:
+    # get_asset raises (symbol absent) → treated as non-fractionable, floored.
+    client = _FakeAlpacaClient({})
+    broker = _broker_with_client(client)
+
+    with pytest.warns(RuntimeWarning):
+        result = broker.place_order("ZZZZ", "buy", 1.9)
+
+    assert client.submitted[0].qty == 1.0
+    assert result["quantity"] == 1.0

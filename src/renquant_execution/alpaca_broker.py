@@ -31,6 +31,9 @@ class AlpacaBroker(BaseBroker):
         self.label = label
         self._trading_client: Any | None = None
         self._account: Any | None = None
+        # Cache of symbol -> fractionable (Alpaca asset attribute). Avoids a
+        # get_asset round-trip per order; assets' fractionability is stable.
+        self._fractionable_cache: dict[str, bool] = {}
 
     @property
     def broker_name(self) -> str:
@@ -157,16 +160,93 @@ class AlpacaBroker(BaseBroker):
         action_u = action.upper()
         if action_u not in {"BUY", "SELL"}:
             raise ValueError(f"unsupported Alpaca action: {action!r}")
+
+        # Fractional-share safety guard (renquant-pipeline #35 cash-drag
+        # follow-up). Alpaca accepts a FRACTIONAL `qty` ONLY for assets flagged
+        # `fractionable=True`, and only on MARKET orders with DAY time-in-force
+        # in the regular session — which this method already uses
+        # (MarketOrderRequest + TimeInForce.DAY). For a non-fractionable symbol
+        # we floor the qty DOWN to a whole number so the order is still valid;
+        # if that floors to 0 we return a NOOP skip rather than reject a whole
+        # pipeline run. Whole-number quantities pass through untouched.
+        qty = self._guard_fractional_qty(symbol, float(quantity))
+        if qty <= 0:
+            return {
+                "order_id": "",
+                "status": "skipped_non_fractionable_dust",
+                "symbol": symbol,
+                "side": action_u,
+                "action": action_u,
+                "quantity": 0.0,
+                "qty": 0.0,
+                "filled_qty": 0.0,
+                "filled_avg_price": 0.0,
+                "avg_price": 0.0,
+                "partial": False,
+                "created_at": "",
+                "submitted_at": "",
+                "filled_at": "",
+            }
+
         request = MarketOrderRequest(
             symbol=symbol,
-            qty=quantity,
+            qty=qty,
             side=OrderSide.BUY if action_u == "BUY" else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
         order = self._require_client().submit_order(order_data=request)
         result = _order_to_dict(order)
-        result.update({"action": action_u, "quantity": float(quantity)})
+        result.update({"action": action_u, "quantity": float(qty)})
         return result
+
+    def is_fractionable(self, symbol: str) -> bool:
+        """Whether ``symbol`` supports fractional Alpaca orders (cached).
+
+        Defaults to ``True`` (the pipeline only emits fractional qty when it
+        already intends fractional execution) but falls back to ``False`` —
+        forcing a whole-share floor — if the asset lookup fails, so an unknown
+        symbol can never silently submit an invalid fractional order.
+        """
+        key = str(symbol).upper()
+        cached = self._fractionable_cache.get(key)
+        if cached is not None:
+            return cached
+        client = self._require_client()
+        try:
+            asset = client.get_asset(symbol)
+            fractionable = bool(getattr(asset, "fractionable", False))
+        except Exception as exc:  # noqa: BLE001 — degrade safely to whole-share
+            warnings.warn(
+                f"Alpaca get_asset({symbol!r}) failed ({exc!r}); "
+                "treating as non-fractionable (whole-share floor)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            fractionable = False
+        self._fractionable_cache[key] = fractionable
+        return fractionable
+
+    def _guard_fractional_qty(self, symbol: str, quantity: float) -> float:
+        """Return a broker-safe qty: pass fractional through for fractionable
+        symbols, else floor DOWN to a whole share for non-fractionable ones."""
+        import math
+
+        if not math.isfinite(quantity) or quantity <= 0:
+            return 0.0
+        # Already a whole quantity → no fractionable lookup needed.
+        if float(quantity).is_integer():
+            return float(quantity)
+        if self.is_fractionable(symbol):
+            return float(quantity)
+        floored = math.floor(quantity)
+        if floored < 1:
+            warnings.warn(
+                f"{symbol} is not fractionable and qty {quantity} floors to 0 "
+                "— skipping order",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        return float(floored)
 
     def supports_broker_side_stops(self) -> bool:
         return True
