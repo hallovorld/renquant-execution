@@ -1,0 +1,1028 @@
+"""Stage-1 intraday order-lifecycle state machine (RFC #208 SS7/SS10/SS11b + #223 A2).
+
+Pure, broker-agnostic implementation of the order-lifecycle / idempotency
+contract pre-registered in the renquant105 RFC
+(``doc/design/2026-06-30-renquant105-intraday-decisioning-architecture.md``
+SS7, safety defaults SS10, session policy SS11b) as amended by the merged
+design-review amendment A2 (``doc/design/2026-07-01-104-105-design-review-amendments.md``):
+
+- Lifecycle states per (account, symbol, session)::
+
+    NONE -> INTENDED -> SUBMITTED -> ACCEPTED -> PARTIALLY_FILLED -> FILLED
+                 |            |              |
+                 +- REJECTED  +- CANCELED    +- (remainder) CANCELED
+                 +- STALE_PENDING (age > max_pending_age) -> reconcile -> CANCELED/FILLED
+
+- Two-level id: ``parent_intent_id = hash(account, symbol, trading_day, side,
+  signal_version)`` is the dedup key (identifies the *decision*, never a broker
+  id); ``child_order_id = parent_intent_id + ":" + attempt_n`` is the broker
+  client-order-id, fresh and unique per submission.
+- Economic invariant (hard assertion before EVERY submit)::
+
+    target_qty = cum_filled + open_qty + remaining_unsubmitted,
+    remaining_unsubmitted >= 0,  cum_filled + open_qty <= target_qty
+
+  so retries can never make total filled exceed ``target_qty``.
+- Audit invariant (monotone, MAY exceed target)::
+
+    gross_submitted_qty = cum_filled + open_qty + cum_canceled
+                          + cum_rejected + cum_expired
+
+- Re-emit rule: at most one OPEN child per parent; a remainder child is
+  eligible only when there is no OPEN child, ``cum_filled < target_qty``, and
+  the name is still gate-admitted. At most one filled position per name per
+  session (a parent reaches its target then stops).
+- Canceled-remainder eligibility: a canceled partial remainder stays eligible
+  within the session under the re-emit rule; the canceled quantity does NOT
+  reduce ``target_qty`` (it is recovered through ``remaining_unsubmitted``).
+- Reserved-cash accounting: open BUY children reserve ``unfilled x price``
+  until filled or canceled; sizing must use ``broker_cash - reserved_cash``.
+- Reconcile-before-emit: a book restored from a snapshot refuses ALL submits
+  until reconciled against broker open-orders; a reconciliation mismatch
+  halts new ENTRIES for the session (exits stay allowed) and surfaces the
+  mismatch data for alerting.
+- Timer-driven stale-pending cancel (SS10 default: 10 min, enforced between
+  decision ticks by a watchdog, never inherited by the next tick).
+- Amendment A2 (verified intraday-margin regime, effective 2026-06-04): NO
+  legacy PDT / day-trade counting anywhere. Entries bind on recorded
+  buying-power headroom fields (``non_marginable_buying_power``, consistent
+  with the pinned ``execution.buying_power_mode``); a broker-reported intraday
+  margin deficit or a broker-rule-regime mismatch is a Tier-1 condition (halt
+  new entries). Exits-always-allowed precedence: no envelope, regulatory, or
+  budget constraint may ever block a protective exit -- constraints bind
+  entries only.
+
+Broker-agnostic by construction: the only seam to a real broker is the
+``BrokerPort`` protocol; the driver helpers (``submit_remainder``,
+``run_stale_watchdog``, ``reconcile_on_restart``) are the intended call
+pattern. Nothing in this module wires into any live execution path -- the
+orchestrator/pipeline slices (RFC SS8 rows 2-3) integrate it behind the
+default-OFF intraday flag.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Mapping, Protocol
+
+ORDER_STATE_SCHEMA_VERSION = "order-state-machine-v1"
+
+#: SS10 conservative default: max pending-order age before the watchdog
+#: cancels + reconciles it *between* ticks (< the 12-min decision cadence).
+MAX_PENDING_AGE_SECONDS = 600.0
+
+_QTY_EPS = 1e-9
+_FIELD_SEP = "\x1f"  # unit separator: cannot appear in symbols/accounts
+
+SIDE_BUY = "BUY"
+SIDE_SELL = "SELL"
+_VALID_SIDES = (SIDE_BUY, SIDE_SELL)
+
+
+class LifecycleError(RuntimeError):
+    """Contract violation inside the order-lifecycle state machine."""
+
+
+class EconomicInvariantError(LifecycleError):
+    """The SS7 economic invariant would be (or has been) violated."""
+
+
+class DuplicateChildOrderError(LifecycleError):
+    """A child_order_id collision -- every submission must be unique."""
+
+
+class EntryBlockedError(LifecycleError):
+    """An ENTRY submit was refused by a policy constraint (never an exit)."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"entry blocked: {reason}")
+        self.reason = reason
+
+
+class LifecycleState(str, Enum):
+    """Parent-level lifecycle state per the SS7 diagram."""
+
+    NONE = "NONE"
+    INTENDED = "INTENDED"
+    SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    CANCELED = "CANCELED"
+    STALE_PENDING = "STALE_PENDING"
+
+
+class ChildOrderState(str, Enum):
+    """State of one broker submission (one client-order-id)."""
+
+    SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    CANCELED = "CANCELED"
+    EXPIRED = "EXPIRED"
+    STALE_PENDING = "STALE_PENDING"
+
+
+#: Child states that are live at the broker (consume open_qty + reservation).
+#: STALE_PENDING is still OPEN: the order is live until the cancel is
+#: confirmed by reconciliation (it may still race to a fill).
+OPEN_CHILD_STATES = frozenset(
+    {
+        ChildOrderState.SUBMITTED,
+        ChildOrderState.ACCEPTED,
+        ChildOrderState.PARTIALLY_FILLED,
+        ChildOrderState.STALE_PENDING,
+    }
+)
+
+
+def compute_parent_intent_id(
+    *,
+    account: str,
+    symbol: str,
+    trading_day: str,
+    side: str,
+    signal_version: str,
+) -> str:
+    """Deterministic dedup key for one *decision* (SS7 two-level id).
+
+    Stable across restarts and processes (sha256, not ``hash()``); identifies
+    the INTENDED row, never sent to the broker directly.
+    """
+    payload = _FIELD_SEP.join(
+        [
+            str(account),
+            str(symbol).upper(),
+            str(trading_day),
+            str(side).upper(),
+            str(signal_version),
+        ]
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"pi-{digest[:20]}"
+
+
+def child_order_id(parent_intent_id: str, attempt_n: int) -> str:
+    """Broker client-order-id: unique per submission (SS7)."""
+    return f"{parent_intent_id}:{attempt_n}"
+
+
+def _utc(ts: dt.datetime) -> dt.datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=dt.timezone.utc)
+    return ts
+
+
+@dataclass
+class ChildOrder:
+    """One broker submission attempt for a parent intent."""
+
+    child_order_id: str
+    attempt_n: int
+    requested_qty: float
+    price: float  # limit / marketable reference price used for reservation
+    submitted_at: dt.datetime
+    state: ChildOrderState = ChildOrderState.SUBMITTED
+    filled_qty: float = 0.0
+
+    @property
+    def unfilled_qty(self) -> float:
+        return self.requested_qty - self.filled_qty
+
+    @property
+    def is_open(self) -> bool:
+        return self.state in OPEN_CHILD_STATES
+
+    def to_snapshot(self) -> dict[str, Any]:
+        return {
+            "child_order_id": self.child_order_id,
+            "attempt_n": self.attempt_n,
+            "requested_qty": self.requested_qty,
+            "price": self.price,
+            "submitted_at": self.submitted_at.isoformat(),
+            "state": self.state.value,
+            "filled_qty": self.filled_qty,
+        }
+
+    @classmethod
+    def from_snapshot(cls, row: Mapping[str, Any]) -> "ChildOrder":
+        return cls(
+            child_order_id=str(row["child_order_id"]),
+            attempt_n=int(row["attempt_n"]),
+            requested_qty=float(row["requested_qty"]),
+            price=float(row["price"]),
+            submitted_at=_utc(dt.datetime.fromisoformat(str(row["submitted_at"]))),
+            state=ChildOrderState(row["state"]),
+            filled_qty=float(row["filled_qty"]),
+        )
+
+
+@dataclass
+class ParentIntent:
+    """One decision row: the SS7 dedup unit with its cumulative accounting."""
+
+    parent_intent_id: str
+    account: str
+    symbol: str
+    trading_day: str
+    side: str
+    signal_version: str
+    target_qty: float
+    children: list[ChildOrder] = field(default_factory=list)
+    cum_canceled: float = 0.0
+    cum_rejected: float = 0.0
+    cum_expired: float = 0.0
+
+    # -- economic accounting -------------------------------------------------
+    @property
+    def cum_filled(self) -> float:
+        return sum(c.filled_qty for c in self.children)
+
+    @property
+    def open_qty(self) -> float:
+        return sum(c.unfilled_qty for c in self.children if c.is_open)
+
+    @property
+    def remaining_unsubmitted(self) -> float:
+        """target_qty - cum_filled - open_qty (economic invariant, >= 0)."""
+        return self.target_qty - self.cum_filled - self.open_qty
+
+    # -- audit accounting ----------------------------------------------------
+    @property
+    def gross_submitted_qty(self) -> float:
+        """Audit invariant: monotone gross of all attempts; MAY exceed target."""
+        return (
+            self.cum_filled
+            + self.open_qty
+            + self.cum_canceled
+            + self.cum_rejected
+            + self.cum_expired
+        )
+
+    @property
+    def open_child(self) -> ChildOrder | None:
+        for c in self.children:
+            if c.is_open:
+                return c
+        return None
+
+    @property
+    def state(self) -> LifecycleState:
+        if not self.children:
+            return LifecycleState.INTENDED
+        if self.cum_filled >= self.target_qty - _QTY_EPS:
+            return LifecycleState.FILLED
+        open_child = self.open_child
+        if open_child is not None:
+            if open_child.state is ChildOrderState.STALE_PENDING:
+                return LifecycleState.STALE_PENDING
+            if self.cum_filled > _QTY_EPS:
+                return LifecycleState.PARTIALLY_FILLED
+            if open_child.state is ChildOrderState.ACCEPTED:
+                return LifecycleState.ACCEPTED
+            return LifecycleState.SUBMITTED
+        last = self.children[-1]
+        if last.state is ChildOrderState.REJECTED:
+            return LifecycleState.REJECTED
+        # CANCELED and (DAY) EXPIRED both map to the diagram's CANCELED branch;
+        # the parent stays re-emit eligible per the canceled-remainder policy.
+        return LifecycleState.CANCELED
+
+    def to_snapshot(self) -> dict[str, Any]:
+        return {
+            "parent_intent_id": self.parent_intent_id,
+            "account": self.account,
+            "symbol": self.symbol,
+            "trading_day": self.trading_day,
+            "side": self.side,
+            "signal_version": self.signal_version,
+            "target_qty": self.target_qty,
+            "children": [c.to_snapshot() for c in self.children],
+            "cum_canceled": self.cum_canceled,
+            "cum_rejected": self.cum_rejected,
+            "cum_expired": self.cum_expired,
+        }
+
+    @classmethod
+    def from_snapshot(cls, row: Mapping[str, Any]) -> "ParentIntent":
+        parent = cls(
+            parent_intent_id=str(row["parent_intent_id"]),
+            account=str(row["account"]),
+            symbol=str(row["symbol"]),
+            trading_day=str(row["trading_day"]),
+            side=str(row["side"]),
+            signal_version=str(row["signal_version"]),
+            target_qty=float(row["target_qty"]),
+            cum_canceled=float(row["cum_canceled"]),
+            cum_rejected=float(row["cum_rejected"]),
+            cum_expired=float(row["cum_expired"]),
+        )
+        seen: set[str] = set()
+        for child_row in row.get("children", []):
+            child = ChildOrder.from_snapshot(child_row)
+            if child.child_order_id in seen:
+                raise DuplicateChildOrderError(
+                    f"snapshot integrity: duplicate child_order_id {child.child_order_id!r}"
+                )
+            seen.add(child.child_order_id)
+            parent.children.append(child)
+        return parent
+
+
+@dataclass(frozen=True)
+class ReconcileMismatch:
+    kind: str  # unknown_broker_order | missing_at_broker | qty_mismatch
+    child_order_id: str
+    book_qty: float | None = None
+    broker_qty: float | None = None
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    clean: bool
+    mismatches: tuple[ReconcileMismatch, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# Amendment A2: verified broker-rule regime + intraday entry envelope.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BrokerRegimeSnapshot:
+    """Recorded broker-effective rule regime for one session (A2 SS11 blocker).
+
+    Queried read-only from the broker account endpoint before the first
+    canary tick and recorded in the run bundle. The envelope binds against
+    THESE recorded fields (verify-then-bind, never hardcode).
+
+    ``pattern_day_trader`` / ``daytrade_count`` are recorded for the audit
+    trail only -- they are DEPRECATED under the FINRA intraday-margin regime
+    (effective 2026-06-04) and MUST NEVER gate any decision.
+    """
+
+    account_type: str  # "margin" | "cash"
+    non_marginable_buying_power: float
+    intraday_margin_deficit: float = 0.0  # broker-reported deficit/adjustment
+    pattern_day_trader: bool = False  # recorded only; never gates
+    daytrade_count: int = 0  # recorded only; never gates
+
+    def to_record(self) -> dict[str, Any]:
+        """Run-bundle record of the regime the session was designed against."""
+        return {
+            "schema_version": ORDER_STATE_SCHEMA_VERSION,
+            "account_type": self.account_type,
+            "non_marginable_buying_power": self.non_marginable_buying_power,
+            "intraday_margin_deficit": self.intraday_margin_deficit,
+            "pattern_day_trader_deprecated": self.pattern_day_trader,
+            "daytrade_count_deprecated": self.daytrade_count,
+        }
+
+
+@dataclass(frozen=True)
+class IntradayEntryEnvelope:
+    """Pre-declared entry constraints (A2 SS10): bind ENTRIES only, never exits.
+
+    ``max_entry_fraction`` is the pre-declared fraction of
+    ``non_marginable_buying_power`` (consistent with the pinned
+    ``execution.buying_power_mode``) that intraday entries may consume,
+    including open/pending buy children (consistent with SS7 reserved_cash).
+    """
+
+    designed_account_type: str = "margin"
+    max_entry_fraction: float = 0.15
+
+
+#: Envelope block reasons that are Tier-1 conditions: they halt new entries
+#: for the session (sticky), not just the one order.
+TIER1_ENTRY_BLOCK_REASONS = frozenset(
+    {"broker_rule_regime_mismatch", "intraday_margin_deficit"}
+)
+
+
+@dataclass(frozen=True)
+class EntryDecision:
+    allowed: bool
+    reason: str  # "ok" or block reason
+    headroom: float
+
+
+def evaluate_entry_headroom(
+    envelope: IntradayEntryEnvelope,
+    regime: BrokerRegimeSnapshot,
+    *,
+    entry_notional: float,
+    reserved_cash: float,
+) -> EntryDecision:
+    """A2 entry check: live buying-power headroom, NO day-trade counting.
+
+    Order of severity: a regime mismatch or broker-reported intraday margin
+    deficit is Tier-1 (session halt); insufficient headroom only refuses this
+    entry. Exits must never be routed through this check.
+    """
+    headroom = (
+        envelope.max_entry_fraction * regime.non_marginable_buying_power
+        - reserved_cash
+    )
+    if regime.account_type != envelope.designed_account_type:
+        return EntryDecision(False, "broker_rule_regime_mismatch", headroom)
+    if regime.intraday_margin_deficit > 0:
+        return EntryDecision(False, "intraday_margin_deficit", headroom)
+    if entry_notional > headroom + _QTY_EPS:
+        return EntryDecision(False, "insufficient_buying_power_headroom", headroom)
+    return EntryDecision(True, "ok", headroom)
+
+
+# ---------------------------------------------------------------------------
+# The state book: all parents for one (account, trading_day) session.
+# ---------------------------------------------------------------------------
+
+
+class OrderStateBook:
+    """SS7 state machine + invariants for one (account, trading_day) session.
+
+    Pure in-memory state; the caller owns persistence (snapshot) and all
+    broker I/O (via :class:`BrokerPort` and the driver helpers below).
+    """
+
+    def __init__(self, *, account: str, trading_day: str):
+        self.account = str(account)
+        self.trading_day = str(trading_day)
+        self._parents: dict[str, ParentIntent] = {}
+        self.entries_halted = False
+        self.halt_reason: str | None = None
+        # reconcile-before-emit: set on restore; cleared only by reconcile().
+        self._needs_reconcile = False
+        # defense-in-depth: audit invariant must be monotone non-decreasing.
+        self._gross_high_water: dict[str, float] = {}
+
+    # -- introspection -------------------------------------------------------
+    @property
+    def needs_reconcile(self) -> bool:
+        return self._needs_reconcile
+
+    def parents(self) -> list[ParentIntent]:
+        return list(self._parents.values())
+
+    def parent(self, parent_intent_id: str) -> ParentIntent:
+        try:
+            return self._parents[parent_intent_id]
+        except KeyError:
+            raise LifecycleError(f"unknown parent_intent_id: {parent_intent_id!r}") from None
+
+    def lifecycle_state(self, parent_intent_id: str) -> LifecycleState:
+        """Parent state, or NONE when the intent was never registered."""
+        parent = self._parents.get(parent_intent_id)
+        return parent.state if parent is not None else LifecycleState.NONE
+
+    def open_children(self) -> list[ChildOrder]:
+        return [c for p in self._parents.values() for c in p.children if c.is_open]
+
+    def _child(self, child_order_id_: str) -> tuple[ParentIntent, ChildOrder]:
+        for parent in self._parents.values():
+            for child in parent.children:
+                if child.child_order_id == child_order_id_:
+                    return parent, child
+        raise LifecycleError(f"unknown child_order_id: {child_order_id_!r}")
+
+    # -- invariants ----------------------------------------------------------
+    def _assert_invariants(self, parent: ParentIntent) -> None:
+        if parent.cum_filled + parent.open_qty > parent.target_qty + _QTY_EPS:
+            raise EconomicInvariantError(
+                f"{parent.parent_intent_id}: cum_filled({parent.cum_filled}) + "
+                f"open_qty({parent.open_qty}) > target_qty({parent.target_qty})"
+            )
+        if parent.remaining_unsubmitted < -_QTY_EPS:
+            raise EconomicInvariantError(
+                f"{parent.parent_intent_id}: remaining_unsubmitted "
+                f"{parent.remaining_unsubmitted} < 0"
+            )
+        gross = parent.gross_submitted_qty
+        high = self._gross_high_water.get(parent.parent_intent_id, 0.0)
+        if gross < high - _QTY_EPS:
+            raise EconomicInvariantError(
+                f"{parent.parent_intent_id}: gross_submitted_qty regressed "
+                f"{high} -> {gross} (audit invariant must be monotone)"
+            )
+        self._gross_high_water[parent.parent_intent_id] = max(gross, high)
+
+    # -- session-level controls ----------------------------------------------
+    def halt_entries(self, reason: str) -> None:
+        """Halt new ENTRIES for the session; exits stay allowed (SS7/A2)."""
+        self.entries_halted = True
+        self.halt_reason = reason
+
+    # -- transitions ----------------------------------------------------------
+    def register_intent(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        signal_version: str,
+        target_qty: float,
+    ) -> ParentIntent:
+        """NONE -> INTENDED. Idempotent on the parent_intent_id dedup key."""
+        side_u = str(side).upper()
+        if side_u not in _VALID_SIDES:
+            raise LifecycleError(f"unsupported side: {side!r}")
+        target = float(target_qty)
+        if target <= 0:
+            raise LifecycleError(f"target_qty must be positive: {target_qty!r}")
+        symbol_u = str(symbol).upper()
+        pid = compute_parent_intent_id(
+            account=self.account,
+            symbol=symbol_u,
+            trading_day=self.trading_day,
+            side=side_u,
+            signal_version=str(signal_version),
+        )
+        existing = self._parents.get(pid)
+        if existing is not None:
+            if abs(existing.target_qty - target) > _QTY_EPS:
+                raise LifecycleError(
+                    f"{pid}: re-registered with different target_qty "
+                    f"({existing.target_qty} != {target}); Stage-1 targets are "
+                    "immutable within a session"
+                )
+            return existing
+        if side_u == SIDE_BUY:
+            # SS7 re-emit rule: at most one filled position per name per
+            # session. A second BUY decision for the same name is refused once
+            # the first has economic effect (fills or an open child).
+            for other in self._parents.values():
+                if (
+                    other.side == SIDE_BUY
+                    and other.symbol == symbol_u
+                    and (other.cum_filled > _QTY_EPS or other.open_qty > _QTY_EPS)
+                ):
+                    raise LifecycleError(
+                        f"one filled position per name per session: {symbol_u} "
+                        f"already has BUY parent {other.parent_intent_id} with "
+                        "fills or an open child"
+                    )
+        parent = ParentIntent(
+            parent_intent_id=pid,
+            account=self.account,
+            symbol=symbol_u,
+            trading_day=self.trading_day,
+            side=side_u,
+            signal_version=str(signal_version),
+            target_qty=target,
+        )
+        self._parents[pid] = parent
+        return parent
+
+    def can_emit_remainder(self, parent_intent_id: str, *, gate_admitted: bool = True) -> bool:
+        """SS7 re-emit rule (canceled-remainder eligibility included)."""
+        parent = self.parent(parent_intent_id)
+        if self._needs_reconcile:
+            return False
+        if parent.open_child is not None:
+            return False
+        if parent.cum_filled >= parent.target_qty - _QTY_EPS:
+            return False
+        if parent.side == SIDE_BUY and (self.entries_halted or not gate_admitted):
+            return False
+        return True
+
+    def submit_child(
+        self,
+        parent_intent_id: str,
+        *,
+        qty: float,
+        price: float,
+        now: dt.datetime,
+        gate_admitted: bool = True,
+    ) -> ChildOrder:
+        """Open a new child submission (INTENDED/CANCELED -> SUBMITTED).
+
+        Enforces, in order: reconcile-before-emit; entry policy (BUY only:
+        session halt + gate-stack admission -- exits are never policy-blocked);
+        the one-OPEN-child rule; and the SS7 hard economic assertion
+        ``cum_filled + open_qty <= target_qty`` with ``qty`` capped at
+        ``remaining_unsubmitted`` so retries can never overfill.
+        """
+        parent = self.parent(parent_intent_id)
+        if self._needs_reconcile:
+            raise LifecycleError(
+                "reconcile-before-emit: book restored from snapshot; reconcile "
+                "against broker open-orders before any submit"
+            )
+        qty_f = float(qty)
+        if qty_f <= 0:
+            raise LifecycleError(f"child qty must be positive: {qty!r}")
+        price_f = float(price)
+        if price_f <= 0:
+            raise LifecycleError(f"child price must be positive: {price!r}")
+        if parent.side == SIDE_BUY:
+            if self.entries_halted:
+                raise EntryBlockedError(self.halt_reason or "entries_halted")
+            if not gate_admitted:
+                raise EntryBlockedError("gate_stack_rejected")
+        if parent.open_child is not None:
+            raise LifecycleError(
+                f"{parent.parent_intent_id}: at most one OPEN child per parent "
+                f"(open: {parent.open_child.child_order_id})"
+            )
+        if parent.cum_filled >= parent.target_qty - _QTY_EPS:
+            raise LifecycleError(
+                f"{parent.parent_intent_id}: target already reached; a parent "
+                "reaches its target then stops (Stage-1 re-emit rule)"
+            )
+        # SS7 hard assertion before EVERY submit.
+        if parent.cum_filled + parent.open_qty > parent.target_qty + _QTY_EPS:
+            raise EconomicInvariantError(
+                f"{parent.parent_intent_id}: cum_filled + open_qty exceeds "
+                "target_qty before submit"
+            )
+        if qty_f > parent.remaining_unsubmitted + _QTY_EPS:
+            raise EconomicInvariantError(
+                f"{parent.parent_intent_id}: child qty {qty_f} > "
+                f"remaining_unsubmitted {parent.remaining_unsubmitted}; "
+                "a remainder child requests at most remaining_unsubmitted"
+            )
+        attempt_n = max((c.attempt_n for c in parent.children), default=0) + 1
+        cid = child_order_id(parent.parent_intent_id, attempt_n)
+        if any(c.child_order_id == cid for c in parent.children):
+            raise DuplicateChildOrderError(f"duplicate child_order_id: {cid!r}")
+        child = ChildOrder(
+            child_order_id=cid,
+            attempt_n=attempt_n,
+            requested_qty=qty_f,
+            price=price_f,
+            submitted_at=_utc(now),
+        )
+        parent.children.append(child)
+        self._assert_invariants(parent)
+        return child
+
+    def on_broker_ack(self, child_order_id_: str) -> ChildOrder:
+        """SUBMITTED -> ACCEPTED."""
+        parent, child = self._child(child_order_id_)
+        if child.state is not ChildOrderState.SUBMITTED:
+            raise LifecycleError(
+                f"{child_order_id_}: broker ack from state {child.state.value}"
+            )
+        child.state = ChildOrderState.ACCEPTED
+        self._assert_invariants(parent)
+        return child
+
+    def on_fill(self, child_order_id_: str, qty: float) -> ChildOrder:
+        """Apply an (incremental) fill; full fill -> FILLED."""
+        parent, child = self._child(child_order_id_)
+        if not child.is_open:
+            raise LifecycleError(
+                f"{child_order_id_}: fill on non-open state {child.state.value}"
+            )
+        qty_f = float(qty)
+        if qty_f <= 0:
+            raise LifecycleError(f"fill qty must be positive: {qty!r}")
+        if child.filled_qty + qty_f > child.requested_qty + _QTY_EPS:
+            raise EconomicInvariantError(
+                f"{child_order_id_}: fill {qty_f} would exceed requested "
+                f"{child.requested_qty} (filled {child.filled_qty})"
+            )
+        child.filled_qty += qty_f
+        if child.filled_qty >= child.requested_qty - _QTY_EPS:
+            child.state = ChildOrderState.FILLED
+        elif child.state is not ChildOrderState.STALE_PENDING:
+            child.state = ChildOrderState.PARTIALLY_FILLED
+        self._assert_invariants(parent)
+        return child
+
+    def _close_open_child(
+        self, child_order_id_: str, terminal: ChildOrderState, counter: str
+    ) -> ChildOrder:
+        parent, child = self._child(child_order_id_)
+        if not child.is_open:
+            raise LifecycleError(
+                f"{child_order_id_}: {terminal.value.lower()} on non-open "
+                f"state {child.state.value}"
+            )
+        remainder = child.unfilled_qty
+        child.state = terminal
+        setattr(parent, counter, getattr(parent, counter) + remainder)
+        self._assert_invariants(parent)
+        return child
+
+    def on_cancel(self, child_order_id_: str) -> ChildOrder:
+        """OPEN -> CANCELED; unfilled remainder moves to cum_canceled."""
+        return self._close_open_child(
+            child_order_id_, ChildOrderState.CANCELED, "cum_canceled"
+        )
+
+    def on_reject(self, child_order_id_: str) -> ChildOrder:
+        """OPEN -> REJECTED; unfilled remainder moves to cum_rejected."""
+        return self._close_open_child(
+            child_order_id_, ChildOrderState.REJECTED, "cum_rejected"
+        )
+
+    def on_expire(self, child_order_id_: str) -> ChildOrder:
+        """OPEN -> EXPIRED (DAY expiry); remainder moves to cum_expired.
+
+        Stage 1 pre-empts expiry via the SS11b close-cancel, but the counter
+        exists for reconciliation (SS7).
+        """
+        return self._close_open_child(
+            child_order_id_, ChildOrderState.EXPIRED, "cum_expired"
+        )
+
+    # -- reserved-cash accounting (SS7) ---------------------------------------
+    def reserved_cash(self, *, unsettled_buys: float = 0.0) -> float:
+        """Sum of open BUY children notionals (at reference price) + unsettled.
+
+        The unfilled remainder of a partial stays reserved until its child is
+        filled or canceled. Sizing must never use raw broker cash.
+        """
+        reserved = float(unsettled_buys)
+        for parent in self._parents.values():
+            if parent.side != SIDE_BUY:
+                continue
+            for child in parent.children:
+                if child.is_open:
+                    reserved += child.unfilled_qty * child.price
+        return reserved
+
+    def available_cash(self, broker_cash: float, *, unsettled_buys: float = 0.0) -> float:
+        """``broker_cash - reserved_cash`` -- the only sizing input (SS7)."""
+        return float(broker_cash) - self.reserved_cash(unsettled_buys=unsettled_buys)
+
+    # -- stale-pending watchdog (SS10) ----------------------------------------
+    def mark_stale(
+        self,
+        *,
+        now: dt.datetime,
+        max_age_seconds: float = MAX_PENDING_AGE_SECONDS,
+    ) -> list[ChildOrder]:
+        """Transition over-age open children to STALE_PENDING and return them.
+
+        Timer-driven (between ticks): the caller cancels each at the broker
+        and reconciles the outcome to CANCELED or FILLED; a decision tick must
+        never inherit an already-overdue order.
+        """
+        now_utc = _utc(now)
+        stale: list[ChildOrder] = []
+        for parent in self._parents.values():
+            for child in parent.children:
+                if child.state is ChildOrderState.STALE_PENDING or not child.is_open:
+                    continue
+                age = (now_utc - child.submitted_at).total_seconds()
+                if age > max_age_seconds:
+                    child.state = ChildOrderState.STALE_PENDING
+                    stale.append(child)
+        return stale
+
+    # -- persistence + restart reconciliation (SS7) ---------------------------
+    def to_snapshot(self) -> dict[str, Any]:
+        """JSON-serializable ledger snapshot of the whole session book."""
+        return {
+            "schema_version": ORDER_STATE_SCHEMA_VERSION,
+            "account": self.account,
+            "trading_day": self.trading_day,
+            "entries_halted": self.entries_halted,
+            "halt_reason": self.halt_reason,
+            "parents": [p.to_snapshot() for p in self._parents.values()],
+        }
+
+    @classmethod
+    def from_snapshot(cls, snapshot: Mapping[str, Any]) -> "OrderStateBook":
+        """Rebuild from the ledger; the book REFUSES all emits until reconciled."""
+        version = snapshot.get("schema_version")
+        if version != ORDER_STATE_SCHEMA_VERSION:
+            raise LifecycleError(f"unsupported snapshot schema_version: {version!r}")
+        book = cls(
+            account=str(snapshot["account"]),
+            trading_day=str(snapshot["trading_day"]),
+        )
+        book.entries_halted = bool(snapshot.get("entries_halted", False))
+        raw_reason = snapshot.get("halt_reason")
+        book.halt_reason = str(raw_reason) if raw_reason is not None else None
+        for row in snapshot.get("parents", []):
+            parent = ParentIntent.from_snapshot(row)
+            if parent.parent_intent_id in book._parents:
+                raise LifecycleError(
+                    f"snapshot integrity: duplicate parent {parent.parent_intent_id!r}"
+                )
+            book._parents[parent.parent_intent_id] = parent
+            book._assert_invariants(parent)
+        book._needs_reconcile = True
+        return book
+
+    def reconcile(self, broker_open_orders: Mapping[str, float]) -> ReconcileResult:
+        """Compare the book's in-flight set against broker open-orders.
+
+        Clean -> emits re-enabled. Any mismatch (broker open-orders != ledger)
+        -> halt new entries for the session, return the mismatch data for
+        alerting; exits stay allowed (SS7).
+        """
+        book_open = {c.child_order_id: c.unfilled_qty for c in self.open_children()}
+        mismatches: list[ReconcileMismatch] = []
+        for cid, broker_qty in broker_open_orders.items():
+            if cid not in book_open:
+                mismatches.append(
+                    ReconcileMismatch(
+                        kind="unknown_broker_order",
+                        child_order_id=cid,
+                        broker_qty=float(broker_qty),
+                    )
+                )
+        for cid, book_qty in book_open.items():
+            if cid not in broker_open_orders:
+                mismatches.append(
+                    ReconcileMismatch(
+                        kind="missing_at_broker",
+                        child_order_id=cid,
+                        book_qty=book_qty,
+                    )
+                )
+            elif abs(float(broker_open_orders[cid]) - book_qty) > _QTY_EPS:
+                mismatches.append(
+                    ReconcileMismatch(
+                        kind="qty_mismatch",
+                        child_order_id=cid,
+                        book_qty=book_qty,
+                        broker_qty=float(broker_open_orders[cid]),
+                    )
+                )
+        self._needs_reconcile = False
+        if mismatches:
+            self.halt_entries("reconcile_mismatch")
+            return ReconcileResult(clean=False, mismatches=tuple(mismatches))
+        return ReconcileResult(clean=True)
+
+
+# ---------------------------------------------------------------------------
+# Driven-adapter seam: the broker Protocol + driver helpers.
+# ---------------------------------------------------------------------------
+
+
+class BrokerPort(Protocol):
+    """The ONLY seam to a real broker (Alpaca adapter implements this later).
+
+    All methods are keyed on the child_order_id == broker client-order-id.
+    """
+
+    def submit_order(
+        self, *, client_order_id: str, symbol: str, side: str, qty: float
+    ) -> Mapping[str, Any]:
+        """Submit; MUST reject a duplicate client_order_id."""
+        ...
+
+    def cancel_order(self, client_order_id: str) -> Mapping[str, Any]:
+        """Request cancel; returns final ``{"status": ..., "filled_qty": ...}``."""
+        ...
+
+    def open_orders(self) -> Mapping[str, float]:
+        """Live open orders as ``{client_order_id: unfilled_qty}``."""
+        ...
+
+    def order_status(self, client_order_id: str) -> Mapping[str, Any]:
+        """Terminal/live status: ``{"status": ..., "filled_qty": ...}``."""
+        ...
+
+
+def _apply_fill_delta(book: OrderStateBook, child: ChildOrder, broker_filled: float) -> None:
+    delta = float(broker_filled) - child.filled_qty
+    if delta > _QTY_EPS:
+        book.on_fill(child.child_order_id, delta)
+
+
+def submit_remainder(
+    book: OrderStateBook,
+    port: BrokerPort,
+    parent_intent_id: str,
+    *,
+    price: float,
+    now: dt.datetime,
+    gate_admitted: bool = True,
+    envelope: IntradayEntryEnvelope | None = None,
+    regime: BrokerRegimeSnapshot | None = None,
+) -> ChildOrder | None:
+    """Emit one child sized to ``remaining_unsubmitted`` through the port.
+
+    Applies the A2 entry envelope to BUY parents when ``envelope`` +
+    ``regime`` are supplied (Tier-1 block reasons halt the session's entries);
+    SELL (exit) parents are NEVER routed through the envelope. Returns None
+    when there is nothing left to submit. A broker submit failure is recorded
+    as a REJECTED child before the error propagates.
+    """
+    parent = book.parent(parent_intent_id)
+    qty = parent.remaining_unsubmitted
+    if qty <= _QTY_EPS:
+        return None
+    if parent.side == SIDE_BUY and envelope is not None and regime is not None:
+        decision = evaluate_entry_headroom(
+            envelope,
+            regime,
+            entry_notional=qty * float(price),
+            reserved_cash=book.reserved_cash(),
+        )
+        if not decision.allowed:
+            if decision.reason in TIER1_ENTRY_BLOCK_REASONS:
+                book.halt_entries(decision.reason)
+            raise EntryBlockedError(decision.reason)
+    child = book.submit_child(
+        parent_intent_id,
+        qty=qty,
+        price=price,
+        now=now,
+        gate_admitted=gate_admitted,
+    )
+    try:
+        port.submit_order(
+            client_order_id=child.child_order_id,
+            symbol=parent.symbol,
+            side=parent.side,
+            qty=child.requested_qty,
+        )
+    except Exception:
+        book.on_reject(child.child_order_id)
+        raise
+    return child
+
+
+def run_stale_watchdog(
+    book: OrderStateBook,
+    port: BrokerPort,
+    *,
+    now: dt.datetime,
+    max_age_seconds: float = MAX_PENDING_AGE_SECONDS,
+) -> list[ChildOrder]:
+    """Timer-driven stale-pending cancel (SS10): cancel + reconcile over-age
+    children *between* decision ticks so a tick never inherits an overdue
+    order. Each stale child resolves to CANCELED or (if the cancel raced a
+    fill) FILLED, per the SS7 STALE_PENDING branch.
+    """
+    resolved: list[ChildOrder] = []
+    for child in book.mark_stale(now=now, max_age_seconds=max_age_seconds):
+        outcome = port.cancel_order(child.child_order_id)
+        _apply_fill_delta(book, child, float(outcome.get("filled_qty", 0.0)))
+        if child.state is not ChildOrderState.FILLED:
+            book.on_cancel(child.child_order_id)
+        resolved.append(child)
+    return resolved
+
+
+def reconcile_on_restart(book: OrderStateBook, port: BrokerPort) -> ReconcileResult:
+    """SS7 reconcile-before-emit: rebuild the in-flight picture from broker
+    open-orders + per-order terminal statuses, then reconcile the book.
+
+    Children the broker no longer lists as open are resolved through their
+    terminal status (fills applied first, so a cancel that raced a fill lands
+    on FILLED). Only after this does :meth:`OrderStateBook.reconcile` compare
+    the surviving in-flight set; any mismatch halts entries (exits allowed).
+    """
+    broker_open = dict(port.open_orders())
+    for child in list(book.open_children()):
+        if child.child_order_id in broker_open:
+            continue
+        status_row = port.order_status(child.child_order_id)
+        status = str(status_row.get("status", "")).lower()
+        _apply_fill_delta(book, child, float(status_row.get("filled_qty", 0.0)))
+        if child.state is ChildOrderState.FILLED:
+            continue
+        if status in {"canceled", "cancelled", "done_for_day"}:
+            book.on_cancel(child.child_order_id)
+        elif status == "expired":
+            book.on_expire(child.child_order_id)
+        elif status == "rejected":
+            book.on_reject(child.child_order_id)
+        # any other status (still live but absent from open_orders, or
+        # unknown) is left open and will surface as a reconcile mismatch.
+    return book.reconcile(broker_open)
+
+
+__all__ = [
+    "BrokerPort",
+    "BrokerRegimeSnapshot",
+    "ChildOrder",
+    "ChildOrderState",
+    "DuplicateChildOrderError",
+    "EconomicInvariantError",
+    "EntryBlockedError",
+    "EntryDecision",
+    "IntradayEntryEnvelope",
+    "LifecycleError",
+    "LifecycleState",
+    "MAX_PENDING_AGE_SECONDS",
+    "OPEN_CHILD_STATES",
+    "ORDER_STATE_SCHEMA_VERSION",
+    "OrderStateBook",
+    "ParentIntent",
+    "ReconcileMismatch",
+    "ReconcileResult",
+    "SIDE_BUY",
+    "SIDE_SELL",
+    "TIER1_ENTRY_BLOCK_REASONS",
+    "child_order_id",
+    "compute_parent_intent_id",
+    "evaluate_entry_headroom",
+    "reconcile_on_restart",
+    "run_stale_watchdog",
+    "submit_remainder",
+]
