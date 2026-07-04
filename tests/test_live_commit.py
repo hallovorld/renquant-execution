@@ -3,10 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
 from renquant_execution import (
+    FRACTIONABLE_LOOKUP_FAILED_STATUS,
+    NO_SUBMIT_STATUSES,
+    NON_FRACTIONABLE_STATUS,
+    AlpacaBroker,
     BaseBroker,
     LiveCommitPlan,
     build_live_persistence_alert_event,
@@ -89,6 +94,10 @@ def test_build_live_commit_plan_is_readonly_and_auditable() -> None:
             "partial": False,
             "pending": True,
             "rejected": False,
+            "canceled": False,
+            "expired": False,
+            "terminal": False,
+            "skipped": False,
             "filled_qty": 0.0,
             "filled_avg_price": 0.0,
         },
@@ -104,6 +113,10 @@ def test_build_live_commit_plan_is_readonly_and_auditable() -> None:
             "partial": False,
             "pending": True,
             "rejected": False,
+            "canceled": False,
+            "expired": False,
+            "terminal": False,
+            "skipped": False,
             "filled_qty": 0.0,
             "filled_avg_price": 0.0,
         },
@@ -123,6 +136,10 @@ def test_classify_broker_result_covers_live_order_statuses() -> None:
         "partial": False,
         "pending": False,
         "rejected": False,
+        "canceled": False,
+        "expired": False,
+        "terminal": True,
+        "skipped": False,
         "filled_qty": 3.0,
         "filled_avg_price": 101.5,
     }
@@ -255,7 +272,7 @@ def test_execute_live_commit_submits_sell_first_and_returns_non_readonly_plan() 
         "filled_avg_price": 10.0,
     }
     assert plan.execution_audit == [
-        {"broker": "recording", "dry_run": False, "n_intents": 2, "n_submitted": 2}
+        {"broker": "recording", "dry_run": False, "n_intents": 2, "n_submitted": 2, "n_skipped": 0}
     ]
 
 
@@ -618,3 +635,313 @@ def test_write_live_commit_plan_writes_payload(tmp_path: Path) -> None:
     plan = write_live_commit_plan(execution_json=execution, output_json=output)
 
     assert json.loads(output.read_text(encoding="utf-8")) == plan.to_payload()
+
+
+# ── End-to-end fractional-share behavior through execute_live_commit ─────────
+#
+# These exercise the full live boundary the reviewer asked for: a fractional
+# BUY -> AlpacaBroker broker result -> commit_live_persistence quantity ->
+# exit/stop policy, plus the non-fractionable and asset-lookup-failure paths,
+# driven through execute_live_commit / commit planning (not just direct broker
+# methods). They use the real AlpacaBroker with an injected fake TradingClient
+# so the live guard logic runs end to end.
+
+
+class _FakeAccount:
+    status = "ACTIVE"
+    portfolio_value = 10000.0
+    cash = 10000.0
+    non_marginable_buying_power = 10000.0
+
+
+class _FakeAlpacaClient:
+    """Fake alpaca-py TradingClient: records submits, echoes request shape."""
+
+    def __init__(
+        self,
+        fractionable: dict[str, bool],
+        *,
+        fill_status: str = "filled",
+        fill: bool = True,
+        fill_price: float = 101.0,
+    ) -> None:
+        self._fractionable = fractionable
+        self._fill_status = fill_status
+        self._fill = fill
+        self._fill_price = fill_price
+        self.submitted: list[object] = []
+        self.get_asset_calls: list[str] = []
+
+    def get_account(self):
+        return _FakeAccount()
+
+    def get_asset(self, symbol: str):
+        self.get_asset_calls.append(symbol)
+        if symbol not in self._fractionable:
+            raise RuntimeError(f"unknown asset {symbol}")
+        return SimpleNamespace(fractionable=self._fractionable[symbol])
+
+    def submit_order(self, order_data):
+        self.submitted.append(order_data)
+        qty = float(getattr(order_data, "qty", 0.0) or 0.0)
+        side = str(getattr(getattr(order_data, "side", ""), "value", "") or "").upper()
+        return SimpleNamespace(
+            id=f"ord-{len(self.submitted)}",
+            status=self._fill_status,
+            symbol=getattr(order_data, "symbol", ""),
+            side=side or "BUY",
+            qty=qty,
+            filled_qty=qty if self._fill else 0.0,
+            filled_avg_price=self._fill_price if self._fill else 0.0,
+        )
+
+
+def _alpaca_broker(client: _FakeAlpacaClient) -> AlpacaBroker:
+    broker = AlpacaBroker(paper=True, label="alpaca-frac-e2e")
+    broker._trading_client = client  # noqa: SLF001 — inject fake, skip connect()
+    return broker
+
+
+def test_e2e_fractional_buy_fills_persists_quantity_and_routes_software_stop(
+    tmp_path: Path,
+) -> None:
+    client = _FakeAlpacaClient({"BLK": True})
+    broker = _alpaca_broker(client)
+    state_path = tmp_path / "live_state.alpaca.json"
+    journal_path = tmp_path / "trades.jsonl"
+    state_path.write_text(
+        json.dumps({"account_snapshot": {"positions": {}}}), encoding="utf-8"
+    )
+
+    plan = execute_live_commit(
+        broker=broker,
+        order_intents=[{"symbol": "BLK", "action": "buy", "quantity": 0.435578}],
+    )
+
+    # Broker result: fractional qty submitted and filled (not floored/skipped).
+    submitted = plan.submitted_orders[0]
+    assert submitted["status"] == "filled"
+    assert submitted["quantity"] == pytest.approx(0.435578)
+    assert submitted["requested_quantity"] == pytest.approx(0.435578)
+    assert submitted["skipped"] is False
+    # Audit counts it as a real submission.
+    assert plan.execution_audit == [
+        {
+            "broker": "alpaca-frac-e2e",
+            "dry_run": False,
+            "n_intents": 1,
+            "n_submitted": 1,
+            "n_skipped": 0,
+        }
+    ]
+
+    # Persistence: the FRACTIONAL quantity flows all the way to live state.
+    commit_live_persistence(
+        plan,
+        live_state_path=state_path,
+        trade_journal_path=journal_path,
+        run_id="run-frac-1",
+        timestamp="2026-06-30T05:00:00+00:00",
+    )
+    positions = json.loads(state_path.read_text(encoding="utf-8"))[
+        "account_snapshot"
+    ]["positions"]
+    assert positions["BLK"]["quantity"] == pytest.approx(0.435578)
+    journal = [
+        json.loads(line)
+        for line in journal_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert journal[0]["symbol"] == "BLK"
+    assert journal[0]["filled_qty"] == pytest.approx(0.435578)
+
+    # Exit/stop policy: the fractional holding cannot get a broker-side stop, so
+    # the caller is routed to a software stop and a broker-side stop fails closed.
+    assert broker.supports_broker_side_stops("BLK", positions["BLK"]["quantity"]) is False
+    with pytest.raises(ValueError, match="whole-share"):
+        broker.place_stop_order("BLK", positions["BLK"]["quantity"], 900.0)
+
+
+def test_e2e_non_fractionable_fractional_buy_is_skipped_not_submitted() -> None:
+    client = _FakeAlpacaClient({"GS": False})
+    broker = _alpaca_broker(client)
+
+    with pytest.warns(RuntimeWarning):
+        plan = execute_live_commit(
+            broker=broker,
+            order_intents=[{"symbol": "GS", "action": "buy", "quantity": 0.4}],
+        )
+
+    submitted = plan.submitted_orders[0]
+    assert submitted["status"] == NON_FRACTIONABLE_STATUS
+    assert submitted["skipped"] is True
+    assert submitted["quantity"] == 0.0
+    assert submitted["requested_quantity"] == pytest.approx(0.4)
+    # Audit must NOT count a no-submit order as submitted.
+    assert plan.execution_audit == [
+        {
+            "broker": "alpaca-frac-e2e",
+            "dry_run": False,
+            "n_intents": 1,
+            "n_submitted": 0,
+            "n_skipped": 1,
+        }
+    ]
+    # The order_submission mutation is marked skipped; no fill is planned.
+    assert [row["mutation_type"] for row in plan.state_mutations] == ["order_submission"]
+    assert plan.state_mutations[0]["skipped"] is True
+    assert plan.state_mutations[0]["pending"] is False
+
+
+def test_e2e_asset_lookup_failure_fails_closed_through_commit() -> None:
+    client = _FakeAlpacaClient({})  # every get_asset raises
+    broker = _alpaca_broker(client)
+
+    with pytest.warns(RuntimeWarning):
+        plan = execute_live_commit(
+            broker=broker,
+            order_intents=[{"symbol": "ZZZZ", "action": "buy", "quantity": 1.9}],
+        )
+
+    submitted = plan.submitted_orders[0]
+    assert submitted["status"] == FRACTIONABLE_LOOKUP_FAILED_STATUS
+    assert submitted["skipped"] is True
+    assert submitted["quantity"] == 0.0
+    assert submitted["requested_quantity"] == pytest.approx(1.9)
+    assert plan.execution_audit[0]["n_submitted"] == 0
+    assert plan.execution_audit[0]["n_skipped"] == 1
+    # Classified as skipped (a first-class no-submit class), never pending.
+    classified = classify_broker_result(submitted)
+    assert classified["skipped"] is True
+    assert classified["pending"] is False
+    assert classified["rejected"] is False
+
+
+# ── S-FRAC stage 1: DAY-expiry / cancel-with-fill terminal classification ────
+# and float requested-vs-filled epsilon discipline (design SS4).
+
+
+def test_classify_day_expiry_unfilled_is_terminal_no_fill() -> None:
+    # Fractional orders are TIF=DAY only: an unfilled DAY order expires at
+    # the close — TERMINAL, never a resting order carried overnight.
+    result = classify_broker_result({
+        "status": "expired",
+        "quantity": 0.341052,
+        "filled_qty": 0.0,
+    })
+    assert result["expired"] is True
+    assert result["terminal"] is True
+    assert result["rejected"] is True  # legacy consumers: order is dead
+    assert result["canceled"] is False
+    assert result["pending"] is False
+    assert result["filled"] is False
+    assert result["partial"] is False
+
+
+def test_classify_partial_fill_then_expire_keeps_the_real_fill() -> None:
+    # Partial-fill-then-expire: the filled 0.20 is REAL (position + cash);
+    # only the unfilled remainder died with the DAY order.
+    result = classify_broker_result({
+        "status": "expired",
+        "quantity": 0.341052,
+        "filled_qty": 0.20,
+        "filled_avg_price": 948.0,
+    })
+    assert result["expired"] is True
+    assert result["terminal"] is True
+    assert result["partial"] is True  # persistence must book the fill
+    assert result["filled"] is False
+    assert result["pending"] is False
+    assert result["filled_qty"] == pytest.approx(0.20)
+
+
+def test_classify_cancel_with_fill_is_terminal_and_books_the_fill() -> None:
+    result = classify_broker_result({
+        "status": "canceled",
+        "quantity": 1.0,
+        "filled_qty": 0.3,
+        "filled_avg_price": 100.0,
+    })
+    assert result["canceled"] is True
+    assert result["terminal"] is True
+    assert result["partial"] is True
+    assert result["pending"] is False
+    assert result["filled_qty"] == pytest.approx(0.3)
+
+
+def test_expired_partial_fill_plans_persistence_for_the_filled_portion() -> None:
+    plan = build_live_commit_plan({
+        "broker_name": "alpaca",
+        "order_intents": [
+            {"symbol": "BLK", "action": "BUY", "quantity": 0.341052}
+        ],
+        "submitted_orders": [{
+            "order_id": "ord-exp-1",
+            "status": "expired",
+            "symbol": "BLK",
+            "action": "BUY",
+            "quantity": 0.341052,
+            "filled_qty": 0.20,
+            "filled_avg_price": 948.0,
+        }],
+        "execution_audit": [],
+    })
+
+    submission = plan.state_mutations[0]
+    assert submission["expired"] is True
+    assert submission["terminal"] is True
+    # The REAL filled portion reaches persistence planning; the dead
+    # remainder does not create any position/journal effect.
+    effects = [m for m in plan.state_mutations if m["mutation_type"] != "order_submission"]
+    assert [m["mutation_type"] for m in effects] == [
+        "planned_live_state_update",
+        "planned_trade_log_append",
+    ]
+    assert all(m["filled_qty"] == pytest.approx(0.20) for m in effects)
+
+
+def test_classify_float_fill_comparison_uses_dust_epsilon() -> None:
+    # A broker cumulative within QTY_INTEGRAL_EPS of the request is COMPLETE
+    # (float partial fills accumulate; never compare with raw >=).
+    near_full = classify_broker_result({
+        "status": "partially_filled",  # stale status; quantities decide
+        "quantity": 0.435578,
+        "filled_qty": 0.435578 - 2e-10,
+    })
+    assert near_full["filled"] is True
+
+    # Float accumulation noise ABOVE the request is also complete, not a
+    # phantom overfill/partial.
+    accumulated = classify_broker_result({
+        "status": "accepted",
+        "quantity": 0.3,
+        "filled_qty": 0.1 + 0.1 + 0.1,  # 0.30000000000000004
+    })
+    assert accumulated["filled"] is True
+    assert accumulated["partial"] is False
+
+    # A genuine fractional partial stays partial.
+    partial = classify_broker_result({
+        "status": "accepted",
+        "quantity": 0.341052,
+        "filled_qty": 0.20,
+    })
+    assert partial["partial"] is True
+    assert partial["filled"] is False
+
+
+def test_no_submit_status_matrix_is_terminal_never_pending() -> None:
+    # The full no-submit vocabulary: never submitted, never pending, never a
+    # broker rejection, always terminal, zero filled qty.
+    for status in sorted(NO_SUBMIT_STATUSES):
+        result = classify_broker_result({
+            "status": status,
+            "quantity": 0.4,
+            "requested_quantity": 0.4,
+        })
+        assert result["skipped"] is True, status
+        assert result["terminal"] is True, status
+        assert result["pending"] is False, status
+        assert result["rejected"] is False, status
+        assert result["filled"] is False, status
+        assert result["partial"] is False, status
+        assert result["filled_qty"] == 0.0, status

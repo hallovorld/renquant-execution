@@ -140,6 +140,39 @@ OPEN_CHILD_STATES = frozenset(
     }
 )
 
+#: S-FRAC stage-1 terminal vocabulary: canonical SS7 mapping from broker
+#: status strings to terminal child states. DAY expiry ("expired") is a
+#: first-class TERMINAL outcome — fractional orders are TIF=DAY only (S-FRAC
+#: design SS4), so an unfilled remainder expires at close and must never be
+#: carried as a resting order (same-day reconciliation only, no GTC carryover
+#: bookkeeping). "done_for_day" is the broker's close-out of a DAY order and
+#: maps to the SS7 diagram's CANCELED branch.
+TERMINAL_STATUS_MAP: dict[str, ChildOrderState] = {
+    "filled": ChildOrderState.FILLED,
+    "canceled": ChildOrderState.CANCELED,
+    "cancelled": ChildOrderState.CANCELED,
+    "done_for_day": ChildOrderState.CANCELED,
+    "expired": ChildOrderState.EXPIRED,
+    "rejected": ChildOrderState.REJECTED,
+    "failed": ChildOrderState.REJECTED,
+}
+
+#: Terminal state -> the parent audit counter its unfilled remainder feeds.
+_TERMINAL_COUNTERS: dict[ChildOrderState, str] = {
+    ChildOrderState.CANCELED: "cum_canceled",
+    ChildOrderState.REJECTED: "cum_rejected",
+    ChildOrderState.EXPIRED: "cum_expired",
+}
+
+
+def classify_terminal_status(status: Any) -> ChildOrderState | None:
+    """Map a broker status string to its terminal child state (or None).
+
+    ``None`` means the status is not terminal (the order may still fill);
+    callers must leave the child OPEN and let reconciliation surface it.
+    """
+    return TERMINAL_STATUS_MAP.get(str(status or "").strip().lower())
+
 
 def compute_parent_intent_id(
     *,
@@ -732,6 +765,67 @@ class OrderStateBook:
             child_order_id_, ChildOrderState.EXPIRED, "cum_expired"
         )
 
+    def apply_terminal_status(
+        self, child_order_id_: str, *, status: Any, filled_qty: float = 0.0
+    ) -> ChildOrder:
+        """Resolve one OPEN child through a broker terminal status row.
+
+        The S-FRAC stage-1 terminal classification, fill-first by contract:
+
+        1. **The filled portion is REAL.** ``filled_qty`` is the broker's
+           cumulative fill for this child at terminal sight; any delta above
+           the book's view is applied BEFORE the terminal transition. This is
+           the cancel-with-fill / partial-fill-then-expire rule: a cancel or
+           DAY expiry whose confirmation carries first-sight fills books those
+           fills — they are position and cash, not bookkeeping noise.
+        2. If the fill completes the child it lands on FILLED regardless of
+           the reported status (a cancel/expiry that raced a full fill).
+        3. Otherwise the status maps through :data:`TERMINAL_STATUS_MAP` and
+           the unfilled remainder moves to the matching audit counter
+           (``cum_canceled`` / ``cum_rejected`` / ``cum_expired``) — thereby
+           returning to ``remaining_unsubmitted`` for the SS7 re-emit rule,
+           with the audit trail preserved (``gross_submitted_qty`` monotone).
+
+        Fail-loud guards: a non-terminal/unknown status raises (leave the
+        child open and let reconcile surface it instead); a ``filled`` status
+        whose reported quantity is SHORT of the request raises rather than
+        inventing shares; a broker cumulative BELOW the book's view raises
+        through :meth:`on_fill`'s economic guards on the negative delta —
+        quantities are never silently mutated in either direction.
+        """
+        parent, child = self._child(child_order_id_)
+        if not child.is_open:
+            raise LifecycleError(
+                f"{child_order_id_}: terminal status {status!r} on non-open "
+                f"state {child.state.value}"
+            )
+        terminal = classify_terminal_status(status)
+        if terminal is None:
+            raise LifecycleError(
+                f"{child_order_id_}: {status!r} is not a terminal status; "
+                "leave the child open and reconcile instead"
+            )
+        broker_filled = float(filled_qty)
+        if broker_filled < child.filled_qty - _QTY_EPS:
+            raise EconomicInvariantError(
+                f"{child_order_id_}: broker cumulative filled_qty "
+                f"{broker_filled} regressed below the book's {child.filled_qty}"
+            )
+        delta = broker_filled - child.filled_qty
+        if delta > _QTY_EPS:
+            self.on_fill(child_order_id_, delta)
+        if child.state is ChildOrderState.FILLED:
+            return child
+        if terminal is ChildOrderState.FILLED:
+            raise EconomicInvariantError(
+                f"{child_order_id_}: broker says filled but cumulative "
+                f"filled_qty {broker_filled} is short of requested "
+                f"{child.requested_qty}; refusing to invent shares"
+            )
+        return self._close_open_child(
+            child_order_id_, terminal, _TERMINAL_COUNTERS[terminal]
+        )
+
     # -- reserved-cash accounting (SS7) ---------------------------------------
     def reserved_cash(self, *, unsettled_buys: float = 0.0) -> float:
         """Sum of open BUY children notionals (at reference price) + unsettled.
@@ -968,6 +1062,41 @@ def run_stale_watchdog(
     return resolved
 
 
+def resolve_day_expiry(book: OrderStateBook, port: BrokerPort) -> list[ChildOrder]:
+    """End-of-session DAY-expiry sweep (S-FRAC stage 1, design SS4).
+
+    Fractional orders are TIF=DAY only, so any child the book still holds
+    OPEN at/after the close must be resolved to a terminal outcome — never
+    carried overnight as a resting order (same-day reconciliation only, no
+    GTC carryover bookkeeping). For each open child the broker's status is
+    fetched and, when terminal, resolved through
+    :meth:`OrderStateBook.apply_terminal_status`:
+
+    * unfilled DAY expiry -> EXPIRED, full quantity to ``cum_expired``;
+    * **partial-fill-then-expire** -> the filled portion is REAL (already or
+      now booked via the fill-first rule) and only the unfilled remainder
+      moves to ``cum_expired``, returning to ``remaining_unsubmitted`` with
+      the audit trail intact;
+    * a cancel/expiry that raced a full fill -> FILLED.
+
+    Children the broker still reports non-terminal are left OPEN and
+    returned to the caller's reconcile path. Returns the resolved children.
+    """
+    resolved: list[ChildOrder] = []
+    for child in list(book.open_children()):
+        status_row = port.order_status(child.child_order_id)
+        status = status_row.get("status", "")
+        if classify_terminal_status(status) is None:
+            continue
+        book.apply_terminal_status(
+            child.child_order_id,
+            status=status,
+            filled_qty=float(status_row.get("filled_qty", 0.0)),
+        )
+        resolved.append(child)
+    return resolved
+
+
 def reconcile_on_restart(book: OrderStateBook, port: BrokerPort) -> ReconcileResult:
     """SS7 reconcile-before-emit: rebuild the in-flight picture from broker
     open-orders + per-order terminal statuses, then reconcile the book.
@@ -982,18 +1111,21 @@ def reconcile_on_restart(book: OrderStateBook, port: BrokerPort) -> ReconcileRes
         if child.child_order_id in broker_open:
             continue
         status_row = port.order_status(child.child_order_id)
-        status = str(status_row.get("status", "")).lower()
-        _apply_fill_delta(book, child, float(status_row.get("filled_qty", 0.0)))
-        if child.state is ChildOrderState.FILLED:
+        status = status_row.get("status", "")
+        broker_filled = float(status_row.get("filled_qty", 0.0))
+        terminal = classify_terminal_status(status)
+        if terminal is not None and terminal is not ChildOrderState.FILLED:
+            # Shared terminal vocabulary (fills applied first, so a cancel or
+            # DAY expiry that raced a fill keeps the REAL filled portion and
+            # a full-fill race lands on FILLED).
+            book.apply_terminal_status(
+                child.child_order_id, status=status, filled_qty=broker_filled
+            )
             continue
-        if status in {"canceled", "cancelled", "done_for_day"}:
-            book.on_cancel(child.child_order_id)
-        elif status == "expired":
-            book.on_expire(child.child_order_id)
-        elif status == "rejected":
-            book.on_reject(child.child_order_id)
-        # any other status (still live but absent from open_orders, or
-        # unknown) is left open and will surface as a reconcile mismatch.
+        # "filled" (fills carry the transition) or a non-terminal/unknown
+        # status: apply fills; a short "filled" or unknown status is left
+        # open and will surface as a reconcile mismatch.
+        _apply_fill_delta(book, child, broker_filled)
     return book.reconcile(broker_open)
 
 
@@ -1018,11 +1150,14 @@ __all__ = [
     "ReconcileResult",
     "SIDE_BUY",
     "SIDE_SELL",
+    "TERMINAL_STATUS_MAP",
     "TIER1_ENTRY_BLOCK_REASONS",
     "child_order_id",
+    "classify_terminal_status",
     "compute_parent_intent_id",
     "evaluate_entry_headroom",
     "reconcile_on_restart",
+    "resolve_day_expiry",
     "run_stale_watchdog",
     "submit_remainder",
 ]
