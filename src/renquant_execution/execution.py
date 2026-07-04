@@ -13,7 +13,7 @@ from typing import Any
 
 from renquant_common import Job, Pipeline, Task
 
-from .broker import BaseBroker, normalize_order_intent
+from .broker import BaseBroker, is_no_submit_status, normalize_order_intent
 
 
 @dataclass
@@ -73,11 +73,18 @@ class SubmitOrdersTask(Task):
 
 class AuditExecutionTask(Task):
     def run(self, ctx: ExecutionContext) -> bool | None:
+        # A no-submit result (e.g. a fractional intent skipped on a
+        # non-fractionable asset) never reached the broker, so it must not be
+        # counted as submitted — that would be a false operational state.
+        n_skipped = sum(
+            1 for order in ctx.submitted_orders if is_no_submit_status(order.get("status"))
+        )
         ctx.audit_rows.append({
             "broker": ctx.broker_name,
             "dry_run": ctx.dry_run,
             "n_intents": len(ctx.order_intents),
-            "n_submitted": len(ctx.submitted_orders),
+            "n_submitted": len(ctx.submitted_orders) - n_skipped,
+            "n_skipped": n_skipped,
         })
         return True
 
