@@ -1,6 +1,7 @@
 """RenQuant execution package."""
 
 from .alpaca_broker import AlpacaBroker
+from .alpaca_broker_port import AlpacaBrokerPort, BrokerPortContractError
 from .broker import BaseBroker, normalize_order_intent
 from .execution import (
     BrokerExecutionPipeline,
@@ -58,9 +59,11 @@ from .readonly_broker import ReadOnlyBrokerWrapper
 
 __all__ = [
     "AlpacaBroker",
+    "AlpacaBrokerPort",
     "BaseBroker",
     "BrokerExecutionPipeline",
     "BrokerPort",
+    "BrokerPortContractError",
     "BrokerRegimeSnapshot",
     "ChildOrder",
     "ChildOrderState",
