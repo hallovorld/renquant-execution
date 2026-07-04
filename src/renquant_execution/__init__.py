@@ -1,6 +1,7 @@
 """RenQuant execution package."""
 
 from .alpaca_broker import AlpacaBroker
+from .alpaca_broker_port import AlpacaBrokerPort, BrokerPortContractError
 from .broker import (
     BELOW_MIN_NOTIONAL_STATUS,
     FRACTIONABLE_LOOKUP_FAILED_STATUS,
@@ -80,9 +81,11 @@ from .readonly_broker import ReadOnlyBrokerWrapper
 
 __all__ = [
     "AlpacaBroker",
+    "AlpacaBrokerPort",
     "BaseBroker",
     "BrokerExecutionPipeline",
     "BrokerPort",
+    "BrokerPortContractError",
     "BrokerRegimeSnapshot",
     "ChildOrder",
     "ChildOrderState",
