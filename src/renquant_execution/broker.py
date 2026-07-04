@@ -2,7 +2,34 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import math
 from typing import Any
+
+# Broker-result ``status`` values that mean "nothing was sent to the broker".
+# A no-submit result is NOT an order rejection by the broker and NOT a pending
+# order — it is an order the adapter deliberately did not submit (e.g. a
+# fractional intent on a non-fractionable asset, or an asset lookup that failed
+# closed). The execution audit must not count these as submitted, and live
+# state-mutation planning must not treat them as pending fills.
+NON_FRACTIONABLE_STATUS = "rejected_non_fractionable"
+FRACTIONABLE_LOOKUP_FAILED_STATUS = "rejected_fractionable_lookup_failed"
+NO_SUBMIT_STATUSES = frozenset({
+    NON_FRACTIONABLE_STATUS,
+    FRACTIONABLE_LOOKUP_FAILED_STATUS,
+    # Legacy floor-to-zero status, kept recognized for back-compat audit replay.
+    "skipped_non_fractionable_dust",
+})
+
+
+def is_no_submit_status(status: Any) -> bool:
+    """Whether ``status`` denotes a result that never reached the broker."""
+    return str(status or "").strip().lower() in NO_SUBMIT_STATUSES
+
+
+def is_whole_share(quantity: float) -> bool:
+    """Whether ``quantity`` is a finite, whole-share (integral) amount."""
+    value = float(quantity)
+    return math.isfinite(value) and value.is_integer()
 
 
 class BaseBroker(ABC):
@@ -49,7 +76,16 @@ class BaseBroker(ABC):
     def place_order(self, symbol: str, action: str, quantity: float) -> dict[str, Any]:
         """Place an order and return broker confirmation."""
 
-    def supports_broker_side_stops(self) -> bool:
+    def supports_broker_side_stops(
+        self, symbol: str | None = None, quantity: float | None = None
+    ) -> bool:
+        """Whether a broker-side protective stop can be installed.
+
+        Optional ``symbol``/``quantity`` let the adapter answer per-position: a
+        broker that cannot place a stop for a *fractional* holding must return
+        ``False`` when given that fractional quantity so the caller routes the
+        position to a software stop instead of opening unprotectable exposure.
+        """
         return False
 
     def place_stop_order(self, symbol: str, quantity: float, stop_price: float) -> dict[str, Any]:

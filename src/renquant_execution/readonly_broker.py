@@ -43,8 +43,10 @@ class ReadOnlyBrokerWrapper(BaseBroker):
     def get_open_orders(self) -> set[str]:
         return self.underlying.get_open_orders()
 
-    def supports_broker_side_stops(self) -> bool:
-        return self.underlying.supports_broker_side_stops()
+    def supports_broker_side_stops(
+        self, symbol: str | None = None, quantity: float | None = None
+    ) -> bool:
+        return self.underlying.supports_broker_side_stops(symbol, quantity)
 
     def place_order(self, symbol: str, action: str, quantity: float) -> dict[str, Any]:
         return {

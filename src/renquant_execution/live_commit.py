@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .broker import BaseBroker, normalize_order_intent
+from .broker import BaseBroker, is_no_submit_status, normalize_order_intent
 from .execution import BrokerExecutionPipeline, ExecutionContext
 
 
@@ -80,6 +80,22 @@ def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
     filled_avg_price = float(
         order.get("filled_avg_price", order.get("avg_price", order.get("price", 0.0))) or 0.0
     )
+    # First-class no-submit/skipped class: the adapter deliberately did not send
+    # this order to the broker (e.g. a fractional intent on a non-fractionable
+    # asset, or a fail-closed lookup). It is NOT pending and NOT a broker
+    # rejection, and must not be counted as submitted by the execution audit.
+    skipped = is_no_submit_status(status) or bool(order.get("skipped"))
+    if skipped:
+        return {
+            "status": status,
+            "filled": False,
+            "partial": False,
+            "pending": False,
+            "rejected": False,
+            "skipped": True,
+            "filled_qty": 0.0,
+            "filled_avg_price": filled_avg_price,
+        }
     rejected = status in {"rejected", "canceled", "cancelled", "expired", "failed"}
     filled = status == "filled" or (filled_qty > 0.0 and requested_qty > 0.0 and filled_qty >= requested_qty)
     partial = (status in {"partially_filled", "partial"} or (
@@ -94,6 +110,7 @@ def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
         "partial": partial,
         "pending": pending,
         "rejected": rejected,
+        "skipped": False,
         "filled_qty": filled_qty,
         "filled_avg_price": filled_avg_price,
     }
@@ -165,6 +182,7 @@ def _planned_state_mutations(
             "partial": result["partial"],
             "pending": result["pending"],
             "rejected": result["rejected"],
+            "skipped": result["skipped"],
             "filled_qty": result["filled_qty"],
             "filled_avg_price": result["filled_avg_price"],
         })
