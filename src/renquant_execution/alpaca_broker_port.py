@@ -10,6 +10,16 @@ implements this later." This is that adapter.
 NEVER constructed in tests that exercise orchestration logic — those inject a
 fake port. This module's own tests exercise ``AlpacaBrokerPort`` directly
 against an injected fake ``TradingClient``, with no network calls.
+
+Fractional surface: BUY-side fractional validation
+(``broker.validate_fractional_order``) and the explicit no-submit status
+classification belong to the s-frac stage-1 surface (execution#22), not yet
+on main. This adapter deliberately does NOT duplicate them; when #22 lands,
+``submit_order`` is the integration seam (validate before the client call
+and surface the s-frac no-submit result instead of raising, where that
+contract requires it). Until then this adapter passes ``qty`` through
+unvalidated — callers own share sizing (the Stage-2 canary binds risk with
+its own daily entry-notional cap).
 """
 from __future__ import annotations
 
