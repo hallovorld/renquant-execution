@@ -9,6 +9,7 @@ import pytest
 
 from renquant_execution import (
     FRACTIONABLE_LOOKUP_FAILED_STATUS,
+    NO_SUBMIT_STATUSES,
     NON_FRACTIONABLE_STATUS,
     AlpacaBroker,
     BaseBroker,
@@ -93,6 +94,9 @@ def test_build_live_commit_plan_is_readonly_and_auditable() -> None:
             "partial": False,
             "pending": True,
             "rejected": False,
+            "canceled": False,
+            "expired": False,
+            "terminal": False,
             "skipped": False,
             "filled_qty": 0.0,
             "filled_avg_price": 0.0,
@@ -109,6 +113,9 @@ def test_build_live_commit_plan_is_readonly_and_auditable() -> None:
             "partial": False,
             "pending": True,
             "rejected": False,
+            "canceled": False,
+            "expired": False,
+            "terminal": False,
             "skipped": False,
             "filled_qty": 0.0,
             "filled_avg_price": 0.0,
@@ -129,6 +136,9 @@ def test_classify_broker_result_covers_live_order_statuses() -> None:
         "partial": False,
         "pending": False,
         "rejected": False,
+        "canceled": False,
+        "expired": False,
+        "terminal": True,
         "skipped": False,
         "filled_qty": 3.0,
         "filled_avg_price": 101.5,
@@ -804,3 +814,134 @@ def test_e2e_asset_lookup_failure_fails_closed_through_commit() -> None:
     assert classified["skipped"] is True
     assert classified["pending"] is False
     assert classified["rejected"] is False
+
+
+# ── S-FRAC stage 1: DAY-expiry / cancel-with-fill terminal classification ────
+# and float requested-vs-filled epsilon discipline (design SS4).
+
+
+def test_classify_day_expiry_unfilled_is_terminal_no_fill() -> None:
+    # Fractional orders are TIF=DAY only: an unfilled DAY order expires at
+    # the close — TERMINAL, never a resting order carried overnight.
+    result = classify_broker_result({
+        "status": "expired",
+        "quantity": 0.341052,
+        "filled_qty": 0.0,
+    })
+    assert result["expired"] is True
+    assert result["terminal"] is True
+    assert result["rejected"] is True  # legacy consumers: order is dead
+    assert result["canceled"] is False
+    assert result["pending"] is False
+    assert result["filled"] is False
+    assert result["partial"] is False
+
+
+def test_classify_partial_fill_then_expire_keeps_the_real_fill() -> None:
+    # Partial-fill-then-expire: the filled 0.20 is REAL (position + cash);
+    # only the unfilled remainder died with the DAY order.
+    result = classify_broker_result({
+        "status": "expired",
+        "quantity": 0.341052,
+        "filled_qty": 0.20,
+        "filled_avg_price": 948.0,
+    })
+    assert result["expired"] is True
+    assert result["terminal"] is True
+    assert result["partial"] is True  # persistence must book the fill
+    assert result["filled"] is False
+    assert result["pending"] is False
+    assert result["filled_qty"] == pytest.approx(0.20)
+
+
+def test_classify_cancel_with_fill_is_terminal_and_books_the_fill() -> None:
+    result = classify_broker_result({
+        "status": "canceled",
+        "quantity": 1.0,
+        "filled_qty": 0.3,
+        "filled_avg_price": 100.0,
+    })
+    assert result["canceled"] is True
+    assert result["terminal"] is True
+    assert result["partial"] is True
+    assert result["pending"] is False
+    assert result["filled_qty"] == pytest.approx(0.3)
+
+
+def test_expired_partial_fill_plans_persistence_for_the_filled_portion() -> None:
+    plan = build_live_commit_plan({
+        "broker_name": "alpaca",
+        "order_intents": [
+            {"symbol": "BLK", "action": "BUY", "quantity": 0.341052}
+        ],
+        "submitted_orders": [{
+            "order_id": "ord-exp-1",
+            "status": "expired",
+            "symbol": "BLK",
+            "action": "BUY",
+            "quantity": 0.341052,
+            "filled_qty": 0.20,
+            "filled_avg_price": 948.0,
+        }],
+        "execution_audit": [],
+    })
+
+    submission = plan.state_mutations[0]
+    assert submission["expired"] is True
+    assert submission["terminal"] is True
+    # The REAL filled portion reaches persistence planning; the dead
+    # remainder does not create any position/journal effect.
+    effects = [m for m in plan.state_mutations if m["mutation_type"] != "order_submission"]
+    assert [m["mutation_type"] for m in effects] == [
+        "planned_live_state_update",
+        "planned_trade_log_append",
+    ]
+    assert all(m["filled_qty"] == pytest.approx(0.20) for m in effects)
+
+
+def test_classify_float_fill_comparison_uses_dust_epsilon() -> None:
+    # A broker cumulative within QTY_INTEGRAL_EPS of the request is COMPLETE
+    # (float partial fills accumulate; never compare with raw >=).
+    near_full = classify_broker_result({
+        "status": "partially_filled",  # stale status; quantities decide
+        "quantity": 0.435578,
+        "filled_qty": 0.435578 - 2e-10,
+    })
+    assert near_full["filled"] is True
+
+    # Float accumulation noise ABOVE the request is also complete, not a
+    # phantom overfill/partial.
+    accumulated = classify_broker_result({
+        "status": "accepted",
+        "quantity": 0.3,
+        "filled_qty": 0.1 + 0.1 + 0.1,  # 0.30000000000000004
+    })
+    assert accumulated["filled"] is True
+    assert accumulated["partial"] is False
+
+    # A genuine fractional partial stays partial.
+    partial = classify_broker_result({
+        "status": "accepted",
+        "quantity": 0.341052,
+        "filled_qty": 0.20,
+    })
+    assert partial["partial"] is True
+    assert partial["filled"] is False
+
+
+def test_no_submit_status_matrix_is_terminal_never_pending() -> None:
+    # The full no-submit vocabulary: never submitted, never pending, never a
+    # broker rejection, always terminal, zero filled qty.
+    for status in sorted(NO_SUBMIT_STATUSES):
+        result = classify_broker_result({
+            "status": status,
+            "quantity": 0.4,
+            "requested_quantity": 0.4,
+        })
+        assert result["skipped"] is True, status
+        assert result["terminal"] is True, status
+        assert result["pending"] is False, status
+        assert result["rejected"] is False, status
+        assert result["filled"] is False, status
+        assert result["partial"] is False, status
+        assert result["filled_qty"] == 0.0, status

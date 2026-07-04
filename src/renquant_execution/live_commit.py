@@ -6,7 +6,13 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .broker import BaseBroker, is_no_submit_status, normalize_order_intent
+from .broker import (
+    QTY_INTEGRAL_EPS,
+    BaseBroker,
+    is_fill_complete,
+    is_no_submit_status,
+    normalize_order_intent,
+)
 from .execution import BrokerExecutionPipeline, ExecutionContext
 
 
@@ -73,7 +79,25 @@ def sell_first_order_intents(order_intents: list[dict[str, Any]]) -> list[dict[s
 
 
 def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
-    """Classify a broker order result for live state-mutation planning."""
+    """Classify a broker order result for live state-mutation planning.
+
+    S-FRAC stage-1 semantics (design §4):
+
+    * **Float requested-vs-filled comparison**: fractional fills accumulate as
+      floats, so filled/partial are decided with the ``QTY_INTEGRAL_EPS`` dust
+      epsilon (replicated from the stage-0 commit contract), never ``==``/
+      ``>=`` on raw floats.
+    * **DAY-expiry is TERMINAL** (``expired=True``): fractional orders are
+      TIF=DAY only, so an unfilled remainder expires at close — a terminal
+      no-fill, never a resting order. Same-day reconciliation only, no GTC
+      carryover bookkeeping.
+    * **Cancel-with-fill / expire-with-fill**: a terminal cancel or expiry
+      carrying a partial ``filled_qty`` keeps ``partial=True`` — the filled
+      portion is REAL and must reach persistence; only the unfilled remainder
+      is dead.
+    * ``terminal=True`` means no further fills can arrive for this order
+      (filled, canceled, expired, rejected, failed, or never submitted).
+    """
     status = str(order.get("status", "") or "unknown").lower()
     requested_qty = float(order.get("quantity", order.get("qty", 0.0)) or 0.0)
     filled_qty = float(order.get("filled_qty", order.get("filled_quantity", 0.0)) or 0.0)
@@ -92,14 +116,24 @@ def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
             "partial": False,
             "pending": False,
             "rejected": False,
+            "canceled": False,
+            "expired": False,
+            "terminal": True,
             "skipped": True,
             "filled_qty": 0.0,
             "filled_avg_price": filled_avg_price,
         }
-    rejected = status in {"rejected", "canceled", "cancelled", "expired", "failed"}
-    filled = status == "filled" or (filled_qty > 0.0 and requested_qty > 0.0 and filled_qty >= requested_qty)
+    canceled = status in {"canceled", "cancelled", "done_for_day"}
+    expired = status == "expired"
+    # ``rejected`` keeps its legacy meaning (terminal, no more fills coming)
+    # for existing consumers; ``canceled``/``expired`` refine it for the state
+    # machine's terminal vocabulary.
+    rejected = status in {"rejected", "failed"} or canceled or expired
+    filled = status == "filled" or is_fill_complete(filled_qty, requested_qty)
     partial = (status in {"partially_filled", "partial"} or (
-        filled_qty > 0.0 and requested_qty > 0.0 and filled_qty < requested_qty
+        filled_qty > QTY_INTEGRAL_EPS
+        and requested_qty > QTY_INTEGRAL_EPS
+        and not is_fill_complete(filled_qty, requested_qty)
     ))
     if filled and filled_qty <= 0.0:
         filled_qty = requested_qty
@@ -110,6 +144,9 @@ def classify_broker_result(order: dict[str, Any]) -> dict[str, Any]:
         "partial": partial,
         "pending": pending,
         "rejected": rejected,
+        "canceled": canceled,
+        "expired": expired,
+        "terminal": filled or rejected,
         "skipped": False,
         "filled_qty": filled_qty,
         "filled_avg_price": filled_avg_price,
@@ -182,6 +219,9 @@ def _planned_state_mutations(
             "partial": result["partial"],
             "pending": result["pending"],
             "rejected": result["rejected"],
+            "canceled": result["canceled"],
+            "expired": result["expired"],
+            "terminal": result["terminal"],
             "skipped": result["skipped"],
             "filled_qty": result["filled_qty"],
             "filled_avg_price": result["filled_avg_price"],

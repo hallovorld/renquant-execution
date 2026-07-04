@@ -13,7 +13,9 @@ import datetime as dt
 
 import pytest
 
+from renquant_execution.broker import QTY_INTEGRAL_EPS
 from renquant_execution.order_state_machine import (
+    _QTY_EPS,
     BrokerRegimeSnapshot,
     ChildOrderState,
     DuplicateChildOrderError,
@@ -24,10 +26,13 @@ from renquant_execution.order_state_machine import (
     LifecycleState,
     MAX_PENDING_AGE_SECONDS,
     OrderStateBook,
+    TERMINAL_STATUS_MAP,
     child_order_id,
+    classify_terminal_status,
     compute_parent_intent_id,
     evaluate_entry_headroom,
     reconcile_on_restart,
+    resolve_day_expiry,
     run_stale_watchdog,
     submit_remainder,
 )
@@ -694,3 +699,226 @@ def test_snapshot_round_trip_preserves_accounting():
     assert rparent.remaining_unsubmitted == 0
     assert restored.reserved_cash() == 6 * 51.0
     assert rparent.children[1].state is ChildOrderState.SUBMITTED
+
+
+# ---------------------------------------------------------------------------
+# S-FRAC stage 1: terminal classification vocabulary (DAY expiry +
+# cancel-with-fill) and float (fractional) quantity discipline.
+# Extends the SS7 worked-example family above.
+# ---------------------------------------------------------------------------
+
+
+def test_qty_epsilon_matches_stage0_commit_contract_literal():
+    """Literal constant-equality pin against the stage-0 epsilon.
+
+    The S-FRAC stage-0 commit contract (RenQuant umbrella,
+    ``backtesting/renquant_104/adapters/commit_contract.py``, merged in
+    RenQuant#439) defines ``QTY_INTEGRAL_EPS = 1e-9``. The repos cannot
+    import each other, so this repo replicates the constant; this test is
+    the drift tripwire the replication comment promises. If it fails, one
+    side changed the epsilon — re-align BOTH before touching this test.
+    """
+    assert QTY_INTEGRAL_EPS == 1e-9  # the stage-0 literal, verbatim
+    assert _QTY_EPS == 1e-9  # the state machine's fill/invariant epsilon
+    assert QTY_INTEGRAL_EPS == _QTY_EPS
+
+
+def test_terminal_status_map_vocabulary():
+    assert classify_terminal_status("expired") is ChildOrderState.EXPIRED
+    assert classify_terminal_status("EXPIRED ") is ChildOrderState.EXPIRED
+    assert classify_terminal_status("canceled") is ChildOrderState.CANCELED
+    assert classify_terminal_status("cancelled") is ChildOrderState.CANCELED
+    assert classify_terminal_status("done_for_day") is ChildOrderState.CANCELED
+    assert classify_terminal_status("rejected") is ChildOrderState.REJECTED
+    assert classify_terminal_status("failed") is ChildOrderState.REJECTED
+    assert classify_terminal_status("filled") is ChildOrderState.FILLED
+    # Non-terminal / unknown statuses classify to None: the child stays OPEN.
+    for live in ("new", "open", "accepted", "partially_filled", "", None):
+        assert classify_terminal_status(live) is None
+    assert set(TERMINAL_STATUS_MAP.values()) == {
+        ChildOrderState.FILLED,
+        ChildOrderState.CANCELED,
+        ChildOrderState.EXPIRED,
+        ChildOrderState.REJECTED,
+    }
+
+
+def test_worked_example_10_request_3_fill_7_expire_remainder_returns():
+    """Worked example (DAY expiry): target 10; child1 requests 10, fills 3,
+    the DAY order expires at the close -> the 3 filled are REAL, the 7
+    unfilled move to cum_expired and RETURN to remaining_unsubmitted; gross
+    audit stays monotone (10) while economic stays <= 10."""
+    book = _book()
+    parent = _buy(book, target=10)
+
+    c1 = book.submit_child(parent.parent_intent_id, qty=10, price=50.0, now=T0)
+    book.on_broker_ack(c1.child_order_id)
+    book.on_fill(c1.child_order_id, 3)
+
+    # End of session: broker reports the DAY order expired with cumulative 3.
+    resolved = book.apply_terminal_status(
+        c1.child_order_id, status="expired", filled_qty=3.0
+    )
+
+    assert resolved is c1
+    assert c1.state is ChildOrderState.EXPIRED
+    assert parent.cum_filled == 3  # the filled portion is REAL
+    assert parent.cum_expired == 7  # audit trail for the dead remainder
+    assert parent.open_qty == 0
+    assert parent.remaining_unsubmitted == 7  # remainder returned
+    assert parent.gross_submitted_qty == 10
+    # EXPIRED maps to the SS7 diagram's CANCELED branch: re-emit eligible.
+    assert parent.state is LifecycleState.CANCELED
+    assert book.can_emit_remainder(parent.parent_intent_id) is True
+
+    c2 = book.submit_child(parent.parent_intent_id, qty=7, price=50.0, now=T0)
+    book.on_fill(c2.child_order_id, 7)
+    assert parent.cum_filled == 10
+    assert parent.state is LifecycleState.FILLED
+    assert parent.gross_submitted_qty == 17  # audit MAY exceed target
+
+
+def test_worked_example_cancel_with_first_sight_of_fill():
+    """Worked example (cancel-with-fill): the cancel confirmation is the FIRST
+    sight of a 4-share fill. The fill is REAL (position + cash), only the
+    unfilled 6 are canceled; remainder returns to remaining_unsubmitted."""
+    book = _book()
+    parent = _buy(book, target=10)
+
+    c1 = book.submit_child(parent.parent_intent_id, qty=10, price=50.0, now=T0)
+    book.on_broker_ack(c1.child_order_id)
+    assert parent.cum_filled == 0  # no fill has been observed yet
+
+    book.apply_terminal_status(c1.child_order_id, status="canceled", filled_qty=4.0)
+
+    assert c1.state is ChildOrderState.CANCELED
+    assert parent.cum_filled == 4  # first-sight fill booked, not discarded
+    assert parent.cum_canceled == 6
+    assert parent.remaining_unsubmitted == 6
+    assert parent.gross_submitted_qty == 10
+
+
+def test_apply_terminal_status_full_fill_race_lands_filled():
+    # A cancel/expiry that raced a FULL fill resolves to FILLED, nothing
+    # expired/canceled: the shares exist regardless of what the cancel says.
+    book = _book()
+    parent = _buy(book, target=5)
+    c1 = book.submit_child(parent.parent_intent_id, qty=5, price=50.0, now=T0)
+
+    book.apply_terminal_status(c1.child_order_id, status="expired", filled_qty=5.0)
+
+    assert c1.state is ChildOrderState.FILLED
+    assert parent.cum_expired == 0
+    assert parent.state is LifecycleState.FILLED
+
+
+def test_apply_terminal_status_fail_loud_guards():
+    book = _book()
+    parent = _buy(book, target=5)
+    c1 = book.submit_child(parent.parent_intent_id, qty=5, price=50.0, now=T0)
+
+    # Unknown / non-terminal status: refuse, leave the child open.
+    with pytest.raises(LifecycleError, match="not a terminal status"):
+        book.apply_terminal_status(c1.child_order_id, status="open", filled_qty=0.0)
+    assert c1.is_open
+
+    # Broker cumulative below the book's view: quantities never regress.
+    book.on_fill(c1.child_order_id, 2)
+    with pytest.raises(EconomicInvariantError, match="regressed"):
+        book.apply_terminal_status(c1.child_order_id, status="canceled", filled_qty=1.0)
+
+    # "filled" with a SHORT quantity: never invent shares.
+    with pytest.raises(EconomicInvariantError, match="invent"):
+        book.apply_terminal_status(c1.child_order_id, status="filled", filled_qty=2.0)
+
+    # Terminal on a non-open child: contract violation.
+    book.apply_terminal_status(c1.child_order_id, status="canceled", filled_qty=2.0)
+    with pytest.raises(LifecycleError, match="non-open"):
+        book.apply_terminal_status(c1.child_order_id, status="expired", filled_qty=2.0)
+
+
+def test_resolve_day_expiry_partial_fill_then_expire_fractional():
+    """End-of-session sweep: a fractional DAY child (0.341052 requested,
+    0.20 filled) expires -> the 0.20 is REAL, the float remainder returns to
+    remaining_unsubmitted within the dust epsilon; a still-live child is NOT
+    forced terminal."""
+    book = _book()
+    frac = _buy(book, symbol="BLK", target=0.341052)
+    whole = _buy(book, symbol="AAPL", target=3)
+    broker = FakeBroker()
+
+    cf = submit_remainder(book, broker, frac.parent_intent_id, price=950.0, now=T0)
+    cw = submit_remainder(book, broker, whole.parent_intent_id, price=100.0, now=T0)
+    broker.fill(cf.child_order_id, 0.20)
+    book.on_fill(cf.child_order_id, 0.20)
+    broker.set_status(cf.child_order_id, "expired")  # AAPL child stays open
+
+    resolved = resolve_day_expiry(book, broker)
+
+    assert [c.child_order_id for c in resolved] == [cf.child_order_id]
+    assert cf.state is ChildOrderState.EXPIRED
+    assert frac.cum_filled == pytest.approx(0.20, abs=QTY_INTEGRAL_EPS)
+    assert frac.cum_expired == pytest.approx(0.141052, abs=QTY_INTEGRAL_EPS)
+    assert frac.remaining_unsubmitted == pytest.approx(0.141052, abs=QTY_INTEGRAL_EPS)
+    assert book.can_emit_remainder(frac.parent_intent_id) is True
+    # The whole-share child was NOT expired: broker still reports it live.
+    assert cw.is_open
+    assert whole.open_qty == 3
+
+
+def test_fractional_submit_round_trip_fake_broker():
+    """Fractional submit round-trip (fake broker): a 0.341052-share BUY
+    intent submits, partially fills as a float, expires, re-emits the exact
+    float remainder, and completes -- economic + audit invariants hold at
+    float precision throughout (the SS7 worked example at N < 1)."""
+    book = _book()
+    parent = _buy(book, symbol="BLK", target=0.341052)
+    broker = FakeBroker()
+
+    c1 = submit_remainder(book, broker, parent.parent_intent_id, price=950.0, now=T0)
+    assert broker.orders[c1.child_order_id]["qty"] == pytest.approx(0.341052)
+    book.on_broker_ack(c1.child_order_id)
+
+    broker.fill(c1.child_order_id, 0.2)
+    book.on_fill(c1.child_order_id, 0.2)
+    assert parent.state is LifecycleState.PARTIALLY_FILLED
+    assert book.reserved_cash() == pytest.approx((0.341052 - 0.2) * 950.0)
+
+    broker.set_status(c1.child_order_id, "expired")
+    resolve_day_expiry(book, broker)
+    assert c1.state is ChildOrderState.EXPIRED
+
+    c2 = submit_remainder(book, broker, parent.parent_intent_id, price=948.0, now=T0)
+    assert c2.requested_qty == pytest.approx(0.141052, abs=QTY_INTEGRAL_EPS)
+    broker.fill(c2.child_order_id, c2.requested_qty)
+    book.on_fill(c2.child_order_id, c2.requested_qty)
+
+    assert parent.state is LifecycleState.FILLED
+    assert parent.cum_filled == pytest.approx(0.341052, abs=QTY_INTEGRAL_EPS)
+    assert parent.remaining_unsubmitted == pytest.approx(0.0, abs=1e-6)
+    assert parent.gross_submitted_qty == pytest.approx(
+        0.341052 + 0.141052, abs=1e-6
+    )
+    assert book.reserved_cash() == pytest.approx(0.0, abs=1e-6)
+
+
+def test_restart_reconcile_uses_terminal_vocabulary_cancel_with_fill():
+    # A restart discovers a child the broker canceled WITH a first-sight
+    # fill: reconcile books the fill, cancels the remainder, and the book is
+    # clean (no mismatch) because the terminal outcome fully explains it.
+    book = _book()
+    parent = _buy(book, target=10)
+    broker = FakeBroker()
+    c1 = submit_remainder(book, broker, parent.parent_intent_id, price=50.0, now=T0)
+    broker.fill(c1.child_order_id, 4)
+    broker.set_status(c1.child_order_id, "canceled")
+
+    restored = OrderStateBook.from_snapshot(book.to_snapshot())
+    result = reconcile_on_restart(restored, broker)
+
+    assert result.clean is True
+    restored_parent = restored.parents()[0]
+    assert restored_parent.cum_filled == 4
+    assert restored_parent.cum_canceled == 6
+    assert restored_parent.remaining_unsubmitted == 6
+    assert restored.lifecycle_state(parent.parent_intent_id) is LifecycleState.CANCELED

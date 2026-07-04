@@ -7,6 +7,12 @@ import pytest
 
 from renquant_execution.alpaca_broker import _order_to_dict
 from renquant_execution import (
+    BELOW_MIN_NOTIONAL_STATUS,
+    FRACTIONABLE_LOOKUP_FAILED_STATUS,
+    INVALID_FRACTIONAL_ORDER_STATUS,
+    NO_SUBMIT_STATUSES,
+    NON_FRACTIONABLE_STATUS,
+    PRECISION_EXCEEDS_9DP_STATUS,
     AlpacaBroker,
     BaseBroker,
     BrokerExecutionPipeline,
@@ -16,7 +22,9 @@ from renquant_execution import (
     ReadOnlyBrokerWrapper,
     execution_payload,
     get_broker,
+    is_no_submit_status,
     normalize_order_intent,
+    validate_fractional_order,
     write_execution_payload,
 )
 
@@ -476,3 +484,181 @@ def test_place_stop_order_submits_gtc_for_whole_share() -> None:
     assert req.time_in_force == TimeInForce.GTC
     assert req.stop_price == 150.0
     assert result["stop_price"] == 150.0
+
+
+# ── S-FRAC stage 1: notional orders, 9dp grid, rule vocabulary, gate probe ──
+
+
+def _client_and_broker(fractionable: dict[str, bool]) -> tuple[_FakeAlpacaClient, AlpacaBroker]:
+    client = _FakeAlpacaClient(fractionable)
+    return client, _broker_with_client(client)
+
+
+def test_place_notional_order_submits_market_day_notional_shape() -> None:
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest
+
+    client, broker = _client_and_broker({"BLK": True})
+
+    result = broker.place_notional_order("BLK", "buy", 324.17)
+
+    assert len(client.submitted) == 1
+    req = client.submitted[0]
+    # Design SS4: EITHER qty OR notional — the notional shape carries no qty.
+    assert isinstance(req, MarketOrderRequest)
+    assert req.notional == 324.17
+    assert req.qty is None
+    assert req.side == OrderSide.BUY
+    assert req.time_in_force == TimeInForce.DAY
+    assert result["requested_notional"] == 324.17
+    assert result["notional"] == 324.17
+    assert result["skipped"] is False
+    # Notional orders are fractional by construction: fractionable confirmed.
+    assert client.get_asset_calls == ["BLK"]
+
+
+def test_place_notional_order_below_min_dollar_is_no_submit() -> None:
+    client, broker = _client_and_broker({"BLK": True})
+
+    with pytest.warns(RuntimeWarning):
+        result = broker.place_notional_order("BLK", "buy", 0.42)
+
+    assert client.submitted == []
+    assert client.get_asset_calls == []  # rule preflight runs before lookup
+    assert result["status"] == BELOW_MIN_NOTIONAL_STATUS
+    assert result["skipped"] is True
+    assert result["requested_notional"] == 0.42
+    assert result["notional"] == 0.0  # nothing was sent
+
+
+def test_place_notional_order_9dp_grid_is_no_submit() -> None:
+    client, broker = _client_and_broker({"BLK": True})
+
+    with pytest.warns(RuntimeWarning):
+        result = broker.place_notional_order("BLK", "buy", 5.00000000049)
+
+    assert client.submitted == []
+    assert result["status"] == PRECISION_EXCEEDS_9DP_STATUS
+    assert result["skipped"] is True
+
+
+def test_place_notional_order_non_fractionable_and_lookup_failure_fail_closed() -> None:
+    client, broker = _client_and_broker({"GS": False})
+
+    with pytest.warns(RuntimeWarning):
+        rejected = broker.place_notional_order("GS", "buy", 25.0)
+    assert rejected["status"] == NON_FRACTIONABLE_STATUS
+    assert rejected["skipped"] is True
+
+    with pytest.warns(RuntimeWarning):
+        failed = broker.place_notional_order("ZZZZ", "buy", 25.0)  # lookup raises
+    assert failed["status"] == FRACTIONABLE_LOOKUP_FAILED_STATUS
+    assert failed["skipped"] is True
+    assert client.submitted == []
+
+
+def test_place_order_fractional_qty_beyond_9dp_grid_is_no_submit() -> None:
+    client, broker = _client_and_broker({"BLK": True})
+
+    with pytest.warns(RuntimeWarning):
+        result = broker.place_order("BLK", "buy", 0.1234567891)  # 10dp
+
+    assert client.submitted == []
+    assert client.get_asset_calls == []  # rejected before any lookup
+    assert result["status"] == PRECISION_EXCEEDS_9DP_STATUS
+    assert result["quantity"] == 0.0
+    assert result["requested_quantity"] == 0.1234567891
+
+
+def test_place_order_snaps_eps_integral_noise_to_exact_whole_share() -> None:
+    # Stage-0 epsilon discipline on the SUBMIT side: 3.0000000001 is broker
+    # float noise on a whole share; submitting it raw would read as a >9dp
+    # fractional qty. It snaps to exactly 3.0 (and skips the asset lookup).
+    client, broker = _client_and_broker({})
+
+    result = broker.place_order("AAPL", "sell", 3.0000000001)
+
+    assert client.get_asset_calls == []
+    assert client.submitted[0].qty == 3.0
+    assert result["quantity"] == 3.0
+    assert result["requested_quantity"] == 3.0000000001
+
+
+def test_validate_fractional_order_rule_matrix() -> None:
+    ok = dict(order_type="market", time_in_force="day")
+    # The pinned Alpaca rules (design SS4): market/limit/stop/stop_limit, DAY.
+    for order_type in ("market", "limit", "stop", "stop_limit"):
+        assert validate_fractional_order(
+            order_type=order_type, time_in_force="day", qty=0.341052
+        ) is None
+    assert validate_fractional_order(**ok, notional=1.0) is None
+    assert validate_fractional_order(**ok, qty=0.123456789) is None  # 9dp ok
+
+    def status_of(**kw):
+        violation = validate_fractional_order(**kw)
+        assert violation is not None
+        status, reason = violation
+        assert reason  # a reject reason is always surfaced, never silent
+        assert is_no_submit_status(status)
+        return status
+
+    # Exactly one of qty | notional (both/neither = broker HTTP 400).
+    assert status_of(**ok) == INVALID_FRACTIONAL_ORDER_STATUS
+    assert status_of(**ok, qty=1.5, notional=10.0) == INVALID_FRACTIONAL_ORDER_STATUS
+    # TIF=DAY only — GTC is the Z9 dead-box TIF and is never fractional.
+    assert status_of(
+        order_type="market", time_in_force="gtc", qty=0.5
+    ) == INVALID_FRACTIONAL_ORDER_STATUS
+    # Unsupported order type.
+    assert status_of(
+        order_type="trailing_stop", time_in_force="day", qty=0.5
+    ) == INVALID_FRACTIONAL_ORDER_STATUS
+    # Finite/positive.
+    assert status_of(**ok, qty=-0.5) == INVALID_FRACTIONAL_ORDER_STATUS
+    assert status_of(**ok, notional=float("nan")) == INVALID_FRACTIONAL_ORDER_STATUS
+    # 9dp grid.
+    assert status_of(**ok, qty=0.1234567891) == PRECISION_EXCEEDS_9DP_STATUS
+    # $1 broker minimum (notional only).
+    assert status_of(**ok, notional=0.99) == BELOW_MIN_NOTIONAL_STATUS
+
+
+def test_stage0_capability_gate_probe_surface_on_alpaca_broker() -> None:
+    """The umbrella stage-0 capability gate (RenQuant#439,
+    adapters/commit_contract.py::fractional_capability_gate) probes the
+    broker for (a) callable is_fractionable and (b) a callable no-submit
+    classifier, and its stop router calls
+    supports_broker_side_stops(symbol, qty). This pins the exact surface."""
+    _, broker = _client_and_broker({"BLK": True})
+
+    # (a) fractionable probe.
+    assert callable(getattr(broker, "is_fractionable", None))
+    # (b) no-submit classifier, instance-callable, agrees with the module.
+    classifier = getattr(broker, "is_no_submit_status", None)
+    assert callable(classifier)
+    for status in NO_SUBMIT_STATUSES:
+        assert classifier(status) is True
+    assert classifier("filled") is False
+    # Stop routing: qty-aware two-arg call (the round-2 consumer signature).
+    assert broker.supports_broker_side_stops("BLK", 0.435578) is False
+    assert broker.supports_broker_side_stops("AAPL", 3) is True
+    assert broker.supports_broker_side_stops() is True
+    # Eps-integral broker noise counts as whole-share for stop capability.
+    assert broker.supports_broker_side_stops("AAPL", 3.0000000001) is True
+
+
+def test_readonly_wrapper_shadow_acks_notional_orders() -> None:
+    _, broker = _client_and_broker({"BLK": True})
+    shadow = ReadOnlyBrokerWrapper(broker)
+
+    result = shadow.place_notional_order("BLK", "buy", 324.17)
+
+    assert result["status"] == "shadow_ack"
+    assert result["shadow"] is True
+    assert result["requested_notional"] == 324.17
+
+
+def test_base_broker_place_notional_order_fails_loud_by_default() -> None:
+    broker = PaperBroker()
+    broker.connect()
+    with pytest.raises(NotImplementedError, match="notional"):
+        broker.place_notional_order("SPY", "buy", 25.0)

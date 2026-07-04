@@ -59,6 +59,19 @@ class ReadOnlyBrokerWrapper(BaseBroker):
             "timestamp": time.time(),
         }
 
+    def place_notional_order(self, symbol: str, action: str, notional: float) -> dict[str, Any]:
+        return {
+            "order_id": f"SHADOW-{uuid.uuid4().hex[:12].upper()}",
+            "status": "shadow_ack",
+            "symbol": symbol,
+            "action": action.upper(),
+            "quantity": 0.0,
+            "requested_notional": float(notional),
+            "notional": float(notional),
+            "shadow": True,
+            "timestamp": time.time(),
+        }
+
     def place_stop_order(self, symbol: str, quantity: float, stop_price: float) -> dict[str, Any]:
         return {
             "order_id": f"SHADOW-STOP-{uuid.uuid4().hex[:12].upper()}",
