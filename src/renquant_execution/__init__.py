@@ -77,6 +77,7 @@ from .order_state_machine import (
     submit_remainder,
 )
 from .paper_broker import PaperBroker
+from .paper_broker_port import PaperBrokerPort
 from .readonly_broker import ReadOnlyBrokerWrapper
 
 __all__ = [
@@ -113,6 +114,7 @@ __all__ = [
     "PRECISION_EXCEEDS_9DP_STATUS",
     "QTY_INTEGRAL_EPS",
     "PaperBroker",
+    "PaperBrokerPort",
     "ParentIntent",
     "ReadOnlyBrokerWrapper",
     "ReconcileMismatch",
