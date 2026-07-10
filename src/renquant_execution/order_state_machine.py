@@ -207,6 +207,28 @@ def child_order_id(parent_intent_id: str, attempt_n: int) -> str:
     return f"{parent_intent_id}:{attempt_n}"
 
 
+def parent_intent_id_from_client_order_id(client_order_id: str) -> str:
+    """Invert :func:`child_order_id` for §5.3 ledger reconciliation.
+
+    Child ids are ``<parent_intent_id>:<attempt_n>``. Anything that does not
+    match that shape — e.g. an external/manual order's broker-generated id —
+    is returned verbatim, which by construction can never match a ledger
+    reservation and therefore fails closed through the sweep's
+    unknown-open-buy path.
+    """
+    cid = str(client_order_id)
+    head, sep, tail = cid.rpartition(":")
+    if sep and head and tail.isdigit():
+        return head
+    return cid
+
+
+#: §5.3 fail-closed vocabulary shared with the account cash ledger: a book
+#: reconcile mismatch escalates to an ACCOUNT-WIDE entries halt (every
+#: sleeve) when a ledger is attached — single source for the reason string.
+ACCOUNT_CASH_RECONCILE_MISMATCH_REASON = "account_cash_reconcile_mismatch"
+
+
 def _utc(ts: dt.datetime) -> dt.datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=dt.timezone.utc)
@@ -379,6 +401,48 @@ class ParentIntent:
         return parent
 
 
+class CashLedgerPort(Protocol):
+    """Seam to the account-scoped cash reservation ledger (crypto RFC §5.3).
+
+    Implemented by :class:`renquant_execution.account_cash_ledger.
+    AccountCashLedger`; declared here as a Protocol so this module never
+    imports the ledger (the ledger imports :data:`MAX_PENDING_AGE_SECONDS`
+    from here for its TTL convention). ``None`` everywhere = flag OFF =
+    byte-identical legacy behavior.
+    """
+
+    def reserve(
+        self, *, sleeve_tag: str, parent_intent_id: str, amount: float
+    ) -> bool:
+        """Atomic account-wide headroom check + reservation (idempotent)."""
+        ...
+
+    def release(self, parent_intent_id: str, *, reason: str) -> bool:
+        """Idempotent release on a fill/cancel/reject lifecycle transition."""
+        ...
+
+    def recheck_before_submit(self) -> bool:
+        """Broker-cash recheck immediately before the submit API call."""
+        ...
+
+    def halt(self, reason: str) -> None:
+        """Sticky account-wide fail-closed for new entries (every sleeve)."""
+        ...
+
+    def halt_state(self) -> "tuple[bool, str | None]":
+        """(halted, reason) for the shared account."""
+        ...
+
+    def sweep(
+        self,
+        *,
+        broker_open_buy_intents: Any,
+        local_inflight_intents: Any,
+    ) -> Any:
+        """§5.3 orphan sweep; result carries halted/halt_reason attributes."""
+        ...
+
+
 @dataclass(frozen=True)
 class ReconcileMismatch:
     kind: str  # unknown_broker_order | missing_at_broker | qty_mismatch
@@ -495,7 +559,13 @@ class OrderStateBook:
     broker I/O (via :class:`BrokerPort` and the driver helpers below).
     """
 
-    def __init__(self, *, account: str, trading_day: str):
+    def __init__(
+        self,
+        *,
+        account: str,
+        trading_day: str,
+        cash_ledger: CashLedgerPort | None = None,
+    ):
         self.account = str(account)
         self.trading_day = str(trading_day)
         self._parents: dict[str, ParentIntent] = {}
@@ -505,6 +575,16 @@ class OrderStateBook:
         self._needs_reconcile = False
         # defense-in-depth: audit invariant must be monotone non-decreasing.
         self._gross_high_water: dict[str, float] = {}
+        # Crypto RFC §5.3 account-scoped cash reservation ledger. Default
+        # None = flag OFF = byte-identical legacy behavior (the per-tag
+        # reserved_cash() view stays the headroom source). When attached,
+        # BUY reservations are released on the SAME fill/cancel/reject
+        # transitions this book already owns.
+        self.cash_ledger = cash_ledger
+        # Last §5.3 orphan-sweep result (set by reconcile_on_restart when a
+        # ledger is attached) — the caller's alerting hook reads it here:
+        # orphans are released + COUNTED + ALERTED, never silently cleaned.
+        self.last_ledger_sweep: Any | None = None
 
     # -- introspection -------------------------------------------------------
     @property
@@ -561,6 +641,24 @@ class OrderStateBook:
         """Halt new ENTRIES for the session; exits stay allowed (SS7/A2)."""
         self.entries_halted = True
         self.halt_reason = reason
+
+    def attach_cash_ledger(self, cash_ledger: CashLedgerPort | None) -> None:
+        """Attach (or detach) the §5.3 account cash ledger.
+
+        Snapshots never carry the ledger (it is runtime wiring, not state);
+        a restored book must be re-attached by the caller before its
+        reconcile-before-emit pass so the ledger sweep runs.
+        """
+        self.cash_ledger = cash_ledger
+
+    def _release_cash_reservation(self, parent: ParentIntent, reason: str) -> None:
+        """§5.3 release() on the SAME lifecycle transition that observed the
+        terminal event (fill/cancel/reject/expire) — BUY parents only, no-op
+        when no ledger is attached (flag OFF) or already released (hooks may
+        race)."""
+        if self.cash_ledger is None or parent.side != SIDE_BUY:
+            return
+        self.cash_ledger.release(parent.parent_intent_id, reason=reason)
 
     # -- transitions ----------------------------------------------------------
     def register_intent(
@@ -740,6 +838,10 @@ class OrderStateBook:
         child.filled_qty += qty_f
         if child.filled_qty >= child.requested_qty - _QTY_EPS:
             child.state = ChildOrderState.FILLED
+            # §5.3: a full fill is a terminal path for this child's cash —
+            # the spent amount is real broker cash now, visible to the next
+            # reserve() through its fresh broker_cash fetch.
+            self._release_cash_reservation(parent, "filled")
         elif child.state is not ChildOrderState.STALE_PENDING:
             child.state = ChildOrderState.PARTIALLY_FILLED
         self._assert_invariants(parent)
@@ -757,6 +859,10 @@ class OrderStateBook:
         remainder = child.unfilled_qty
         child.state = terminal
         setattr(parent, counter, getattr(parent, counter) + remainder)
+        # §5.3 release() on the same cancel/reject/expire transition. A
+        # re-emitted remainder must go back through reserve() (which
+        # re-activates the released row against fresh headroom).
+        self._release_cash_reservation(parent, terminal.value.lower())
         self._assert_invariants(parent)
         return child
 
@@ -1031,6 +1137,22 @@ def submit_remainder(
     SELL (exit) parents are NEVER routed through the envelope. Returns None
     when there is nothing left to submit. A broker submit failure is recorded
     as a REJECTED child before the error propagates.
+
+    §5.3 account cash ledger (flag-gated; ``book.cash_ledger is None`` =
+    byte-identical legacy path). For BUY parents with a ledger attached:
+
+    1. ``reserve()`` must grant the entry notional against the SHARED
+       account headroom before any child exists; a refusal is
+       ``insufficient_buying_power_headroom`` (the existing A2 reason,
+       reused not duplicated) — unless the account is fail-closed, in which
+       case the halt reason propagates and the session's entries halt too.
+    2. Immediately before the actual order-submit API call, the broker-cash
+       recheck runs; a mismatch refuses THIS entry (child -> REJECTED,
+       reservation released on that same transition) and fail-closes new
+       entries across EVERY sleeve (§5.3 Codex round 2).
+
+    SELL (exit) parents never touch the ledger: exits and protective-stop
+    maintenance can never be blocked by it (§5.4 precedence).
     """
     parent = book.parent(parent_intent_id)
     qty = parent.remaining_unsubmitted
@@ -1047,13 +1169,44 @@ def submit_remainder(
             if decision.reason in TIER1_ENTRY_BLOCK_REASONS:
                 book.halt_entries(decision.reason)
             raise EntryBlockedError(decision.reason)
-    child = book.submit_child(
-        parent_intent_id,
-        qty=qty,
-        price=price,
-        now=now,
-        gate_admitted=gate_admitted,
-    )
+    ledger = book.cash_ledger if parent.side == SIDE_BUY else None
+    if ledger is not None:
+        granted = ledger.reserve(
+            sleeve_tag=book.account,
+            parent_intent_id=parent.parent_intent_id,
+            amount=qty * float(price),
+        )
+        if not granted:
+            halted, halt_reason = ledger.halt_state()
+            if halted:
+                reason = halt_reason or ACCOUNT_CASH_RECONCILE_MISMATCH_REASON
+                book.halt_entries(reason)
+                raise EntryBlockedError(reason)
+            raise EntryBlockedError("insufficient_buying_power_headroom")
+    try:
+        child = book.submit_child(
+            parent_intent_id,
+            qty=qty,
+            price=price,
+            now=now,
+            gate_admitted=gate_admitted,
+        )
+    except BaseException:
+        if ledger is not None:
+            # The reservation must not outlive a submit that never happened.
+            ledger.release(parent.parent_intent_id, reason="submit_failed")
+        raise
+    if ledger is not None and not ledger.recheck_before_submit():
+        # §5.3: broker cash moved below what the ledger believes is reserved
+        # — a REAL reconciliation mismatch, not a soft warning. Refuse this
+        # entry (REJECTED child; the transition releases the reservation)
+        # and fail closed for every sleeve; the ledger halt is already
+        # sticky, mirror it on this session book.
+        book.on_reject(child.child_order_id)
+        _, halt_reason = ledger.halt_state()
+        reason = halt_reason or ACCOUNT_CASH_RECONCILE_MISMATCH_REASON
+        book.halt_entries(reason)
+        raise EntryBlockedError(reason)
     try:
         port.submit_order(
             client_order_id=child.child_order_id,
@@ -1147,6 +1300,16 @@ def reconcile_on_restart(book: OrderStateBook, port: BrokerPort) -> ReconcileRes
     terminal status (fills applied first, so a cancel that raced a fill lands
     on FILLED). Only after this does :meth:`OrderStateBook.reconcile` compare
     the surviving in-flight set; any mismatch halts entries (exits allowed).
+
+    §5.3 ledger reconciliation (only when ``book.cash_ledger`` is attached;
+    ``None`` = byte-identical): the same pass additionally runs the account
+    cash ledger's orphan sweep — active reservations with no broker open
+    order and no local in-flight state are released/counted/alerted; a
+    broker open BUY with no active reservation (external/manual order,
+    headroom leak) fail-closes new entries for EVERY sleeve sharing the
+    account; and a book reconcile mismatch escalates from a session halt to
+    that same account-wide halt (an unrecognized order means some path is
+    moving cash the ledger doesn't know about).
     """
     broker_open = dict(port.open_orders())
     for child in list(book.open_children()):
@@ -1168,12 +1331,43 @@ def reconcile_on_restart(book: OrderStateBook, port: BrokerPort) -> ReconcileRes
         # status: apply fills; a short "filled" or unknown status is left
         # open and will surface as a reconcile mismatch.
         _apply_fill_delta(book, child, broker_filled)
-    return book.reconcile(broker_open)
+    result = book.reconcile(broker_open)
+    ledger = book.cash_ledger
+    if ledger is not None:
+        book_children = {
+            c.child_order_id: p for p in book.parents() for c in p.children
+        }
+        broker_buy_intents: set[str] = set()
+        for cid in broker_open:
+            known = book_children.get(cid)
+            if known is not None and known.side != SIDE_BUY:
+                continue  # a known SELL never reserves cash
+            # Known BUY, or UNKNOWN (side unknowable -> conservative: treat
+            # as a buy so it fails closed through the sweep).
+            broker_buy_intents.add(parent_intent_id_from_client_order_id(cid))
+        local_inflight = {
+            p.parent_intent_id
+            for p in book.parents()
+            if p.side == SIDE_BUY
+            and (p.open_qty > _QTY_EPS or p.remaining_unsubmitted > _QTY_EPS)
+        }
+        book.last_ledger_sweep = ledger.sweep(
+            broker_open_buy_intents=broker_buy_intents,
+            local_inflight_intents=local_inflight,
+        )
+        if not result.clean:
+            ledger.halt(ACCOUNT_CASH_RECONCILE_MISMATCH_REASON)
+        halted, halt_reason = ledger.halt_state()
+        if halted:
+            book.halt_entries(halt_reason or ACCOUNT_CASH_RECONCILE_MISMATCH_REASON)
+    return result
 
 
 __all__ = [
+    "ACCOUNT_CASH_RECONCILE_MISMATCH_REASON",
     "BrokerPort",
     "BrokerRegimeSnapshot",
+    "CashLedgerPort",
     "ChildOrder",
     "ChildOrderState",
     "DuplicateChildOrderError",
@@ -1198,6 +1392,7 @@ __all__ = [
     "classify_terminal_status",
     "compute_parent_intent_id",
     "evaluate_entry_headroom",
+    "parent_intent_id_from_client_order_id",
     "reconcile_on_restart",
     "resolve_day_expiry",
     "run_stale_watchdog",
