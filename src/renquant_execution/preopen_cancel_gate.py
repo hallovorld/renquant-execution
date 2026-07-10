@@ -23,6 +23,7 @@ import time
 from typing import Any
 
 from .alerts import AlertEvent, post_ntfy_alert, stable_alert_key
+from .crypto import is_crypto_pair
 
 logging.basicConfig(
     level=logging.INFO,
@@ -370,7 +371,15 @@ def cancel_stale_market_orders(
     )
     req = orders_request_factory(status=open_status, limit=200)
     orders = client.get_orders(filter=req)
-    pending_market = [order for order in orders if _is_market_order(order)]
+    # Crypto exclusion (crypto RFC §3.2 E10): this is an NYSE pre-open gate —
+    # crypto trades 24/7 and has no open to gate. Crypto-pair orders are
+    # never considered, on either side, even with --cancel-both-sides.
+    pending_market = [
+        order
+        for order in orders
+        if _is_market_order(order)
+        and not is_crypto_pair(str(getattr(order, "symbol", "")))
+    ]
     if cancel_both_sides:
         to_cancel = list(pending_market)
     else:

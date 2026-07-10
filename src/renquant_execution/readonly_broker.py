@@ -119,11 +119,22 @@ class ReadOnlyBrokerWrapper(BaseBroker):
     def get_all_positions(self) -> list[dict[str, Any]]:
         return self.underlying.get_all_positions()
 
-    def get_filled_orders(self, after: str | None = None) -> list[dict[str, Any]]:
-        return self.underlying.get_filled_orders(after=after)
+    def get_filled_orders(
+        self,
+        after: str | None = None,
+        asset_class: str | None = "us_equity",
+    ) -> list[dict[str, Any]]:
+        # E3 asset-class forwarding: only pass the parameter through when a
+        # caller opts OUT of the equity default, so underlying brokers (and
+        # test fakes) with the legacy signature keep working unchanged.
+        if asset_class == "us_equity":
+            return self.underlying.get_filled_orders(after=after)
+        return self.underlying.get_filled_orders(after=after, asset_class=asset_class)
 
-    def get_open_orders(self) -> set[str]:
-        return self.underlying.get_open_orders()
+    def get_open_orders(self, asset_class: str | None = "us_equity") -> set[str]:
+        if asset_class == "us_equity":
+            return self.underlying.get_open_orders()
+        return self.underlying.get_open_orders(asset_class=asset_class)
 
     def supports_broker_side_stops(
         self, symbol: str | None = None, quantity: float | None = None

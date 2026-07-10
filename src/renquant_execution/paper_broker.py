@@ -4,22 +4,45 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from .broker import BaseBroker
+from .broker import ASSET_CLASS_CRYPTO, BaseBroker
+from .crypto import CryptoFeeSchedule, is_crypto_pair
 
 
 class PaperBroker(BaseBroker):
-    """Small no-network broker that tracks cash and long positions."""
+    """Small no-network broker that tracks cash and long positions.
+
+    Crypto fee awareness (crypto RFC §3.2 E4): when constructed with a
+    ``crypto_fee_schedule``, fills on crypto pairs (pair-form symbols) net
+    the taker fee — a BUY must afford ``notional + fee`` and debits both; a
+    SELL credits ``notional - fee`` — so paper P&L stops overstating a
+    fee-bearing asset class. Equity fills are byte-identical with or without
+    a schedule (zero-fee, result shape unchanged); with no schedule (the
+    default) crypto fills are zero-fee too, so every existing caller is
+    unchanged.
+    """
 
     broker_name = "paper"
 
-    def __init__(self, initial_cash: float = 100_000.0) -> None:
+    def __init__(
+        self,
+        initial_cash: float = 100_000.0,
+        *,
+        crypto_fee_schedule: CryptoFeeSchedule | None = None,
+    ) -> None:
         self._initial_cash = float(initial_cash)
         self._cash = float(initial_cash)
         self._positions: dict[str, float] = {}
         self._avg_cost: dict[str, float] = {}
         self._last_price: dict[str, float] = {}
         self._order_counter = 0
+        self._crypto_fee_schedule = crypto_fee_schedule
         self.connected = False
+
+    def _paper_fill_fee(self, symbol: str, notional: float) -> float:
+        """Taker fee for a paper fill: crypto pairs only, else exactly 0.0."""
+        if self._crypto_fee_schedule is None or not is_crypto_pair(symbol):
+            return 0.0
+        return self._crypto_fee_schedule.fee_usd(notional, liquidity="taker")
 
     def connect(self) -> None:
         self.connected = True
@@ -80,8 +103,12 @@ class PaperBroker(BaseBroker):
         self._order_counter += 1
         order_id = f"PAPER-{self._order_counter:04d}"
         notional = float(quantity) * price
+        fee = self._paper_fill_fee(symbol, notional)
         if action_u == "BUY":
-            if notional > self._cash + 1e-6:
+            # Fee-aware affordability (E4): the budget must cover fill + fee.
+            # For equities (and crypto with no schedule) fee == 0.0 and this
+            # is the historical check byte-for-byte.
+            if notional + fee > self._cash + 1e-6:
                 return {
                     "order_id": order_id,
                     "status": "rejected",
@@ -96,17 +123,18 @@ class PaperBroker(BaseBroker):
             new_qty = old_qty + quantity
             self._avg_cost[symbol] = (old_cost * old_qty + price * quantity) / new_qty
             self._positions[symbol] = new_qty
-            self._cash -= notional
+            self._cash -= notional + fee
         else:
             held = self._positions.get(symbol, 0.0)
             sell_qty = min(quantity, held)
             self._positions[symbol] = max(0.0, held - sell_qty)
             if self._positions[symbol] == 0:
                 self._avg_cost.pop(symbol, None)
-            self._cash += sell_qty * price
+            fee = self._paper_fill_fee(symbol, sell_qty * price)
+            self._cash += sell_qty * price - fee
             quantity = sell_qty
 
-        return {
+        result = {
             "order_id": order_id,
             "status": "filled",
             "symbol": symbol,
@@ -114,4 +142,10 @@ class PaperBroker(BaseBroker):
             "quantity": float(quantity),
             "price": price,
         }
+        # Crypto fills surface the netted fee; equity results keep the exact
+        # historical shape (no new keys — byte-identity pin).
+        if is_crypto_pair(symbol):
+            result["fee"] = float(fee)
+            result["asset_class"] = ASSET_CLASS_CRYPTO
+        return result
 

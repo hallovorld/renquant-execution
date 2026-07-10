@@ -67,6 +67,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping, Protocol
 
+from .crypto import is_crypto_pair
+
 ORDER_STATE_SCHEMA_VERSION = "order-state-machine-v1"
 
 #: SS10 conservative default: max pending-order age before the watchdog
@@ -213,7 +215,13 @@ def _utc(ts: dt.datetime) -> dt.datetime:
 
 @dataclass
 class ChildOrder:
-    """One broker submission attempt for a parent intent."""
+    """One broker submission attempt for a parent intent.
+
+    ``fee_bps`` (crypto RFC §3.2 E4): the per-side fee schedule value the
+    reservation must cover for a fee-bearing asset class (crypto taker bps).
+    Defaults to ``0.0`` — every equity child (and every pre-crypto snapshot,
+    which has no ``fee_bps`` key) reserves exactly as before.
+    """
 
     child_order_id: str
     attempt_n: int
@@ -222,6 +230,7 @@ class ChildOrder:
     submitted_at: dt.datetime
     state: ChildOrderState = ChildOrderState.SUBMITTED
     filled_qty: float = 0.0
+    fee_bps: float = 0.0
 
     @property
     def unfilled_qty(self) -> float:
@@ -240,6 +249,7 @@ class ChildOrder:
             "submitted_at": self.submitted_at.isoformat(),
             "state": self.state.value,
             "filled_qty": self.filled_qty,
+            "fee_bps": self.fee_bps,
         }
 
     @classmethod
@@ -252,6 +262,8 @@ class ChildOrder:
             submitted_at=_utc(dt.datetime.fromisoformat(str(row["submitted_at"]))),
             state=ChildOrderState(row["state"]),
             filled_qty=float(row["filled_qty"]),
+            # Pre-crypto snapshots have no fee_bps key: default 0.0 (equity).
+            fee_bps=float(row.get("fee_bps", 0.0)),
         )
 
 
@@ -631,6 +643,7 @@ class OrderStateBook:
         price: float,
         now: dt.datetime,
         gate_admitted: bool = True,
+        fee_bps: float = 0.0,
     ) -> ChildOrder:
         """Open a new child submission (INTENDED/CANCELED -> SUBMITTED).
 
@@ -652,6 +665,9 @@ class OrderStateBook:
         price_f = float(price)
         if price_f <= 0:
             raise LifecycleError(f"child price must be positive: {price!r}")
+        fee_bps_f = float(fee_bps)
+        if fee_bps_f < 0:
+            raise LifecycleError(f"child fee_bps must be >= 0: {fee_bps!r}")
         if parent.side == SIDE_BUY:
             if self.entries_halted:
                 raise EntryBlockedError(self.halt_reason or "entries_halted")
@@ -689,6 +705,7 @@ class OrderStateBook:
             requested_qty=qty_f,
             price=price_f,
             submitted_at=_utc(now),
+            fee_bps=fee_bps_f,
         )
         parent.children.append(child)
         self._assert_invariants(parent)
@@ -832,6 +849,13 @@ class OrderStateBook:
 
         The unfilled remainder of a partial stays reserved until its child is
         filled or canceled. Sizing must never use raw broker cash.
+
+        Fee awareness (crypto RFC §3.2 E4): a child carrying a non-zero
+        ``fee_bps`` (crypto taker schedule) reserves ``notional * (1 +
+        fee_bps/1e4)`` so the fee can never be paid out of headroom another
+        order was sized against. Equity children (``fee_bps == 0.0``,
+        including every pre-crypto snapshot) reserve the exact historical
+        notional — byte-identical.
         """
         reserved = float(unsettled_buys)
         for parent in self._parents.values():
@@ -839,7 +863,10 @@ class OrderStateBook:
                 continue
             for child in parent.children:
                 if child.is_open:
-                    reserved += child.unfilled_qty * child.price
+                    notional = child.unfilled_qty * child.price
+                    if child.fee_bps:
+                        notional *= 1.0 + child.fee_bps / 10_000.0
+                    reserved += notional
         return reserved
 
     def available_cash(self, broker_cash: float, *, unsettled_buys: float = 0.0) -> float:
@@ -1081,19 +1108,34 @@ def resolve_day_expiry(book: OrderStateBook, port: BrokerPort) -> list[ChildOrde
 
     Children the broker still reports non-terminal are left OPEN and
     returned to the caller's reconcile path. Returns the resolved children.
+
+    Crypto exemption (crypto RFC §3.2 E9): crypto orders are GTC/IOC on a
+    24/7 market — there IS no equity close for them, and a resting GTC
+    crypto order (protective stop, resting limit) is a legitimate overnight
+    state, not a leftover. The sweep therefore SKIPS every crypto-pair
+    child entirely (no status fetch, no terminal resolution), so an
+    end-of-equity-session sweep can never wrongly terminate — or even
+    touch — a resting crypto order. Stale non-protective crypto GTC orders
+    are the crypto sleeve's ``max_resting_age`` watchdog's job (RFC §3.2),
+    not this sweep's.
     """
     resolved: list[ChildOrder] = []
-    for child in list(book.open_children()):
-        status_row = port.order_status(child.child_order_id)
-        status = status_row.get("status", "")
-        if classify_terminal_status(status) is None:
-            continue
-        book.apply_terminal_status(
-            child.child_order_id,
-            status=status,
-            filled_qty=float(status_row.get("filled_qty", 0.0)),
-        )
-        resolved.append(child)
+    for parent in book.parents():
+        if is_crypto_pair(parent.symbol):
+            continue  # E9: crypto orders never expire at an equity close
+        for child in parent.children:
+            if not child.is_open:
+                continue
+            status_row = port.order_status(child.child_order_id)
+            status = status_row.get("status", "")
+            if classify_terminal_status(status) is None:
+                continue
+            book.apply_terminal_status(
+                child.child_order_id,
+                status=status,
+                filled_qty=float(status_row.get("filled_qty", 0.0)),
+            )
+            resolved.append(child)
     return resolved
 
 
