@@ -79,7 +79,11 @@ from .order_state_machine import (
 )
 from .paper_broker import PaperBroker
 from .paper_broker_port import PaperBrokerPort
-from .readonly_broker import ReadOnlyBrokerWrapper
+from .readonly_broker import (
+    DEFAULT_READONLY_BROKER_NAME,
+    ReadOnlyBrokerWrapper,
+    validate_readonly_broker_name,
+)
 
 __all__ = [
     "AlpacaBroker",
@@ -96,6 +100,7 @@ __all__ = [
     "EntryBlockedError",
     "EntryDecision",
     "BELOW_MIN_NOTIONAL_STATUS",
+    "DEFAULT_READONLY_BROKER_NAME",
     "ExecutionContext",
     "ExecutionPipeline",
     "FRACTIONAL_QTY_GRID",
@@ -150,6 +155,7 @@ __all__ = [
     "sell_first_order_intents",
     "submit_remainder",
     "validate_fractional_order",
+    "validate_readonly_broker_name",
     "write_execution_payload",
     "write_live_commit_plan",
 ]
