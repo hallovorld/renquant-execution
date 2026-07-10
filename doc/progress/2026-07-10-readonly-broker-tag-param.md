@@ -1,5 +1,6 @@
 # ReadOnlyBrokerWrapper — parameterized broker-state tag (P-1)
 
+STATUS:   delivered
 DATE:     2026-07-10
 PR:       (this PR)
 CONTEXT:  `renquant_execution.readonly_broker.ReadOnlyBrokerWrapper` was an
