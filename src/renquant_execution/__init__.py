@@ -44,6 +44,7 @@ from .live_persistence import (
     commit_live_persistence,
     post_live_persistence_alert,
 )
+from .order_math import FRACTIONAL_QTY_GRID, cap_affordable_qty
 from .order_lifecycle import (
     LIFECYCLE_SCHEMA_VERSION,
     VALID_LIFECYCLE_EVENTS,
@@ -97,6 +98,7 @@ __all__ = [
     "BELOW_MIN_NOTIONAL_STATUS",
     "ExecutionContext",
     "ExecutionPipeline",
+    "FRACTIONAL_QTY_GRID",
     "FRACTIONABLE_LOOKUP_FAILED_STATUS",
     "FRACTIONAL_ORDER_TYPES",
     "FRACTIONAL_TIME_IN_FORCE",
@@ -125,6 +127,7 @@ __all__ = [
     "build_live_persistence_alert_event",
     "build_order_lifecycle_event",
     "build_live_commit_plan",
+    "cap_affordable_qty",
     "child_order_id",
     "classify_broker_result",
     "classify_terminal_status",
