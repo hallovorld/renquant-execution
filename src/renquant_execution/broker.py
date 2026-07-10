@@ -206,6 +206,21 @@ class BaseBroker(ABC):
     def get_cash(self) -> float:
         return self.get_account_value()
 
+    def get_account_id(self) -> str:
+        """The REAL brokerage account identifier (e.g. Alpaca's
+        ``account_number``) — never a sleeve/tag string. Required by the
+        account-scoped cash ledger's shared-wiring contract (crypto RFC
+        §5.3, D-C4): the ledger's identity is DERIVED from this, so a
+        caller can never accidentally pass a per-sleeve tag in its place.
+        Backends that don't yet participate in the shared-ledger contract
+        fail loud rather than silently returning a placeholder a caller
+        could mistake for a real account id."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement get_account_id() "
+            "(required for the account-scoped cash ledger's shared-wiring "
+            "contract)"
+        )
+
     def get_all_positions(self) -> list[dict[str, Any]]:
         return []
 

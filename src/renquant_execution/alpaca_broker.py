@@ -136,6 +136,20 @@ class AlpacaBroker(BaseBroker):
             raise
         return float(getattr(position, "qty", 0.0))
 
+    def get_account_id(self) -> str:
+        """Alpaca's real ``account_number`` (the same field ``connect()``
+        already verifies against ``RENQUANT_EXPECTED_LIVE_ACCOUNT`` in live
+        mode) — the shared cash ledger's identity is derived from THIS,
+        never a sleeve tag."""
+        self._require_client()
+        account_id = str(getattr(self._account, "account_number", "") or "")
+        if not account_id:
+            raise RuntimeError(
+                "AlpacaBroker has no account_number on its connected account "
+                "(cannot derive the shared cash ledger's identity)"
+            )
+        return account_id
+
     def get_account_value(self) -> float:
         account = self._refresh_account()
         return float(getattr(account, "portfolio_value", 0.0))

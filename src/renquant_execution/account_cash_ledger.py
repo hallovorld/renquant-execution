@@ -95,6 +95,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from .broker import BaseBroker
 from .order_state_machine import (
     ACCOUNT_CASH_RECONCILE_MISMATCH_REASON,
     MAX_PENDING_AGE_SECONDS,
@@ -703,6 +704,42 @@ def maybe_build_account_cash_ledger(
     )
 
 
+def build_shared_account_cash_ledger_for_broker(
+    broker: BaseBroker,
+    *,
+    data_dir: "str | Path",
+    ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS,
+    env: Optional[Mapping[str, str]] = None,
+) -> Optional[AccountCashLedger]:
+    """THE execution-owned wiring contract every launch path (the 104 batch
+    process, the crypto 24/7 loop) MUST build its ledger handle through
+    (Codex review, D-C4 round-1): ``account_id`` is DERIVED from
+    ``broker.get_account_id()`` — the broker's own verified real account
+    identity — never accepted as a caller-supplied string. This makes it
+    structurally impossible for a caller to pass a per-sleeve tag (e.g.
+    ``"alpaca_shadow_a"``) in the account-id slot: two sleeves that connect
+    to the SAME brokerage account through their own :class:`BaseBroker`
+    instance always resolve to the SAME ``account_cash_ledger_db_path``,
+    regardless of which sleeve's process constructs it, because the id
+    itself is queried from the broker, not threaded through config. The
+    shared-file property this enforces is verified end-to-end (two real
+    OS processes, not two in-process instances) by
+    ``tests/test_account_cash_ledger_shared_process.py``.
+
+    Delegates to :func:`maybe_build_account_cash_ledger` for the flag gate
+    and ``broker.get_cash`` for the fresh-every-transaction balance read.
+    """
+    if not account_cash_ledger_enabled(env):
+        return None
+    return maybe_build_account_cash_ledger(
+        data_dir=data_dir,
+        account_id=broker.get_account_id(),
+        broker_cash_fn=broker.get_cash,
+        ttl_seconds=ttl_seconds,
+        env=env,
+    )
+
+
 __all__ = [
     "ACCOUNT_CASH_LEDGER_FLAG",
     "ACCOUNT_CASH_LEDGER_SCHEMA_VERSION",
@@ -717,6 +754,7 @@ __all__ = [
     "ReservationRow",
     "account_cash_ledger_db_path",
     "account_cash_ledger_enabled",
+    "build_shared_account_cash_ledger_for_broker",
     "maybe_build_account_cash_ledger",
     "parent_intent_id_from_client_order_id",
 ]
