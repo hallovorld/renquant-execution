@@ -27,6 +27,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from .crypto import is_crypto_pair
 from .order_state_machine import SIDE_BUY
 
 #: Broker order statuses treated as an acknowledgment of a live order.
@@ -105,6 +106,18 @@ class AlpacaBrokerPort:
             LimitOrderRequest,
             MarketOrderRequest,
         )
+
+        # Crypto guard (crypto RFC §3.2 E1): this port is the 105 equity
+        # intraday path and pins TIF=DAY on every submit — a shape the broker
+        # rejects for crypto (GTC/IOC only). Fail closed instead of silently
+        # submitting a doomed DAY order; the crypto sleeve's port wiring is a
+        # separate slice (D-C11).
+        if is_crypto_pair(symbol):
+            raise BrokerPortContractError(
+                f"AlpacaBrokerPort is a TIF=DAY equity port; crypto pair "
+                f"{symbol!r} is not supported here (crypto TIF is GTC/IOC "
+                "only — use the crypto order paths on AlpacaBroker)"
+            )
 
         side_u = str(side).upper()
         order_type = self.entry_order_type if side_u == SIDE_BUY else self.exit_order_type

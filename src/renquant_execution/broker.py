@@ -20,6 +20,13 @@ from typing import Any
 # are >= 1e-6 away from an integer per Alpaca's 6-9dp quantity grid).
 QTY_INTEGRAL_EPS = 1e-9
 
+# Canonical asset-class vocabulary (crypto RFC 2026-07-10 §3.0/§3.2, D-C1
+# execution slice). ``us_equity`` is the implicit legacy default everywhere;
+# ``crypto`` is opted into EXPLICITLY (pair-form symbol or an explicit
+# asset_class argument) so every equity code path stays byte-identical.
+ASSET_CLASS_EQUITY = "us_equity"
+ASSET_CLASS_CRYPTO = "crypto"
+
 # Broker-result ``status`` values that mean "nothing was sent to the broker".
 # A no-submit result is NOT an order rejection by the broker and NOT a pending
 # order — it is an order the adapter deliberately did not submit (e.g. a
@@ -31,12 +38,22 @@ FRACTIONABLE_LOOKUP_FAILED_STATUS = "rejected_fractionable_lookup_failed"
 PRECISION_EXCEEDS_9DP_STATUS = "rejected_precision_exceeds_9dp"
 BELOW_MIN_NOTIONAL_STATUS = "rejected_below_min_notional"
 INVALID_FRACTIONAL_ORDER_STATUS = "rejected_invalid_fractional_order"
+# Crypto order-validation no-submit statuses (crypto RFC §3.2 E1/E2/E5/E6/E11).
+# Only ever produced by crypto order paths — equity paths cannot emit them.
+INVALID_CRYPTO_ORDER_STATUS = "rejected_invalid_crypto_order"
+CRYPTO_NO_SHORT_STATUS = "rejected_crypto_no_short"
+BELOW_MIN_ORDER_SIZE_STATUS = "rejected_below_min_order_size"
+CRYPTO_SPEC_LOOKUP_FAILED_STATUS = "rejected_crypto_spec_lookup_failed"
 NO_SUBMIT_STATUSES = frozenset({
     NON_FRACTIONABLE_STATUS,
     FRACTIONABLE_LOOKUP_FAILED_STATUS,
     PRECISION_EXCEEDS_9DP_STATUS,
     BELOW_MIN_NOTIONAL_STATUS,
     INVALID_FRACTIONAL_ORDER_STATUS,
+    INVALID_CRYPTO_ORDER_STATUS,
+    CRYPTO_NO_SHORT_STATUS,
+    BELOW_MIN_ORDER_SIZE_STATUS,
+    CRYPTO_SPEC_LOOKUP_FAILED_STATUS,
     # Legacy floor-to-zero status, kept recognized for back-compat audit replay.
     "skipped_non_fractionable_dust",
 })
@@ -192,10 +209,24 @@ class BaseBroker(ABC):
     def get_all_positions(self) -> list[dict[str, Any]]:
         return []
 
-    def get_filled_orders(self, after: str | None = None) -> list[dict[str, Any]]:
+    def get_filled_orders(
+        self,
+        after: str | None = None,
+        asset_class: str | None = ASSET_CLASS_EQUITY,
+    ) -> list[dict[str, Any]]:
+        """Filled orders for reconciliation (crypto RFC §3.2 E3).
+
+        ``asset_class`` defaults to ``us_equity`` so every existing caller is
+        unchanged; the crypto sleeve asks EXPLICITLY (``asset_class="crypto"``,
+        or ``None`` for every class) — crypto fills must never be silently
+        invisible to reconcile-before-emit, and equity reconciliation must
+        never silently start seeing crypto rows.
+        """
         return []
 
-    def get_open_orders(self) -> set[str]:
+    def get_open_orders(self, asset_class: str | None = ASSET_CLASS_EQUITY) -> set[str]:
+        """Open-order symbols for reconciliation; same E3 contract as
+        :meth:`get_filled_orders` (equity default, crypto explicit)."""
         return set()
 
     @abstractmethod
