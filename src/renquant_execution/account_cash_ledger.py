@@ -704,27 +704,64 @@ def maybe_build_account_cash_ledger(
     )
 
 
+#: THE single override hook for the canonical shared-ledger data root
+#: (intended for tests / an explicit, ONE-TIME operator decision recorded
+#: here — never a per-sleeve setting). Absent, the ledger lives at a FIXED
+#: location independent of any per-process variable (RENQUANT_REPO_ROOT,
+#: cwd, RENQUANT_SUBREPO_ROOT, ...) that could legitimately differ between
+#: two sleeves' launch environments (Codex review, D-C4 round-2: the prior
+#: design accepted an arbitrary caller-supplied ``data_dir``, which let two
+#: sleeves silently create independent per-account databases).
+ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE = "RENQUANT_ACCOUNT_CASH_LEDGER_DATA_DIR"
+
+
+def account_cash_ledger_data_dir(env: Optional[Mapping[str, str]] = None) -> Path:
+    """THE canonical, non-negotiable data root for the shared account-scoped
+    cash ledger (Codex review, D-C4 round-2).
+
+    Takes NO caller-supplied path argument and consults nothing that could
+    vary sleeve-to-sleeve: exactly one override
+    (:data:`ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE`, for tests / a single
+    recorded operator decision — never set differently per sleeve) and
+    otherwise a FIXED, machine-scoped default
+    (``~/.renquant/account_cash_ledger``) that does not depend on
+    ``RENQUANT_REPO_ROOT`` or any other per-deployment variable. Two
+    sleeves sharing a real brokerage account run on the same machine (the
+    whole point of a SQLite-file-coordinated ledger); this function's only
+    job is to make sure they can never resolve to two different files.
+    """
+    source = os.environ if env is None else env
+    raw = source.get(ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE)
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.home() / ".renquant" / "account_cash_ledger"
+
+
 def build_shared_account_cash_ledger_for_broker(
     broker: BaseBroker,
     *,
-    data_dir: "str | Path",
     ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS,
     env: Optional[Mapping[str, str]] = None,
 ) -> Optional[AccountCashLedger]:
     """THE execution-owned wiring contract every launch path (the 104 batch
     process, the crypto 24/7 loop) MUST build its ledger handle through
-    (Codex review, D-C4 round-1): ``account_id`` is DERIVED from
+    (Codex review, D-C4 round-1/round-2): ``account_id`` is DERIVED from
     ``broker.get_account_id()`` — the broker's own verified real account
-    identity — never accepted as a caller-supplied string. This makes it
-    structurally impossible for a caller to pass a per-sleeve tag (e.g.
-    ``"alpaca_shadow_a"``) in the account-id slot: two sleeves that connect
-    to the SAME brokerage account through their own :class:`BaseBroker`
-    instance always resolve to the SAME ``account_cash_ledger_db_path``,
-    regardless of which sleeve's process constructs it, because the id
-    itself is queried from the broker, not threaded through config. The
-    shared-file property this enforces is verified end-to-end (two real
-    OS processes, not two in-process instances) by
-    ``tests/test_account_cash_ledger_shared_process.py``.
+    identity — never accepted as a caller-supplied string, and the data
+    root is resolved by :func:`account_cash_ledger_data_dir` — ALSO never
+    a caller-supplied string. This function takes NO path/account
+    argument at all (round-2: round-1 still accepted an arbitrary
+    ``data_dir``, which Codex correctly flagged as still allowing two
+    sleeves to silently diverge onto independent per-account databases).
+    Two sleeves that connect to the SAME brokerage account through their
+    own :class:`BaseBroker` instance therefore always resolve to the SAME
+    ``account_cash_ledger_db_path``, regardless of which sleeve's process
+    constructs it — there is no parameter through which a per-sleeve path
+    could be threaded, by construction, not by convention. The shared-file
+    property this enforces is verified end-to-end (two real OS processes,
+    not two in-process instances) by
+    ``tests/test_account_cash_ledger_shared_process.py``, including a
+    positive proof that passing ``data_dir`` is now a ``TypeError``.
 
     Delegates to :func:`maybe_build_account_cash_ledger` for the flag gate
     and ``broker.get_cash`` for the fresh-every-transaction balance read.
@@ -732,7 +769,7 @@ def build_shared_account_cash_ledger_for_broker(
     if not account_cash_ledger_enabled(env):
         return None
     return maybe_build_account_cash_ledger(
-        data_dir=data_dir,
+        data_dir=account_cash_ledger_data_dir(env=env),
         account_id=broker.get_account_id(),
         broker_cash_fn=broker.get_cash,
         ttl_seconds=ttl_seconds,
@@ -741,6 +778,7 @@ def build_shared_account_cash_ledger_for_broker(
 
 
 __all__ = [
+    "ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE",
     "ACCOUNT_CASH_LEDGER_FLAG",
     "ACCOUNT_CASH_LEDGER_SCHEMA_VERSION",
     "AccountCashLedger",
@@ -752,6 +790,7 @@ __all__ = [
     "LedgerSweepResult",
     "RESERVATION_GRACE_SECONDS",
     "ReservationRow",
+    "account_cash_ledger_data_dir",
     "account_cash_ledger_db_path",
     "account_cash_ledger_enabled",
     "build_shared_account_cash_ledger_for_broker",
