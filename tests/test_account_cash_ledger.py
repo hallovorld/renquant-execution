@@ -28,6 +28,7 @@ import pytest
 
 import renquant_execution.account_cash_ledger as acl
 from renquant_execution.account_cash_ledger import (
+    ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST,
     ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE,
     ACCOUNT_CASH_LEDGER_FLAG,
     DEFAULT_RESERVATION_TTL_SECONDS,
@@ -676,6 +677,7 @@ def test_flag_default_off_builds_nothing(tmp_path):
 def test_flag_on_builds_ledger_at_canonical_resolved_path(tmp_path):
     env = {
         ACCOUNT_CASH_LEDGER_FLAG: "1",
+        ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST: "1",
         ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
     }
     ledger = build_shared_account_cash_ledger_for_broker(
@@ -1049,6 +1051,52 @@ def test_wiring_contract_rejects_per_sleeve_path_overrides(tmp_path):
         )
 
 
+def test_flag_on_without_same_host_acknowledgment_fails_closed(tmp_path):
+    # Codex round 3: the ledger's cross-process guarantee only holds on a
+    # same-host, local-filesystem deployment. Enabling the main flag WITHOUT
+    # also explicitly acknowledging that must fail loud, not silently
+    # degrade to None (which would look identical to the flag being off).
+    with pytest.raises(AccountCashLedgerError, match="ACKNOWLEDGE_SAME_HOST"):
+        build_shared_account_cash_ledger_for_broker(
+            _FakeAccountBroker(),
+            env={
+                ACCOUNT_CASH_LEDGER_FLAG: "1",
+                ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
+            },
+        )
+    assert not list(tmp_path.iterdir())  # fails before anything is created
+
+
+def test_flag_on_with_same_host_acknowledgment_builds_ledger(tmp_path):
+    ledger = build_shared_account_cash_ledger_for_broker(
+        _FakeAccountBroker(),
+        env={
+            ACCOUNT_CASH_LEDGER_FLAG: "1",
+            ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST: "1",
+            ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
+        },
+    )
+    assert ledger is not None
+
+
+def test_ledger_stamps_hostname_and_refuses_to_open_from_a_different_one(tmp_path):
+    # Structural check (not just an honor-system flag): the exact failure
+    # signature a genuine cross-host network-mount misconfiguration would
+    # produce -- two hosts opening what they believe is "the same shared
+    # ledger" -- is caught the same way schema_version/account_id mismatches
+    # already are ("refusing to mix ledgers").
+    db_path = tmp_path / "account_cash_ledger.TESTACC.db"
+    AccountCashLedger(db_path, account_id="TESTACC", broker_cash_fn=lambda: 1000.0)
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            "UPDATE ledger_meta SET value = ? WHERE key = 'hostname'",
+            ("some-other-host",),
+        )
+        conn.commit()
+    with pytest.raises(AccountCashLedgerError, match="refusing to mix ledgers"):
+        AccountCashLedger(db_path, account_id="TESTACC", broker_cash_fn=lambda: 1000.0)
+
+
 def test_session_factory_flag_off_returns_plain_book(tmp_path):
     book = open_session_order_book(
         _FakeAccountBroker(),
@@ -1076,6 +1124,7 @@ def test_session_factory_divergent_path_attempt_fails_before_any_submission(tmp_
             data_dir=str(tmp_path / "sleeve_private"),
             env={
                 ACCOUNT_CASH_LEDGER_FLAG: "1",
+                ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST: "1",
                 ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
             },
         )
@@ -1090,6 +1139,7 @@ def test_session_factory_two_sleeves_share_one_ledger_e2e(tmp_path):
     # and the second sleeve's over-committing BUY is refused at submit.
     env = {
         ACCOUNT_CASH_LEDGER_FLAG: "1",
+        ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST: "1",
         ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
     }
     equity_book = open_session_order_book(
@@ -1264,6 +1314,7 @@ def test_ledger_attached_book_requires_cost_spec_at_construction(tmp_path):
 def test_session_factory_requires_cost_contract_before_session_opens(tmp_path, monkeypatch):
     env = {
         ACCOUNT_CASH_LEDGER_FLAG: "1",
+        ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST: "1",
         ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
     }
     # missing spec: refused at wiring time

@@ -60,6 +60,31 @@ Contract (all RFC §5.3, quoted where binding):
   protective-stop maintenance are never routed through ``reserve()`` and can
   never be blocked by this ledger (the §5.4 exits-always-allowed precedence).
 
+DEPLOYMENT CONSTRAINT — SAME HOST, LOCAL FILESYSTEM ONLY (Codex review, D-C4
+round-3): this ledger's cross-process coordination guarantee rests entirely
+on SQLite's WAL-mode locking, which itself rests on the OS's POSIX advisory
+file locking (``fcntl``) working correctly on the volume the db file lives
+on. That holds for a local disk on ONE machine. It does NOT reliably hold
+over NFS, SMB, or most cloud-mounted/network-attached filesystems — many
+either lack working advisory locking entirely or emulate it in ways that can
+silently fail to serialize concurrent writers. Running the 104 batch process
+and the crypto 24/7 loop on DIFFERENT HOSTS sharing this db over a network
+mount — or pointing :data:`ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE` at such a
+mount "to simplify multi-host deployment" — would silently break the exact
+serialization guarantee this whole ledger exists to provide: reservations
+could race and double-book instead of correctly refusing. This is why
+enabling the ledger requires BOTH the main flag AND an explicit same-host
+acknowledgment (:data:`ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST`, the same
+"operator must consciously affirm X" idiom ``alpaca_broker.py`` already uses
+for ``RENQUANT_EXPECTED_LIVE_ACCOUNT``) — see
+:func:`build_shared_account_cash_ledger_for_broker`. As a second, structural
+check (not just an honor-system flag), the ledger stamps the creating
+process's hostname into ``ledger_meta`` at first construction and REFUSES to
+open the db from a different hostname thereafter — the same "refuse to mix
+ledgers" mechanism already used for ``schema_version``/``account_id``
+consistency — which is exactly the failure signature a genuine cross-host
+network-mount misconfiguration would produce.
+
 Flag-gated (default OFF = byte-identical): nothing constructs a ledger unless
 the ``RENQUANT_ACCOUNT_CASH_LEDGER`` environment flag is truthy —
 :func:`build_shared_account_cash_ledger_for_broker` returns ``None`` when
@@ -99,6 +124,7 @@ import datetime as dt
 import json
 import math
 import os
+import socket
 import sqlite3
 from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass
@@ -129,6 +155,16 @@ ACCOUNT_CASH_LEDGER_FLAG = "RENQUANT_ACCOUNT_CASH_LEDGER"
 #: design accepted an arbitrary caller-supplied ``data_dir``, which let two
 #: sleeves silently create independent per-account databases).
 ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE = "RENQUANT_ACCOUNT_CASH_LEDGER_DATA_DIR"
+
+#: Explicit operator acknowledgment that this deployment is SAME-HOST,
+#: LOCAL-FILESYSTEM (Codex review, D-C4 round-3 — see the module docstring's
+#: "DEPLOYMENT CONSTRAINT" section for why this matters). Required in
+#: addition to :data:`ACCOUNT_CASH_LEDGER_FLAG`; same idiom as
+#: ``alpaca_broker.py``'s ``RENQUANT_EXPECTED_LIVE_ACCOUNT`` — an operator
+#: must consciously affirm the constraint, it is never assumed.
+ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST = (
+    "RENQUANT_ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST"
+)
 
 #: The REQUIRED canonical cost contract (Codex review round 2 — reservations
 #: must be the fee-inclusive worst-case executable debit, computed through
@@ -211,6 +247,13 @@ def account_cash_ledger_data_dir(env: Optional[Mapping[str, str]] = None) -> Pat
     sleeves sharing a real brokerage account run on the same machine (the
     whole point of a SQLite-file-coordinated ledger); this function's only
     job is to make sure they can never resolve to two different files.
+
+    SAME-HOST, LOCAL FILESYSTEM ONLY: whatever this resolves to must be a
+    local disk path on the one machine both sleeves run on — never a
+    network-mounted volume (NFS/SMB/cloud-mount), whose POSIX advisory
+    locking support SQLite's WAL-mode coordination depends on is often
+    unreliable or absent. See the module docstring's "DEPLOYMENT
+    CONSTRAINT" section.
     """
     source = os.environ if env is None else env
     raw = source.get(ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE)
@@ -467,6 +510,7 @@ class AccountCashLedger:
             for key, expected in (
                 ("schema_version", ACCOUNT_CASH_LEDGER_SCHEMA_VERSION),
                 ("account_id", self.account_id),
+                ("hostname", socket.gethostname()),
             ):
                 row = conn.execute(
                     "SELECT value FROM ledger_meta WHERE key = ?", (key,)
@@ -477,9 +521,17 @@ class AccountCashLedger:
                         (key, expected),
                     )
                 elif str(row["value"]) != expected:
+                    hint = (
+                        " — this is the exact signature of a same-host/"
+                        "local-filesystem deployment violation (see the "
+                        "module docstring's DEPLOYMENT CONSTRAINT section): "
+                        "a second host is opening a db a different host "
+                        "created, almost certainly over a network mount"
+                        if key == "hostname" else ""
+                    )
                     raise AccountCashLedgerError(
                         f"ledger db {self.db_path} has {key}={row['value']!r}, "
-                        f"expected {expected!r} — refusing to mix ledgers"
+                        f"expected {expected!r} — refusing to mix ledgers{hint}"
                     )
             conn.execute(
                 "INSERT OR IGNORE INTO ledger_control (account_id, halted) VALUES (?, 0)",
@@ -930,9 +982,32 @@ def build_shared_account_cash_ledger_for_broker(
     Flag-gated: returns ``None`` (byte-identical legacy behavior) unless
     :data:`ACCOUNT_CASH_LEDGER_FLAG` is explicitly ON. ``broker.get_cash``
     supplies the fresh-every-transaction balance read.
+
+    SAME-HOST DEPLOYMENT ACKNOWLEDGMENT (Codex round 3): the ledger's
+    cross-process guarantee depends on POSIX advisory locking, which only
+    holds reliably for processes on ONE machine sharing a LOCAL disk (see
+    the module docstring's "DEPLOYMENT CONSTRAINT" section) — a caller
+    running this on a network-mounted volume, or across two hosts, would
+    silently defeat the whole reservation-serialization guarantee. Enabling
+    the flag WITHOUT also setting
+    :data:`ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST` is therefore a
+    configuration error, not a legitimate "off" state: raises
+    :class:`AccountCashLedgerError` rather than silently falling back to
+    ``None`` (which would look identical to the flag being off at all,
+    masking a half-configured deployment).
     """
     if not account_cash_ledger_enabled(env):
         return None
+    source = os.environ if env is None else env
+    if str(source.get(ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST, "")).strip().lower() not in _TRUTHY:
+        raise AccountCashLedgerError(
+            f"{ACCOUNT_CASH_LEDGER_FLAG} is enabled but "
+            f"{ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST} is not — the "
+            "account cash ledger's cross-process locking guarantee only "
+            "holds for a same-host, local-filesystem deployment (see the "
+            "module docstring); set the acknowledgment env var explicitly "
+            "once that has been confirmed for this deployment, never assume it"
+        )
     account_id = broker.get_account_id()
     return AccountCashLedger(
         account_cash_ledger_db_path(account_cash_ledger_data_dir(env=env), account_id),
@@ -999,6 +1074,7 @@ def open_session_order_book(
 
 
 __all__ = [
+    "ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST",
     "ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE",
     "ACCOUNT_CASH_LEDGER_FLAG",
     "ACCOUNT_CASH_LEDGER_SCHEMA_VERSION",

@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from renquant_execution.account_cash_ledger import (
+    ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST,
     ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE,
     account_cash_ledger_data_dir,
     account_cash_ledger_db_path,
@@ -98,6 +99,7 @@ def _run_worker(
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(p for p in sys.path if p)
     env["RENQUANT_ACCOUNT_CASH_LEDGER"] = "1"
+    env[ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST] = "1"
     if data_dir_override is not None:
         env[ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE] = data_dir_override
     else:
