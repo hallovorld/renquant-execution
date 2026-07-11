@@ -77,13 +77,33 @@ enabling the ledger requires BOTH the main flag AND an explicit same-host
 acknowledgment (:data:`ACCOUNT_CASH_LEDGER_ACKNOWLEDGE_SAME_HOST`, the same
 "operator must consciously affirm X" idiom ``alpaca_broker.py`` already uses
 for ``RENQUANT_EXPECTED_LIVE_ACCOUNT``) — see
-:func:`build_shared_account_cash_ledger_for_broker`. As a second, structural
-check (not just an honor-system flag), the ledger stamps the creating
-process's hostname into ``ledger_meta`` at first construction and REFUSES to
-open the db from a different hostname thereafter — the same "refuse to mix
-ledgers" mechanism already used for ``schema_version``/``account_id``
-consistency — which is exactly the failure signature a genuine cross-host
-network-mount misconfiguration would produce.
+:func:`build_shared_account_cash_ledger_for_broker`. As a second,
+best-effort check (not a substitute for the acknowledgment), the ledger
+stamps the creating process's hostname into ``ledger_meta`` at first
+construction and REFUSES to open the SAME db file from a different
+hostname thereafter — the same "refuse to mix ledgers" mechanism already
+used for ``schema_version``/``account_id`` consistency.
+
+LIMIT OF THE HOSTNAME CHECK (Codex D-C4 round-4, do not overstate this
+mechanism): it only detects a divergent host AFTER two processes already
+happen to open the SAME db file. The actual dangerous cross-host failure
+mode is the opposite — two hosts (or two containers, or two independently
+configured processes on one host with different ``HOME``/override roots)
+resolving to TWO DIFFERENT db files, each of which looks like a perfectly
+valid, self-consistent single-host ledger from the inside. Neither process
+observes a mismatch, because there is nothing to mismatch against; the
+hostname stamp cannot see a file it never opened. No mechanism internal to
+this SQLite-backed library can close that gap — it requires an external
+party that can observe BOTH processes' resolved paths before either opens
+its db and refuse to let them diverge. That external party is a
+control-plane preflight, and it does not exist yet. Until it does, this
+module is a SAME-FILESYSTEM-ONLY LIBRARY PRIMITIVE: safe and correct when
+every process sharing an account's ledger is genuinely co-resident on one
+host/filesystem, and NOT validated (by this module or anything else today)
+for cross-host or cross-container deployment. Enabling
+``RENQUANT_ACCOUNT_CASH_LEDGER`` for a real multi-host 104+24/7-crypto
+deployment without that preflight in place is a deployment error this
+library cannot detect for you.
 
 Flag-gated (default OFF = byte-identical): nothing constructs a ledger unless
 the ``RENQUANT_ACCOUNT_CASH_LEDGER`` environment flag is truthy —
@@ -92,8 +112,13 @@ OFF, and every ``order_state_machine`` seam treats ``None`` as "behave
 exactly as before". When ON, the topology is non-negotiable by construction:
 the account id comes from ``broker.get_account_id()`` (never a caller
 string) and the db location comes from :func:`account_cash_ledger_data_dir`
-(never a caller path) — see :func:`open_session_order_book`, THE session
-constructor both launch paths use. Reservations are the fee-inclusive
+(never a caller path) — see :func:`open_session_order_book`, the session
+constructor both real launch paths MUST route through to get this
+non-negotiable topology. No in-repo production entry point calls it yet
+(renquant-execution is a library; wiring the 104 batch process and the
+24/7 crypto loop onto it is owned by renquant-orchestrator and is tracked
+as a separate follow-up — see the D-C4 progress doc). Reservations are the
+fee-inclusive
 WORST-CASE EXECUTABLE DEBIT computed through the REQUIRED canonical cost
 contract (``renquant_common.cost_model``, coordinated floor
 renquant-common>=0.12.0), sha-stamped per row; absent contract = new
@@ -975,9 +1000,15 @@ def build_shared_account_cash_ledger_for_broker(
     Two sleeves that connect to the SAME brokerage account through their own
     :class:`BaseBroker` instances therefore always resolve to the SAME
     ``account_cash_ledger_db_path``, regardless of which sleeve's process
-    constructs it — by construction, not by convention. Verified end-to-end
-    with two real OS processes (including deliberately divergent unrelated
-    env vars) by ``tests/test_account_cash_ledger_shared_process.py``.
+    constructs it — by construction, not by convention, PROVIDED both
+    processes are co-resident on the same host/filesystem (see the module
+    docstring's DEPLOYMENT CONSTRAINT). This guarantee is a same-filesystem
+    path-resolution property only; it says nothing about whether two
+    processes on DIFFERENT hosts/filesystems were even supposed to share
+    one ledger in the first place — that is a control-plane preflight
+    concern this function does not address. Verified end-to-end with two
+    real OS processes on one filesystem (including deliberately divergent
+    unrelated env vars) by ``tests/test_account_cash_ledger_shared_process.py``.
 
     Flag-gated: returns ``None`` (byte-identical legacy behavior) unless
     :data:`ACCOUNT_CASH_LEDGER_FLAG` is explicitly ON. ``broker.get_cash``
@@ -1026,13 +1057,25 @@ def open_session_order_book(
     ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS,
     env: Optional[Mapping[str, str]] = None,
 ) -> OrderStateBook:
-    """THE execution-owned session-book constructor for BOTH real launch
-    paths (the 104 batch process and the 105-style/crypto 24/7 loop — the
-    two stacks that drive ``submit_remainder`` through a ``BrokerPort``).
+    """THE execution-owned session-book constructor BOTH real launch paths
+    (the 104 batch process and the 105-style/crypto 24/7 loop — the two
+    stacks that drive ``submit_remainder`` through a ``BrokerPort``) MUST
+    route through if/when they adopt the shared account cash ledger.
 
-    Launch paths construct their per-sleeve ``OrderStateBook`` HERE instead
-    of calling ``OrderStateBook(...)`` directly, so the §5.3 shared-ledger
-    wiring cannot be skipped or diverged per sleeve:
+    Scope note (Codex D-C4 round-4): this is a library contract, not a
+    completed integration — no in-repo production code and no launch
+    script in this repo calls this function today; renquant-execution does
+    not own either launch path's entry point. Wiring the real 104 and 24/7
+    processes onto this constructor (and proving, via an orchestrator-owned
+    control-plane preflight, that both resolve to the identical ledger
+    file before either submits an order) is separate, out-of-scope work
+    tracked against renquant-orchestrator. Do not read this docstring as a
+    claim that both launch paths are wired today.
+
+    Launch paths that DO adopt it construct their per-sleeve
+    ``OrderStateBook`` HERE instead of calling ``OrderStateBook(...)``
+    directly, so the §5.3 shared-ledger wiring cannot be skipped or
+    diverged per sleeve:
 
     - flag OFF -> a plain book (``cash_ledger=None``), byte-identical
       legacy behavior;
