@@ -10,7 +10,10 @@ default OFF = byte-identical.
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
+import hashlib
+import inspect
 import json
 import os
 import sqlite3
@@ -18,11 +21,14 @@ import subprocess
 import sys
 import threading
 import textwrap
+import types
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+import renquant_execution.account_cash_ledger as acl
 from renquant_execution.account_cash_ledger import (
+    ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE,
     ACCOUNT_CASH_LEDGER_FLAG,
     DEFAULT_RESERVATION_TTL_SECONDS,
     HALT_REASON_RECHECK_MISMATCH,
@@ -30,15 +36,21 @@ from renquant_execution.account_cash_ledger import (
     RESERVATION_GRACE_SECONDS,
     AccountCashLedger,
     AccountCashLedgerError,
+    account_cash_ledger_data_dir,
     account_cash_ledger_db_path,
     account_cash_ledger_enabled,
-    maybe_build_account_cash_ledger,
+    build_shared_account_cash_ledger_for_broker,
+    open_session_order_book,
+    worst_case_entry_debit,
 )
 from renquant_execution.order_state_machine import (
+    ACCOUNT_CASH_COST_CONTRACT_UNAVAILABLE_REASON,
     ACCOUNT_CASH_RECONCILE_MISMATCH_REASON,
     MAX_PENDING_AGE_SECONDS,
     ChildOrderState,
+    CostContractUnavailableError,
     EntryBlockedError,
+    LifecycleError,
     LifecycleState,
     OrderStateBook,
     parent_intent_id_from_client_order_id,
@@ -48,6 +60,96 @@ from renquant_execution.order_state_machine import (
 
 T0 = dt.datetime(2026, 7, 10, 14, 0, tzinfo=dt.timezone.utc)
 ACCOUNT = "PA3XXXX1"  # real brokerage account id, NEVER a broker tag
+
+
+# ---------------------------------------------------------------------------
+# Stub cost contract — a faithful replica of renquant_common.cost_model's
+# FROZEN surface (common#28 D-C8a: per_side = fee + spread/2 + slippage +
+# increment_rounding; sha256 over canonical sorted-keys JSON of to_dict()).
+# Installed via the autouse fixture below so the REQUIRED-contract paths stay
+# exercisable in environments where the installed renquant-common predates
+# D-C8a; parity with the REAL module is pinned by
+# tests/test_account_cash_ledger_cost_contract.py (importorskip) against the
+# same hand-computed sha values used here.
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class _StubCostModelSpec:
+    fee_bps: float = 0.0
+    spread_bps: float = 0.0
+    slippage_bps: float = 0.0
+    increment_rounding_bps: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "fee_bps": self.fee_bps,
+            "spread_bps": self.spread_bps,
+            "slippage_bps": self.slippage_bps,
+            "increment_rounding_bps": self.increment_rounding_bps,
+        }
+
+
+def _stub_spec_from_dict(payload) -> _StubCostModelSpec:
+    return _StubCostModelSpec(
+        fee_bps=payload.get("fee_bps", 0.0),
+        spread_bps=payload.get("spread_bps", 0.0),
+        slippage_bps=payload.get("slippage_bps", 0.0),
+        increment_rounding_bps=payload.get("increment_rounding_bps", 0.0),
+    )
+
+
+def _stub_per_side_cost_bps(spec) -> float:
+    return (
+        spec.fee_bps
+        + spec.spread_bps / 2.0
+        + spec.slippage_bps
+        + spec.increment_rounding_bps
+    )
+
+
+def canonical_cost_sha(spec_dict: dict) -> str:
+    """The frozen sha convention (common#28): canonical JSON, sha256: prefix."""
+    blob = json.dumps(
+        spec_dict, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _stub_cost_sha(spec) -> str:
+    return canonical_cost_sha(spec.to_dict())
+
+
+STUB_COST_MODEL = types.SimpleNamespace(
+    COST_MODEL_FINGERPRINT_SCHEMA_VERSION=1,
+    CostModelSpec=_StubCostModelSpec,
+    cost_model_spec_from_dict=_stub_spec_from_dict,
+    per_side_cost_bps=_stub_per_side_cost_bps,
+    cost_model_content_sha256=_stub_cost_sha,
+)
+
+
+@pytest.fixture(autouse=True)
+def stub_cost_contract(monkeypatch):
+    """Every test in this module runs against the stub contract; the
+    contract-ABSENT tests re-patch the importer to raise, and the REAL
+    module is exercised by test_account_cash_ledger_cost_contract.py."""
+    monkeypatch.setattr(acl, "_import_cost_model", lambda: STUB_COST_MODEL)
+    return STUB_COST_MODEL
+
+
+#: Zero-cost spec: worst-case debit == notional, so wiring tests keep exact
+#: historical numbers while still flowing through the REQUIRED contract.
+ZERO_COST_SPEC = {
+    "fee_bps": 0.0,
+    "spread_bps": 0.0,
+    "slippage_bps": 0.0,
+    "increment_rounding_bps": 0.0,
+}
+
+#: 25 bps fee + 10 bps full spread -> 30 bps per side (fee + spread/2).
+FEE_COST_SPEC = {"fee_bps": 25.0, "spread_bps": 10.0}
+FEE_PER_SIDE_RATE = 30.0 / 1e4
 
 
 class _BrokerCash:
@@ -119,8 +221,34 @@ class FakeBroker:
         return {"status": row["status"], "filled_qty": row["filled_qty"]}
 
 
-def _book(tag: str = "alpaca", ledger: AccountCashLedger | None = None) -> OrderStateBook:
-    return OrderStateBook(account=tag, trading_day="2026-07-10", cash_ledger=ledger)
+class _FakeAccountBroker:
+    """BaseBroker-shaped double for the wiring contract: reports a REAL
+    account id + live cash, like a connected sleeve broker would."""
+
+    def __init__(self, account_id: str = ACCOUNT, cash: float = 1_000.0):
+        self._account_id = account_id
+        self.cash = float(cash)
+
+    def get_account_id(self) -> str:
+        return self._account_id
+
+    def get_cash(self) -> float:
+        return self.cash
+
+
+def _book(
+    tag: str = "alpaca",
+    ledger: AccountCashLedger | None = None,
+    cost_spec: dict | None = None,
+) -> OrderStateBook:
+    if ledger is not None and cost_spec is None:
+        cost_spec = dict(ZERO_COST_SPEC)
+    return OrderStateBook(
+        account=tag,
+        trading_day="2026-07-10",
+        cash_ledger=ledger,
+        cost_model_spec=cost_spec,
+    )
 
 
 def _buy(book: OrderStateBook, symbol: str = "NVDA", target: float = 10.0):
@@ -537,12 +665,7 @@ def test_halt_state_shared_between_instances(tmp_path):
 def test_flag_default_off_builds_nothing(tmp_path):
     assert not account_cash_ledger_enabled(env={})
     assert (
-        maybe_build_account_cash_ledger(
-            data_dir=tmp_path,
-            account_id=ACCOUNT,
-            broker_cash_fn=lambda: 1.0,
-            env={},
-        )
+        build_shared_account_cash_ledger_for_broker(_FakeAccountBroker(), env={})
         is None
     )
     for off_value in ("", "0", "false", "off", "no"):
@@ -550,16 +673,18 @@ def test_flag_default_off_builds_nothing(tmp_path):
     assert not list(tmp_path.iterdir())  # flag OFF writes NOTHING
 
 
-def test_flag_on_builds_ledger_at_canonical_path(tmp_path):
-    ledger = maybe_build_account_cash_ledger(
-        data_dir=tmp_path,
-        account_id=ACCOUNT,
-        broker_cash_fn=lambda: 1.0,
-        env={ACCOUNT_CASH_LEDGER_FLAG: "1"},
+def test_flag_on_builds_ledger_at_canonical_resolved_path(tmp_path):
+    env = {
+        ACCOUNT_CASH_LEDGER_FLAG: "1",
+        ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
+    }
+    ledger = build_shared_account_cash_ledger_for_broker(
+        _FakeAccountBroker(), env=env
     )
     assert isinstance(ledger, AccountCashLedger)
     assert ledger.db_path == account_cash_ledger_db_path(tmp_path, ACCOUNT)
     assert ledger.db_path.exists()
+    assert ledger.account_id == ACCOUNT  # derived from the broker, not config
 
 
 def test_flag_off_book_and_submit_path_identical(tmp_path):
@@ -768,7 +893,7 @@ def test_exits_never_blocked_by_halted_ledger(tmp_path):
 
 def _snapshot_roundtrip(book: OrderStateBook, ledger: AccountCashLedger) -> OrderStateBook:
     restored = OrderStateBook.from_snapshot(book.to_snapshot())
-    restored.attach_cash_ledger(ledger)
+    restored.attach_cash_ledger(ledger, cost_model_spec=dict(ZERO_COST_SPEC))
     return restored
 
 
@@ -877,3 +1002,289 @@ def test_parent_intent_id_from_client_order_id_roundtrip():
     # external/manual ids come back verbatim -> can never match a reservation
     for manual in ("8f2c9e-broker-uuid", "manual:order:extra", "no-colon", ":3"):
         assert parent_intent_id_from_client_order_id(manual) == manual
+
+
+# ---------------------------------------------------------------------------
+# Topology (Codex round 2): the ledger location is owned by the execution
+# runtime — a fixed machine-scoped canonical root with exactly one
+# (tests/ops) override hook; no caller-controlled path anywhere in the
+# wiring.
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_data_dir_is_fixed_and_sleeve_independent(tmp_path):
+    # override hook (tests / one recorded operator decision) wins
+    assert account_cash_ledger_data_dir(
+        env={ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path)}
+    ) == tmp_path.resolve()
+    # otherwise: a FIXED home-scoped root, identical no matter which
+    # per-deployment variables a sleeve's launch environment carries
+    default = account_cash_ledger_data_dir(env={})
+    assert default.name == "account_cash_ledger"
+    assert account_cash_ledger_data_dir(
+        env={"RENQUANT_REPO_ROOT": "/some/other/deployment/root"}
+    ) == default
+
+
+def test_wiring_contract_rejects_per_sleeve_path_overrides(tmp_path):
+    # No parameter through which a sleeve can thread its own path: a
+    # divergent-path ATTEMPT is a TypeError at the call site — before any
+    # ledger, book, or order exists.
+    for fn in (build_shared_account_cash_ledger_for_broker, open_session_order_book):
+        assert "data_dir" not in inspect.signature(fn).parameters
+        assert not any(
+            "path" in name or "dir" in name
+            for name in inspect.signature(fn).parameters
+        )
+    with pytest.raises(TypeError):
+        build_shared_account_cash_ledger_for_broker(
+            _FakeAccountBroker(), data_dir=str(tmp_path)
+        )
+    with pytest.raises(TypeError):
+        open_session_order_book(
+            _FakeAccountBroker(),
+            sleeve_tag="alpaca",
+            trading_day="2026-07-10",
+            data_dir=str(tmp_path),
+        )
+
+
+def test_session_factory_flag_off_returns_plain_book(tmp_path):
+    book = open_session_order_book(
+        _FakeAccountBroker(),
+        sleeve_tag="alpaca",
+        trading_day="2026-07-10",
+        env={},
+    )
+    assert book.cash_ledger is None
+    assert book.cost_model_sha256 is None
+    assert not list(tmp_path.iterdir())  # nothing written anywhere
+
+
+def test_session_factory_divergent_path_attempt_fails_before_any_submission(tmp_path):
+    # E2E launch attempt threading a per-sleeve path into the session
+    # factory (the pre-review API shape): TypeError at the call site,
+    # BEFORE a ledger/book exists, so no order can ever have been submitted
+    # on a divergently-configured sleeve — and nothing is created on disk.
+    broker_port = FakeBroker()
+    with pytest.raises(TypeError):
+        open_session_order_book(
+            _FakeAccountBroker(),
+            sleeve_tag="alpaca",
+            trading_day="2026-07-10",
+            cost_model_spec=dict(ZERO_COST_SPEC),
+            data_dir=str(tmp_path / "sleeve_private"),
+            env={
+                ACCOUNT_CASH_LEDGER_FLAG: "1",
+                ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
+            },
+        )
+    assert broker_port.submits == []  # nothing ever reached a broker
+    assert not (tmp_path / "sleeve_private").exists()
+    assert not list(tmp_path.iterdir())  # not even the canonical db yet
+
+
+def test_session_factory_two_sleeves_share_one_ledger_e2e(tmp_path):
+    # THE topology property end-to-end through the mandated constructor:
+    # two sleeves, two broker instances, ONE runtime env -> one db file,
+    # and the second sleeve's over-committing BUY is refused at submit.
+    env = {
+        ACCOUNT_CASH_LEDGER_FLAG: "1",
+        ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
+    }
+    equity_book = open_session_order_book(
+        _FakeAccountBroker(cash=1_000.0),
+        sleeve_tag="alpaca",
+        trading_day="2026-07-10",
+        cost_model_spec=dict(ZERO_COST_SPEC),
+        env=env,
+    )
+    crypto_book = open_session_order_book(
+        _FakeAccountBroker(cash=1_000.0),
+        sleeve_tag="alpaca_crypto",
+        trading_day="2026-07-10",
+        cost_model_spec=dict(ZERO_COST_SPEC),
+        env=env,
+    )
+    assert equity_book.cash_ledger.db_path == crypto_book.cash_ledger.db_path
+    assert equity_book.cash_ledger.db_path == account_cash_ledger_db_path(
+        tmp_path, ACCOUNT
+    )
+    # run evidence stamped identically on both sleeves' books
+    assert equity_book.cost_model_sha256 == canonical_cost_sha(ZERO_COST_SPEC)
+    assert crypto_book.cost_model_sha256 == equity_book.cost_model_sha256
+    broker = FakeBroker()
+    equity = _buy(equity_book, symbol="NVDA", target=10.0)  # 600
+    crypto = _buy(crypto_book, symbol="BTC/USD", target=0.01)  # 600
+    assert (
+        submit_remainder(equity_book, broker, equity.parent_intent_id, price=60.0, now=T0)
+        is not None
+    )
+    with pytest.raises(EntryBlockedError) as excinfo:
+        submit_remainder(
+            crypto_book, broker, crypto.parent_intent_id, price=60_000.0, now=T0
+        )
+    assert excinfo.value.reason == "insufficient_buying_power_headroom"
+
+
+# ---------------------------------------------------------------------------
+# Fee-inclusive reservation via the REQUIRED canonical cost contract
+# (Codex round 2): worst-case executable debit, sha-stamped evidence,
+# fail-closed when the contract is absent. Run here against the frozen-API
+# stub; test_account_cash_ledger_cost_contract.py re-proves the same numbers
+# against the REAL renquant_common.cost_model when installed.
+# ---------------------------------------------------------------------------
+
+
+def test_worst_case_entry_debit_includes_per_side_costs():
+    debit, sha, params_json = worst_case_entry_debit(10_000.0, FEE_COST_SPEC)
+    assert debit == pytest.approx(10_000.0 * (1.0 + FEE_PER_SIDE_RATE))  # 10030
+    full = dict(ZERO_COST_SPEC)
+    full.update(FEE_COST_SPEC)
+    assert sha == canonical_cost_sha(full)
+    assert json.loads(params_json) == full
+
+
+def test_reserve_entry_reserves_debit_and_stamps_cost_evidence(tmp_path):
+    ledger, _ = _ledger(tmp_path, 1_000.0)
+    assert ledger.reserve_entry(
+        sleeve_tag="alpaca",
+        parent_intent_id="pi-1",
+        notional=500.0,
+        cost_spec=FEE_COST_SPEC,
+        now=T0,
+    )
+    row = ledger.reservation("pi-1")
+    assert row.amount == pytest.approx(500.0 * (1.0 + FEE_PER_SIDE_RATE))  # 501.5
+    full = dict(ZERO_COST_SPEC)
+    full.update(FEE_COST_SPEC)
+    assert row.cost_model_sha256 == canonical_cost_sha(full)
+    assert json.loads(row.cost_model_params) == full
+    assert ledger.active_reserved_total(now=T0) == pytest.approx(501.5)
+
+
+def test_boundary_notional_fits_but_fees_do_not(tmp_path):
+    # THE Codex boundary case: 100.00 cash, 99.80 notional — the notional
+    # alone fits (proven by the zero-cost grant below), but the worst-case
+    # executable debit 99.80 * 1.003 = 100.0994 does NOT.
+    ledger, _ = _ledger(tmp_path, 100.0)
+    assert not ledger.reserve_entry(
+        sleeve_tag="alpaca",
+        parent_intent_id="pi-fees",
+        notional=99.80,
+        cost_spec=FEE_COST_SPEC,
+    )
+    assert ledger.reservation("pi-fees") is None  # refused = nothing reserved
+    assert ledger.reserve_entry(
+        sleeve_tag="alpaca",
+        parent_intent_id="pi-no-fees",
+        notional=99.80,
+        cost_spec=ZERO_COST_SPEC,
+    )
+
+
+def test_boundary_notional_fits_but_fees_do_not_e2e_submit(tmp_path):
+    # Same boundary through the REAL submit path: the entry is refused with
+    # the existing A2 reason, no child exists, nothing reached the broker.
+    ledger, _ = _ledger(tmp_path, 100.0)
+    book = _book("alpaca", ledger, cost_spec=dict(FEE_COST_SPEC))
+    broker = FakeBroker()
+    parent = _buy(book, target=1.0)  # 1 x 99.80 = 99.80 notional
+    with pytest.raises(EntryBlockedError) as excinfo:
+        submit_remainder(book, broker, parent.parent_intent_id, price=99.80, now=T0)
+    assert excinfo.value.reason == "insufficient_buying_power_headroom"
+    assert parent.children == []
+    assert broker.submits == []
+    # and with the fees actually reservable, the SAME order goes through,
+    # reserving the fee-inclusive debit
+    rich_ledger, _ = _ledger(tmp_path / "rich", 101.0)
+    rich_book = _book("alpaca", rich_ledger, cost_spec=dict(FEE_COST_SPEC))
+    rich = _buy(rich_book, target=1.0)
+    assert submit_remainder(rich_book, broker, rich.parent_intent_id, price=99.80, now=T0)
+    assert rich_ledger.reservation(rich.parent_intent_id).amount == pytest.approx(
+        99.80 * (1.0 + FEE_PER_SIDE_RATE)
+    )
+
+
+def test_cost_contract_absent_fails_closed(tmp_path, monkeypatch):
+    ledger, _ = _ledger(tmp_path, 1_000.0)
+    book = _book("alpaca", ledger)
+    broker = FakeBroker()
+    parent = _buy(book, target=1.0)
+
+    def _no_contract():
+        raise ImportError("No module named 'renquant_common.cost_model'")
+
+    monkeypatch.setattr(acl, "_import_cost_model", _no_contract)
+    with pytest.raises(CostContractUnavailableError):
+        ledger.reserve_entry(
+            sleeve_tag="alpaca",
+            parent_intent_id="pi-x",
+            notional=1.0,
+            cost_spec=ZERO_COST_SPEC,
+        )
+    with pytest.raises(EntryBlockedError) as excinfo:
+        submit_remainder(book, broker, parent.parent_intent_id, price=1.0, now=T0)
+    assert excinfo.value.reason == ACCOUNT_CASH_COST_CONTRACT_UNAVAILABLE_REASON
+    assert parent.children == []
+    assert broker.submits == []
+    assert ledger.reservations() == []  # nothing was ever reserved
+    # exits stay allowed even with the contract absent
+    exit_parent = _sell(book, symbol="MSFT", target=1.0)
+    assert submit_remainder(book, broker, exit_parent.parent_intent_id, price=1.0, now=T0)
+
+
+def test_cost_contract_wrong_schema_version_fails_closed(tmp_path, monkeypatch):
+    bad = types.SimpleNamespace(**vars(STUB_COST_MODEL))
+    bad.COST_MODEL_FINGERPRINT_SCHEMA_VERSION = 2
+    monkeypatch.setattr(acl, "_import_cost_model", lambda: bad)
+    with pytest.raises(CostContractUnavailableError, match="schema version"):
+        worst_case_entry_debit(1.0, ZERO_COST_SPEC)
+
+
+def test_cost_contract_missing_surface_fails_closed(monkeypatch):
+    crippled = types.SimpleNamespace(**vars(STUB_COST_MODEL))
+    del crippled.per_side_cost_bps
+    monkeypatch.setattr(acl, "_import_cost_model", lambda: crippled)
+    with pytest.raises(CostContractUnavailableError, match="per_side_cost_bps"):
+        worst_case_entry_debit(1.0, ZERO_COST_SPEC)
+
+
+def test_ledger_attached_book_requires_cost_spec_at_construction(tmp_path):
+    ledger, _ = _ledger(tmp_path, 1_000.0)
+    with pytest.raises(LifecycleError, match="cost_model_spec"):
+        OrderStateBook(
+            account="alpaca", trading_day="2026-07-10", cash_ledger=ledger
+        )
+    book = OrderStateBook(account="alpaca", trading_day="2026-07-10")
+    with pytest.raises(LifecycleError, match="cost_model_spec"):
+        book.attach_cash_ledger(ledger)
+
+
+def test_session_factory_requires_cost_contract_before_session_opens(tmp_path, monkeypatch):
+    env = {
+        ACCOUNT_CASH_LEDGER_FLAG: "1",
+        ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE: str(tmp_path),
+    }
+    # missing spec: refused at wiring time
+    with pytest.raises(CostContractUnavailableError, match="no cost_model_spec"):
+        open_session_order_book(
+            _FakeAccountBroker(),
+            sleeve_tag="alpaca",
+            trading_day="2026-07-10",
+            env=env,
+        )
+
+    # absent contract module: refused at wiring time too, not at first BUY
+    def _no_contract():
+        raise ImportError("No module named 'renquant_common.cost_model'")
+
+    monkeypatch.setattr(acl, "_import_cost_model", _no_contract)
+    with pytest.raises(CostContractUnavailableError):
+        open_session_order_book(
+            _FakeAccountBroker(),
+            sleeve_tag="alpaca",
+            trading_day="2026-07-10",
+            cost_model_spec=dict(ZERO_COST_SPEC),
+            env=env,
+        )

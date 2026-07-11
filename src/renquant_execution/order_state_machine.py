@@ -228,6 +228,27 @@ def parent_intent_id_from_client_order_id(client_order_id: str) -> str:
 #: sleeve) when a ledger is attached — single source for the reason string.
 ACCOUNT_CASH_RECONCILE_MISMATCH_REASON = "account_cash_reconcile_mismatch"
 
+#: Entry-refusal reason when the canonical cost contract
+#: (``renquant_common.cost_model``, D-C8a) cannot be loaded/verified: the
+#: ledger path REQUIRES the fee-inclusive worst-case debit from the ONE
+#: shared cost model — with the contract absent, NEW ENTRIES fail closed
+#: (exits, as always, are never routed through the ledger).
+ACCOUNT_CASH_COST_CONTRACT_UNAVAILABLE_REASON = (
+    "account_cash_cost_contract_unavailable"
+)
+
+
+class CostContractUnavailableError(LifecycleError):
+    """The canonical cost contract (``renquant_common.cost_model``) is
+    absent, or fails its surface/schema-version verification.
+
+    Defined here (not in the ledger module) because this is the error the
+    :class:`CashLedgerPort` seam is allowed to raise into the submit path;
+    ``submit_remainder`` converts it to a fail-closed
+    :class:`EntryBlockedError` — a BUY can never be sized without the
+    fee-inclusive worst-case debit, and there is deliberately NO
+    notional-only fallback."""
+
 
 def _utc(ts: dt.datetime) -> dt.datetime:
     if ts.tzinfo is None:
@@ -411,10 +432,21 @@ class CashLedgerPort(Protocol):
     byte-identical legacy behavior.
     """
 
-    def reserve(
-        self, *, sleeve_tag: str, parent_intent_id: str, amount: float
+    def reserve_entry(
+        self,
+        *,
+        sleeve_tag: str,
+        parent_intent_id: str,
+        notional: float,
+        cost_spec: Any,
     ) -> bool:
-        """Atomic account-wide headroom check + reservation (idempotent)."""
+        """Atomic account-wide headroom check + reservation (idempotent) of
+        the WORST-CASE EXECUTABLE DEBIT: notional plus per-side costs from
+        the canonical cost contract (``renquant_common.cost_model``,
+        required — raises :class:`CostContractUnavailableError` when the
+        contract is absent; there is NO notional-only path through this
+        seam). The reservation row is stamped with the cost-spec content
+        sha."""
         ...
 
     def release(self, parent_intent_id: str, *, reason: str) -> bool:
@@ -565,6 +597,7 @@ class OrderStateBook:
         account: str,
         trading_day: str,
         cash_ledger: CashLedgerPort | None = None,
+        cost_model_spec: Any | None = None,
     ):
         self.account = str(account)
         self.trading_day = str(trading_day)
@@ -579,12 +612,35 @@ class OrderStateBook:
         # None = flag OFF = byte-identical legacy behavior (the per-tag
         # reserved_cash() view stays the headroom source). When attached,
         # BUY reservations are released on the SAME fill/cancel/reject
-        # transitions this book already owns.
+        # transitions this book already owns, and every reservation is the
+        # WORST-CASE EXECUTABLE DEBIT (notional + per-side costs) computed
+        # through the canonical cost contract — so a ledger-attached book
+        # REQUIRES a cost_model_spec at construction (fail closed HERE,
+        # before any order could be submitted, never mid-session).
+        self._require_cost_spec_with_ledger(cash_ledger, cost_model_spec)
         self.cash_ledger = cash_ledger
+        self.cost_model_spec = cost_model_spec
+        # Cost-contract run evidence: the content sha of the cost spec this
+        # session reserves with (stamped by the open_session_order_book
+        # wiring factory; also stamped per reservation row by the ledger).
+        self.cost_model_sha256: str | None = None
         # Last §5.3 orphan-sweep result (set by reconcile_on_restart when a
         # ledger is attached) — the caller's alerting hook reads it here:
         # orphans are released + COUNTED + ALERTED, never silently cleaned.
         self.last_ledger_sweep: Any | None = None
+
+    @staticmethod
+    def _require_cost_spec_with_ledger(
+        cash_ledger: CashLedgerPort | None, cost_model_spec: Any | None
+    ) -> None:
+        if cash_ledger is not None and cost_model_spec is None:
+            raise LifecycleError(
+                "a cash-ledger-attached book requires a cost_model_spec: "
+                "reservations are the worst-case executable debit (notional "
+                "+ per-side costs per renquant_common.cost_model) — refusing "
+                "at construction rather than failing every BUY at submit "
+                f"({ACCOUNT_CASH_COST_CONTRACT_UNAVAILABLE_REASON})"
+            )
 
     # -- introspection -------------------------------------------------------
     @property
@@ -642,14 +698,23 @@ class OrderStateBook:
         self.entries_halted = True
         self.halt_reason = reason
 
-    def attach_cash_ledger(self, cash_ledger: CashLedgerPort | None) -> None:
+    def attach_cash_ledger(
+        self,
+        cash_ledger: CashLedgerPort | None,
+        *,
+        cost_model_spec: Any | None = None,
+    ) -> None:
         """Attach (or detach) the §5.3 account cash ledger.
 
         Snapshots never carry the ledger (it is runtime wiring, not state);
         a restored book must be re-attached by the caller before its
-        reconcile-before-emit pass so the ledger sweep runs.
+        reconcile-before-emit pass so the ledger sweep runs. Attaching a
+        ledger requires the cost_model_spec, same as construction (fail
+        closed before any order could be submitted).
         """
+        self._require_cost_spec_with_ledger(cash_ledger, cost_model_spec)
         self.cash_ledger = cash_ledger
+        self.cost_model_spec = cost_model_spec
 
     def _release_cash_reservation(self, parent: ParentIntent, reason: str) -> None:
         """§5.3 release() on the SAME lifecycle transition that observed the
@@ -1006,8 +1071,13 @@ class OrderStateBook:
 
     # -- persistence + restart reconciliation (SS7) ---------------------------
     def to_snapshot(self) -> dict[str, Any]:
-        """JSON-serializable ledger snapshot of the whole session book."""
-        return {
+        """JSON-serializable ledger snapshot of the whole session book.
+
+        ``cost_model_sha256`` (cost-contract run evidence) is included ONLY
+        when stamped — a flag-OFF book's snapshot stays byte-identical to
+        the pre-ledger schema.
+        """
+        snapshot = {
             "schema_version": ORDER_STATE_SCHEMA_VERSION,
             "account": self.account,
             "trading_day": self.trading_day,
@@ -1015,6 +1085,9 @@ class OrderStateBook:
             "halt_reason": self.halt_reason,
             "parents": [p.to_snapshot() for p in self._parents.values()],
         }
+        if self.cost_model_sha256 is not None:
+            snapshot["cost_model_sha256"] = self.cost_model_sha256
+        return snapshot
 
     @classmethod
     def from_snapshot(cls, snapshot: Mapping[str, Any]) -> "OrderStateBook":
@@ -1029,6 +1102,10 @@ class OrderStateBook:
         book.entries_halted = bool(snapshot.get("entries_halted", False))
         raw_reason = snapshot.get("halt_reason")
         book.halt_reason = str(raw_reason) if raw_reason is not None else None
+        raw_cost_sha = snapshot.get("cost_model_sha256")
+        book.cost_model_sha256 = (
+            str(raw_cost_sha) if raw_cost_sha is not None else None
+        )
         for row in snapshot.get("parents", []):
             parent = ParentIntent.from_snapshot(row)
             if parent.parent_intent_id in book._parents:
@@ -1141,11 +1218,17 @@ def submit_remainder(
     §5.3 account cash ledger (flag-gated; ``book.cash_ledger is None`` =
     byte-identical legacy path). For BUY parents with a ledger attached:
 
-    1. ``reserve()`` must grant the entry notional against the SHARED
-       account headroom before any child exists; a refusal is
+    1. ``reserve_entry()`` must grant the WORST-CASE EXECUTABLE DEBIT —
+       entry notional PLUS per-side costs computed through the canonical
+       cost contract (``renquant_common.cost_model``; the reservation row
+       is stamped with the cost-spec content sha) — against the SHARED
+       account headroom before any child exists. A refusal is
        ``insufficient_buying_power_headroom`` (the existing A2 reason,
        reused not duplicated) — unless the account is fail-closed, in which
        case the halt reason propagates and the session's entries halt too.
+       An absent/unverifiable cost contract FAILS CLOSED
+       (``account_cash_cost_contract_unavailable``) — there is no
+       notional-only fallback.
     2. Immediately before the actual order-submit API call, the broker-cash
        recheck runs; a mismatch refuses THIS entry (child -> REJECTED,
        reservation released on that same transition) and fail-closes new
@@ -1171,11 +1254,22 @@ def submit_remainder(
             raise EntryBlockedError(decision.reason)
     ledger = book.cash_ledger if parent.side == SIDE_BUY else None
     if ledger is not None:
-        granted = ledger.reserve(
-            sleeve_tag=book.account,
-            parent_intent_id=parent.parent_intent_id,
-            amount=qty * float(price),
-        )
+        if book.cost_model_spec is None:
+            # Unreachable through the constructor/attach guard, but a book
+            # mutated around it must still fail closed, never reserve
+            # notional-only.
+            raise EntryBlockedError(ACCOUNT_CASH_COST_CONTRACT_UNAVAILABLE_REASON)
+        try:
+            granted = ledger.reserve_entry(
+                sleeve_tag=book.account,
+                parent_intent_id=parent.parent_intent_id,
+                notional=qty * float(price),
+                cost_spec=book.cost_model_spec,
+            )
+        except CostContractUnavailableError:
+            raise EntryBlockedError(
+                ACCOUNT_CASH_COST_CONTRACT_UNAVAILABLE_REASON
+            ) from None
         if not granted:
             halted, halt_reason = ledger.halt_state()
             if halted:
@@ -1364,11 +1458,13 @@ def reconcile_on_restart(book: OrderStateBook, port: BrokerPort) -> ReconcileRes
 
 
 __all__ = [
+    "ACCOUNT_CASH_COST_CONTRACT_UNAVAILABLE_REASON",
     "ACCOUNT_CASH_RECONCILE_MISMATCH_REASON",
     "BrokerPort",
     "BrokerRegimeSnapshot",
     "CashLedgerPort",
     "ChildOrder",
+    "CostContractUnavailableError",
     "ChildOrderState",
     "DuplicateChildOrderError",
     "EconomicInvariantError",

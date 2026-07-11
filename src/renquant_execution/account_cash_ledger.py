@@ -62,8 +62,17 @@ Contract (all RFC §5.3, quoted where binding):
 
 Flag-gated (default OFF = byte-identical): nothing constructs a ledger unless
 the ``RENQUANT_ACCOUNT_CASH_LEDGER`` environment flag is truthy —
-:func:`maybe_build_account_cash_ledger` returns ``None`` when OFF, and every
-``order_state_machine`` seam treats ``None`` as "behave exactly as before".
+:func:`build_shared_account_cash_ledger_for_broker` returns ``None`` when
+OFF, and every ``order_state_machine`` seam treats ``None`` as "behave
+exactly as before". When ON, the topology is non-negotiable by construction:
+the account id comes from ``broker.get_account_id()`` (never a caller
+string) and the db location comes from :func:`account_cash_ledger_data_dir`
+(never a caller path) — see :func:`open_session_order_book`, THE session
+constructor both launch paths use. Reservations are the fee-inclusive
+WORST-CASE EXECUTABLE DEBIT computed through the REQUIRED canonical cost
+contract (``renquant_common.cost_model``, coordinated floor
+renquant-common>=0.12.0), sha-stamped per row; absent contract = new
+entries fail closed.
 
 Ambiguities resolved against the RFC text (mirrored in the progress doc):
 
@@ -87,6 +96,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import json
 import math
 import os
 import sqlite3
@@ -98,7 +108,9 @@ from typing import Any, Optional
 from .broker import BaseBroker
 from .order_state_machine import (
     ACCOUNT_CASH_RECONCILE_MISMATCH_REASON,
+    CostContractUnavailableError,
     MAX_PENDING_AGE_SECONDS,
+    OrderStateBook,
     parent_intent_id_from_client_order_id,
 )
 
@@ -107,6 +119,42 @@ ACCOUNT_CASH_LEDGER_SCHEMA_VERSION = "account-cash-ledger-v1"
 #: Default-OFF feature flag (RFC §5.3 lands flag-gated; byte-identical when
 #: OFF). Truthy values: "1", "true", "on", "yes" (case-insensitive).
 ACCOUNT_CASH_LEDGER_FLAG = "RENQUANT_ACCOUNT_CASH_LEDGER"
+
+#: THE single override hook for the canonical shared-ledger data root
+#: (intended for tests / an explicit, ONE-TIME operator decision recorded
+#: here — never a per-sleeve setting). Absent, the ledger lives at a FIXED
+#: location independent of any per-process variable (RENQUANT_REPO_ROOT,
+#: cwd, RENQUANT_SUBREPO_ROOT, ...) that could legitimately differ between
+#: two sleeves' launch environments (Codex review, D-C4 round-2: the prior
+#: design accepted an arbitrary caller-supplied ``data_dir``, which let two
+#: sleeves silently create independent per-account databases).
+ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE = "RENQUANT_ACCOUNT_CASH_LEDGER_DATA_DIR"
+
+#: The REQUIRED canonical cost contract (Codex review round 2 — reservations
+#: must be the fee-inclusive worst-case executable debit, computed through
+#: renquant-common's ONE cost model, never a local formula).
+#:
+#: Coordinated version requirement: ``renquant-common>=0.12.0`` — the
+#: version-addressable release fixed in common#28 r2 (its own words:
+#: "Consumers requiring cost_model pin >=0.12.0 and fail closed below it";
+#: 0.11.0 stays claimed by open common#27). ENFORCEMENT here is structural
+#: — module presence + ``COST_MODEL_FINGERPRINT_SCHEMA_VERSION == 1`` + the
+#: frozen callable surface — because this fleet consumes renquant-common as
+#: a source checkout on PYTHONPATH, where ``importlib.metadata`` reports the
+#: (stale) pip install, not the checkout; ``cost_model`` first ships in
+#: 0.12.0, so a verified import IS >=0.12.0 content, while a metadata floor
+#: would fail closed spuriously on every correctly-deployed machine.
+#: Absent/unverifiable contract = FAIL CLOSED for new entries (never a
+#: notional-only fallback).
+REQUIRED_COST_MODEL_MODULE = "renquant_common.cost_model"
+REQUIRED_COST_MODEL_PACKAGE_FLOOR = "0.12.0"
+REQUIRED_COST_MODEL_FINGERPRINT_SCHEMA_VERSION = 1
+_REQUIRED_COST_MODEL_SURFACE = (
+    "CostModelSpec",
+    "cost_model_content_sha256",
+    "cost_model_spec_from_dict",
+    "per_side_cost_bps",
+)
 
 #: RFC §5.3 TTL: "order timeout budget + a fixed grace margin — reuse
 #: whatever order-submission timeout convention already exists in
@@ -149,6 +197,115 @@ def account_cash_ledger_db_path(data_dir: "str | Path", account_id: str) -> Path
     return Path(data_dir) / f"account_cash_ledger.{account}.db"
 
 
+def account_cash_ledger_data_dir(env: Optional[Mapping[str, str]] = None) -> Path:
+    """THE canonical, non-negotiable data root for the shared account-scoped
+    cash ledger (Codex review, D-C4 round-2).
+
+    Takes NO caller-supplied path argument and consults nothing that could
+    vary sleeve-to-sleeve: exactly one override
+    (:data:`ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE`, for tests / a single
+    recorded operator decision — never set differently per sleeve) and
+    otherwise a FIXED, machine-scoped default
+    (``~/.renquant/account_cash_ledger``) that does not depend on
+    ``RENQUANT_REPO_ROOT`` or any other per-deployment variable. Two
+    sleeves sharing a real brokerage account run on the same machine (the
+    whole point of a SQLite-file-coordinated ledger); this function's only
+    job is to make sure they can never resolve to two different files.
+    """
+    source = os.environ if env is None else env
+    raw = source.get(ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE)
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.home() / ".renquant" / "account_cash_ledger"
+
+
+def _import_cost_model() -> Any:
+    """Import seam for the canonical cost contract (monkeypatchable in
+    tests to simulate presence/absence deterministically)."""
+    from renquant_common import cost_model  # noqa: PLC0415 (lazy: fail closed at use)
+
+    return cost_model
+
+
+def load_cost_contract() -> Any:
+    """Load + verify the REQUIRED canonical cost contract, fail closed.
+
+    Returns the verified ``renquant_common.cost_model`` module. Raises
+    :class:`CostContractUnavailableError` when the module is missing (the
+    installed renquant-common predates D-C8a) or when its fingerprint
+    schema version / callable surface does not match
+    :data:`REQUIRED_COST_MODEL_FINGERPRINT_SCHEMA_VERSION` — a contract
+    that LOOKS different is treated as absent, never partially trusted.
+    """
+    try:
+        contract = _import_cost_model()
+    except ImportError as exc:
+        raise CostContractUnavailableError(
+            f"{REQUIRED_COST_MODEL_MODULE} is not importable (installed "
+            "renquant-common predates the D-C8a cost contract): the account "
+            "cash ledger REQUIRES the canonical cost model for worst-case "
+            f"reservation debits — new entries fail closed. ({exc})"
+        ) from exc
+    schema_version = getattr(
+        contract, "COST_MODEL_FINGERPRINT_SCHEMA_VERSION", None
+    )
+    if schema_version != REQUIRED_COST_MODEL_FINGERPRINT_SCHEMA_VERSION:
+        raise CostContractUnavailableError(
+            f"{REQUIRED_COST_MODEL_MODULE} fingerprint schema version "
+            f"{schema_version!r} != required "
+            f"{REQUIRED_COST_MODEL_FINGERPRINT_SCHEMA_VERSION!r} — treating "
+            "the contract as absent (fail closed), never partially trusted"
+        )
+    missing = [
+        name
+        for name in _REQUIRED_COST_MODEL_SURFACE
+        if not callable(getattr(contract, name, None))
+    ]
+    if missing:
+        raise CostContractUnavailableError(
+            f"{REQUIRED_COST_MODEL_MODULE} is missing required surface "
+            f"{missing} — treating the contract as absent (fail closed)"
+        )
+    return contract
+
+
+def worst_case_entry_debit(
+    notional: float, cost_spec: Any
+) -> "tuple[float, str, str]":
+    """(debit, cost_model_sha256, canonical params json) for one BUY entry.
+
+    ``debit = notional * (1 + per_side_cost_bps(spec) / 1e4)`` — the
+    worst-case executable cash outflow for one side per the canonical cost
+    contract (fee + half-spread + slippage + increment rounding). The sha is
+    ``cost_model_content_sha256`` over the SAME spec the debit used, so the
+    reservation/run evidence pins exactly which numbers sized the entry.
+    ``cost_spec`` may be a ``CostModelSpec`` or its canonical dict form.
+    Raises :class:`CostContractUnavailableError` when the contract is
+    absent — there is NO notional-only fallback.
+    """
+    contract = load_cost_contract()
+    notional_f = float(notional)
+    if not math.isfinite(notional_f) or notional_f <= 0:
+        raise AccountCashLedgerError(
+            f"entry notional must be finite and positive: {notional!r}"
+        )
+    if isinstance(cost_spec, Mapping):
+        spec = contract.cost_model_spec_from_dict(cost_spec)
+    elif isinstance(cost_spec, contract.CostModelSpec):
+        spec = cost_spec
+    else:
+        raise AccountCashLedgerError(
+            "cost_spec must be a renquant_common.cost_model.CostModelSpec "
+            f"or its canonical dict form, got {type(cost_spec).__name__}"
+        )
+    debit = notional_f * (1.0 + contract.per_side_cost_bps(spec) / 1e4)
+    sha = contract.cost_model_content_sha256(spec)
+    params_json = json.dumps(
+        spec.to_dict(), sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return debit, sha, params_json
+
+
 def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -173,6 +330,12 @@ class ReservationRow:
     expires_at: float
     released_at: Optional[float] = None
     release_reason: Optional[str] = None
+    #: Cost-contract evidence stamp: content sha + canonical params of the
+    #: CostModelSpec whose worst-case debit this reservation is (None only
+    #: for raw storage-primitive writes, e.g. tests — every order-path
+    #: reservation carries both).
+    cost_model_sha256: Optional[str] = None
+    cost_model_params: Optional[str] = None
 
     def is_expired(self, *, now_epoch: float) -> bool:
         return self.status == "active" and now_epoch >= self.expires_at
@@ -275,16 +438,18 @@ class AccountCashLedger:
             )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS cash_reservations (
-                       parent_intent_id TEXT PRIMARY KEY,
-                       account_id       TEXT NOT NULL,
-                       sleeve_tag       TEXT NOT NULL,
-                       amount           REAL NOT NULL CHECK (amount > 0),
-                       status           TEXT NOT NULL
+                       parent_intent_id  TEXT PRIMARY KEY,
+                       account_id        TEXT NOT NULL,
+                       sleeve_tag        TEXT NOT NULL,
+                       amount            REAL NOT NULL CHECK (amount > 0),
+                       status            TEXT NOT NULL
                            CHECK (status IN ('active', 'released')),
-                       reserved_at      REAL NOT NULL,
-                       expires_at       REAL NOT NULL,
-                       released_at      REAL,
-                       release_reason   TEXT
+                       reserved_at       REAL NOT NULL,
+                       expires_at        REAL NOT NULL,
+                       released_at       REAL,
+                       release_reason    TEXT,
+                       cost_model_sha256 TEXT,
+                       cost_model_params TEXT
                    )"""
             )
             conn.execute(
@@ -360,6 +525,16 @@ class AccountCashLedger:
             release_reason=(
                 str(row["release_reason"])
                 if row["release_reason"] is not None
+                else None
+            ),
+            cost_model_sha256=(
+                str(row["cost_model_sha256"])
+                if row["cost_model_sha256"] is not None
+                else None
+            ),
+            cost_model_params=(
+                str(row["cost_model_params"])
+                if row["cost_model_params"] is not None
                 else None
             ),
         )
@@ -450,6 +625,38 @@ class AccountCashLedger:
                 raise
 
     # -- the §5.3 protocol ------------------------------------------------------
+    def reserve_entry(
+        self,
+        *,
+        sleeve_tag: str,
+        parent_intent_id: str,
+        notional: float,
+        cost_spec: Any,
+        now: Optional[dt.datetime] = None,
+    ) -> bool:
+        """THE order-path reservation (CashLedgerPort seam): reserve the
+        WORST-CASE EXECUTABLE DEBIT for one BUY entry.
+
+        Computes ``notional * (1 + per_side_cost_bps(cost_spec)/1e4)``
+        through the REQUIRED canonical cost contract
+        (``renquant_common.cost_model`` — raises
+        :class:`CostContractUnavailableError` when absent/unverifiable;
+        there is NO notional-only fallback) and stamps the reservation row
+        with ``cost_model_content_sha256(cost_spec)`` + the canonical params
+        JSON, so the run evidence pins exactly which cost numbers sized the
+        entry. Delegates to :meth:`reserve` for the atomic
+        check-and-insert.
+        """
+        debit, sha, params_json = worst_case_entry_debit(notional, cost_spec)
+        return self.reserve(
+            sleeve_tag=sleeve_tag,
+            parent_intent_id=parent_intent_id,
+            amount=debit,
+            now=now,
+            cost_model_sha256=sha,
+            cost_model_params=params_json,
+        )
+
     def reserve(
         self,
         *,
@@ -457,8 +664,15 @@ class AccountCashLedger:
         parent_intent_id: str,
         amount: float,
         now: Optional[dt.datetime] = None,
+        cost_model_sha256: Optional[str] = None,
+        cost_model_params: Optional[str] = None,
     ) -> bool:
         """Atomically reserve ``amount`` against the shared account headroom.
+
+        STORAGE PRIMITIVE: order paths must go through :meth:`reserve_entry`
+        (which computes the fee-inclusive worst-case debit through the
+        canonical cost contract and stamps its sha here) — the
+        ``CashLedgerPort`` seam exposes only ``reserve_entry``, never this.
 
         UPSERT-then-check (§5.3): an existing ACTIVE row for this
         ``parent_intent_id`` is a retried call — no-op, returns ``True`` (the
@@ -510,8 +724,9 @@ class AccountCashLedger:
                     """INSERT INTO cash_reservations
                            (parent_intent_id, account_id, sleeve_tag, amount,
                             status, reserved_at, expires_at, released_at,
-                            release_reason)
-                       VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, NULL)
+                            release_reason, cost_model_sha256,
+                            cost_model_params)
+                       VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, NULL, ?, ?)
                        ON CONFLICT(parent_intent_id) DO UPDATE SET
                            sleeve_tag = excluded.sleeve_tag,
                            amount = excluded.amount,
@@ -519,7 +734,9 @@ class AccountCashLedger:
                            reserved_at = excluded.reserved_at,
                            expires_at = excluded.expires_at,
                            released_at = NULL,
-                           release_reason = NULL""",
+                           release_reason = NULL,
+                           cost_model_sha256 = excluded.cost_model_sha256,
+                           cost_model_params = excluded.cost_model_params""",
                     (
                         pid,
                         self.account_id,
@@ -527,6 +744,8 @@ class AccountCashLedger:
                         amount_f,
                         now_epoch,
                         now_epoch + self.ttl_seconds,
+                        cost_model_sha256,
+                        cost_model_params,
                     ),
                 )
                 conn.execute("COMMIT")
@@ -680,63 +899,6 @@ class AccountCashLedger:
         )
 
 
-def maybe_build_account_cash_ledger(
-    *,
-    data_dir: "str | Path",
-    account_id: str,
-    broker_cash_fn: Callable[[], float],
-    ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS,
-    env: Optional[Mapping[str, str]] = None,
-) -> Optional[AccountCashLedger]:
-    """Flag-gated constructor: ``None`` unless the §5.3 flag is explicitly ON.
-
-    Default OFF is the byte-identical path — with ``None`` every
-    ``order_state_machine`` seam behaves exactly as it did before this
-    module existed.
-    """
-    if not account_cash_ledger_enabled(env):
-        return None
-    return AccountCashLedger(
-        account_cash_ledger_db_path(data_dir, account_id),
-        account_id=account_id,
-        broker_cash_fn=broker_cash_fn,
-        ttl_seconds=ttl_seconds,
-    )
-
-
-#: THE single override hook for the canonical shared-ledger data root
-#: (intended for tests / an explicit, ONE-TIME operator decision recorded
-#: here — never a per-sleeve setting). Absent, the ledger lives at a FIXED
-#: location independent of any per-process variable (RENQUANT_REPO_ROOT,
-#: cwd, RENQUANT_SUBREPO_ROOT, ...) that could legitimately differ between
-#: two sleeves' launch environments (Codex review, D-C4 round-2: the prior
-#: design accepted an arbitrary caller-supplied ``data_dir``, which let two
-#: sleeves silently create independent per-account databases).
-ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE = "RENQUANT_ACCOUNT_CASH_LEDGER_DATA_DIR"
-
-
-def account_cash_ledger_data_dir(env: Optional[Mapping[str, str]] = None) -> Path:
-    """THE canonical, non-negotiable data root for the shared account-scoped
-    cash ledger (Codex review, D-C4 round-2).
-
-    Takes NO caller-supplied path argument and consults nothing that could
-    vary sleeve-to-sleeve: exactly one override
-    (:data:`ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE`, for tests / a single
-    recorded operator decision — never set differently per sleeve) and
-    otherwise a FIXED, machine-scoped default
-    (``~/.renquant/account_cash_ledger``) that does not depend on
-    ``RENQUANT_REPO_ROOT`` or any other per-deployment variable. Two
-    sleeves sharing a real brokerage account run on the same machine (the
-    whole point of a SQLite-file-coordinated ledger); this function's only
-    job is to make sure they can never resolve to two different files.
-    """
-    source = os.environ if env is None else env
-    raw = source.get(ACCOUNT_CASH_LEDGER_DATA_DIR_OVERRIDE)
-    if raw:
-        return Path(raw).expanduser().resolve()
-    return Path.home() / ".renquant" / "account_cash_ledger"
-
-
 def build_shared_account_cash_ledger_for_broker(
     broker: BaseBroker,
     *,
@@ -744,37 +906,96 @@ def build_shared_account_cash_ledger_for_broker(
     env: Optional[Mapping[str, str]] = None,
 ) -> Optional[AccountCashLedger]:
     """THE execution-owned wiring contract every launch path (the 104 batch
-    process, the crypto 24/7 loop) MUST build its ledger handle through
-    (Codex review, D-C4 round-1/round-2): ``account_id`` is DERIVED from
-    ``broker.get_account_id()`` — the broker's own verified real account
-    identity — never accepted as a caller-supplied string, and the data
-    root is resolved by :func:`account_cash_ledger_data_dir` — ALSO never
-    a caller-supplied string. This function takes NO path/account
-    argument at all (round-2: round-1 still accepted an arbitrary
-    ``data_dir``, which Codex correctly flagged as still allowing two
-    sleeves to silently diverge onto independent per-account databases).
-    Two sleeves that connect to the SAME brokerage account through their
-    own :class:`BaseBroker` instance therefore always resolve to the SAME
-    ``account_cash_ledger_db_path``, regardless of which sleeve's process
-    constructs it — there is no parameter through which a per-sleeve path
-    could be threaded, by construction, not by convention. The shared-file
-    property this enforces is verified end-to-end (two real OS processes,
-    not two in-process instances) by
-    ``tests/test_account_cash_ledger_shared_process.py``, including a
-    positive proof that passing ``data_dir`` is now a ``TypeError``.
+    process, the crypto 24/7 loop) MUST build its ledger handle through:
 
-    Delegates to :func:`maybe_build_account_cash_ledger` for the flag gate
-    and ``broker.get_cash`` for the fresh-every-transaction balance read.
+    - ``account_id`` is DERIVED from ``broker.get_account_id()`` — the
+      broker's own verified real account identity — never accepted as a
+      caller-supplied string (Codex round 1), so a per-sleeve tag can never
+      leak into the ledger-identity slot;
+    - the db LOCATION is resolved by :func:`account_cash_ledger_data_dir` —
+      a fixed, machine-scoped canonical root with exactly one (tests/ops)
+      override hook. There is NO path parameter (Codex round 2: round-1
+      still accepted an arbitrary ``data_dir``, which let two sleeves
+      silently create independent per-account databases); a divergent-path
+      attempt is a ``TypeError`` at the call site, before any ledger, book,
+      or order exists.
+
+    Two sleeves that connect to the SAME brokerage account through their own
+    :class:`BaseBroker` instances therefore always resolve to the SAME
+    ``account_cash_ledger_db_path``, regardless of which sleeve's process
+    constructs it — by construction, not by convention. Verified end-to-end
+    with two real OS processes (including deliberately divergent unrelated
+    env vars) by ``tests/test_account_cash_ledger_shared_process.py``.
+
+    Flag-gated: returns ``None`` (byte-identical legacy behavior) unless
+    :data:`ACCOUNT_CASH_LEDGER_FLAG` is explicitly ON. ``broker.get_cash``
+    supplies the fresh-every-transaction balance read.
     """
     if not account_cash_ledger_enabled(env):
         return None
-    return maybe_build_account_cash_ledger(
-        data_dir=account_cash_ledger_data_dir(env=env),
-        account_id=broker.get_account_id(),
+    account_id = broker.get_account_id()
+    return AccountCashLedger(
+        account_cash_ledger_db_path(account_cash_ledger_data_dir(env=env), account_id),
+        account_id=account_id,
         broker_cash_fn=broker.get_cash,
         ttl_seconds=ttl_seconds,
-        env=env,
     )
+
+
+def open_session_order_book(
+    broker: BaseBroker,
+    *,
+    sleeve_tag: str,
+    trading_day: str,
+    cost_model_spec: Any | None = None,
+    ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS,
+    env: Optional[Mapping[str, str]] = None,
+) -> OrderStateBook:
+    """THE execution-owned session-book constructor for BOTH real launch
+    paths (the 104 batch process and the 105-style/crypto 24/7 loop — the
+    two stacks that drive ``submit_remainder`` through a ``BrokerPort``).
+
+    Launch paths construct their per-sleeve ``OrderStateBook`` HERE instead
+    of calling ``OrderStateBook(...)`` directly, so the §5.3 shared-ledger
+    wiring cannot be skipped or diverged per sleeve:
+
+    - flag OFF -> a plain book (``cash_ledger=None``), byte-identical
+      legacy behavior;
+    - flag ON -> the shared account ledger is built through
+      :func:`build_shared_account_cash_ledger_for_broker` (account id from
+      the broker, location from the runtime env — both non-overridable) and
+      the canonical cost contract is REQUIRED: ``cost_model_spec`` must be
+      supplied and ``renquant_common.cost_model`` must load/verify, both
+      checked HERE — a divergent-path or contract-absent misconfiguration
+      fails at wiring time, BEFORE any order could be submitted. The
+      session book is stamped with the cost-spec content sha
+      (``book.cost_model_sha256``) as run evidence; every reservation row
+      is stamped again by ``reserve_entry``.
+    """
+    ledger = build_shared_account_cash_ledger_for_broker(
+        broker, ttl_seconds=ttl_seconds, env=env
+    )
+    if ledger is None:
+        return OrderStateBook(account=sleeve_tag, trading_day=trading_day)
+    if cost_model_spec is None:
+        raise CostContractUnavailableError(
+            "the account cash ledger is enabled but no cost_model_spec was "
+            "supplied: reservations are the worst-case executable debit "
+            "(notional + per-side costs per renquant_common.cost_model) — "
+            "failing at wiring time, before any order could be submitted"
+        )
+    # Verify the contract + spec NOW (not at first BUY): a bad spec or an
+    # absent contract must fail before the session opens. The probe debit
+    # also yields the run-evidence sha stamped on the book.
+    _, cost_sha, _ = worst_case_entry_debit(1.0, cost_model_spec)
+    book = OrderStateBook(
+        account=sleeve_tag,
+        trading_day=trading_day,
+        cash_ledger=ledger,
+        cost_model_spec=cost_model_spec,
+    )
+    book.cost_model_sha256 = cost_sha
+    return book
 
 
 __all__ = [
@@ -783,17 +1004,23 @@ __all__ = [
     "ACCOUNT_CASH_LEDGER_SCHEMA_VERSION",
     "AccountCashLedger",
     "AccountCashLedgerError",
+    "CostContractUnavailableError",
     "DEFAULT_RESERVATION_TTL_SECONDS",
     "HALT_REASON_RECHECK_MISMATCH",
     "HALT_REASON_RECONCILE_MISMATCH",
     "HALT_REASON_UNKNOWN_OPEN_BUY",
     "LedgerSweepResult",
+    "REQUIRED_COST_MODEL_FINGERPRINT_SCHEMA_VERSION",
+    "REQUIRED_COST_MODEL_MODULE",
+    "REQUIRED_COST_MODEL_PACKAGE_FLOOR",
     "RESERVATION_GRACE_SECONDS",
     "ReservationRow",
-    "account_cash_ledger_data_dir",
     "account_cash_ledger_db_path",
     "account_cash_ledger_enabled",
     "build_shared_account_cash_ledger_for_broker",
-    "maybe_build_account_cash_ledger",
+    "load_cost_contract",
+    "open_session_order_book",
     "parent_intent_id_from_client_order_id",
+    "account_cash_ledger_data_dir",
+    "worst_case_entry_debit",
 ]
