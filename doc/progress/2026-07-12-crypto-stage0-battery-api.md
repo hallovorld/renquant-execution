@@ -10,37 +10,60 @@ broker-facing checks belong in the execution repo.
 
 ## What this PR contains
 
-- `alpaca_broker.py`: 4 new thin wrapper methods on AlpacaBroker:
+- `alpaca_broker.py`: originally 4 thin wrapper methods on AlpacaBroker, now
+  6 (see the Revision note for the 2 added post-Codex-review):
   - `get_account_info()` -- account metadata (status, crypto_status, buying power)
   - `get_crypto_asset_spec(symbol)` -- public wrapper for per-pair order-grid spec
   - `place_crypto_limit_order(symbol, action, qty, limit_price)` -- crypto GTC/IOC limit order
   - `place_crypto_stop_limit_order(symbol, action, qty, stop_price, limit_price)` -- general-purpose crypto stop-limit (BUY + SELL sides)
+  - `wait_for_order_terminal_cancel(order_id)` -- public wrapper over the
+    existing private `_wait_for_order_terminal_cancel` (PR #31)
+  - `get_crypto_reference_price(symbol)` -- latest-quote-derived reference
+    price via `CryptoHistoricalDataClient` (finding 3)
 
 - `crypto_stage0_checks.py`: complete rewrite (was a direct-alpaca-py
   importer, now uses AlpacaBroker adapter exclusively):
-  - `StepResult` / `StepStatus` / `BatteryReport` data types
+  - `StepResult` (now with a `required: bool` field) / `StepStatus` /
+    `BatteryReport` data types
   - 6 battery steps: account status, pair snapshot, GTC order acceptance,
-    stop-limit acceptance, buying power behavior, data parity (placeholder)
-  - `run_full_battery(broker, dry_run=False)` -- orchestrates all steps
-  - Hard safety gate: refuses to run on non-paper broker
+    stop-limit acceptance (both now private -- see Revision note finding 4),
+    buying power behavior (observational, finding 6), data parity
+    (placeholder, `required=False`, finding 5)
+  - `run_full_battery(broker, dry_run=False)` -- orchestrates all steps; the
+    only public entry point that can place a probe order (finding 4)
+  - Hard safety gate: refuses to run on non-paper broker, PLUS fail-closed
+    account/environment identity verification (finding 4)
 
-- `tests/test_crypto_stage0_checks.py`: 30 tests covering all battery steps,
-  broker thin wrappers, dry-run mode, live-run mode, error handling, and
-  the paper-only safety gate. All mock the broker (no alpaca-py needed in CI).
+- `tests/test_crypto_stage0_checks.py`: 45 tests (30 original + 15 from the
+  Revision note) covering all battery steps, broker thin wrappers,
+  dry-run mode, live-run mode, error handling, the paper-only safety gate,
+  and the 6 Codex findings below. All mock the broker (no alpaca-py needed
+  for the battery-logic tests; the broker thin-wrapper tests construct real
+  alpaca-py request/response shapes, same as before).
 
 ## Key design choices
 
 1. All checks route through the AlpacaBroker adapter, never direct alpaca-py.
-2. GTC acceptance tested via limit BUY at $0.01 (never fills); stop-limit
-   acceptance tested via BUY stop-limit at unreachable prices (never triggers).
-   Both cancelled immediately.
+2. GTC acceptance tested via a limit BUY at ~half the pair's real current
+   reference price (never fills); stop-limit acceptance tested via a BUY
+   stop-limit at ~3x the reference price (never triggers). Both cancelled
+   immediately, with cancellation CONFIRMED (not just requested) before a
+   PASS is reported. See the Revision note below -- this replaced an
+   earlier fixed-constant ($0.01 / $999,999,999) design per Codex review.
 3. Data parity is a SKIP placeholder -- the Trading API has no market-data
-   endpoint; the orchestrator/data repo wires this when infrastructure exists.
+   endpoint; the orchestrator/data repo wires this when infrastructure
+   exists. `required=False`: it does not block `BatteryReport.all_passed`.
 4. Not re-exported from `__init__.py` (follows software_stops_liveness precedent).
+5. The two transactional (order-placing) checks are private
+   (`_check_gtc_order_acceptance` / `_check_stop_limit_acceptance`) --
+   `run_full_battery` is the only public entry point that can place a
+   probe order (see Revision note, finding 4).
 
 ## Verification
 
-- 30 new tests pass, 417 total (2 skipped) `[VERIFIED]`
+- 45 tests pass, 434 total (2 skipped) `[VERIFIED]` (current, post-revision;
+  see Verification note at the end of the Revision note section below for
+  the step-by-step count)
 
 ## Reconciliation note (2026-07-12, post-review)
 
@@ -91,66 +114,165 @@ cleanly on the first attempt after that; full suite re-run green
 (421 passed, 2 skipped) immediately after.
 
 **Ground-truth correction:** Codex has, in fact, already reviewed this PR
-(2026-07-12T22:16:36Z, CHANGES_REQUESTED) -- 6 findings, not zero. Finding 1
-is exactly the terminal-cancellation-confirmation gap fixed below (proactively
-scoped ahead of seeing that review). Findings 2-6 (acceptance inferred from a
-nonempty order id rather than a genuinely-resting status; fixed canary prices
-not derived from a versioned quote/price-band contract; the paper gate
-trusting only `broker.paper` while the report can still default
-environment=paper on a failed account lookup; `check_data_parity` always
-SKIPping while `BatteryReport.all_passed` requires every step PASS, making a
-clean full-battery run structurally impossible; the buying-power check's
-NMBP-nonnegative-only assertion not actually establishing non-marginable
-crypto behavior) are **not addressed in this revision** -- they were outside
-this fix's explicit scope and involve design judgment calls the coordinator
-asked to make personally. Flagging here so the next round of work (or the
-coordinator's own pass before merge) has the full, current review state,
-not a stale "Codex hasn't looked yet" assumption.
+(2026-07-12T22:16:36Z, CHANGES_REQUESTED) -- 6 findings, not zero. This
+landed mid-work, while the terminal-cancellation-confirmation fix (finding
+1, scoped proactively ahead of seeing the review) was already being pushed.
+All 6 findings are addressed below, in the SAME push -- not a reactive
+follow-up discovering them later, but a proactive fix landing
+concurrently/ahead of a second Codex pass on this revision.
 
-## Revision note (2026-07-12): proactive terminal-cancellation confirmation
+## Revision note (2026-07-12): all 6 Codex findings addressed proactively
 
-Both `check_gtc_order_acceptance` and `check_stop_limit_acceptance` used to
-call `broker.cancel_order(order_id)` inside a `finally` block and only check
-whether it *raised* -- not whether the order actually reached a confirmed
-terminal `canceled` state. That's the same "confirm, don't assume" gap
-Codex required closed on PR #31's `replace_crypto_stop_limit`
-(`AlpacaBroker._wait_for_order_terminal_cancel`, merged into `main` via #31).
-Applied the same discipline here, proactively:
+Codex's second review (2026-07-12T22:16:36Z, CHANGES_REQUESTED) raised 6
+findings on top of the ones #32 already got right. All 6 are addressed in
+this revision, in the same push as the originally-scoped terminal-
+cancellation fix:
+
+### Finding 1 -- cleanup must be a Tier-1 failure, not a silent PASS
+
+`_check_gtc_order_acceptance`/`_check_stop_limit_acceptance` (renamed
+private, see finding 4) used to call `broker.cancel_order(order_id)` inside
+a `finally` block and only check whether it *raised* -- not whether the
+order actually reached a confirmed terminal `canceled` state, and they
+appended the pair to the success list *before* that check even ran. Fixed
+via a new shared helper, `_place_probe_and_confirm_cleanup`:
 
 - Added a new **public** wrapper, `AlpacaBroker.wait_for_order_terminal_cancel`,
-  that delegates to the existing private `_wait_for_order_terminal_cancel`.
-  Chose the public-wrapper route (option (b)) over calling the
+  delegating to the existing private `_wait_for_order_terminal_cancel`
+  (PR #31). Chose the public-wrapper route (option (b)) over calling the
   underscore-prefixed method directly from `crypto_stage0_checks.py`, for
-  consistency: this PR's whole design principle for the four existing thin
-  wrappers (`get_account_info`, `get_crypto_asset_spec`,
-  `place_crypto_limit_order`, `place_crypto_stop_limit_order`) is that the
-  battery module never reaches into `AlpacaBroker` private state -- adding
-  one direct private-method call would have been the only exception to that
-  rule in the whole file. The wrapper is a pure pass-through (same
-  signature, same defaults, same docstring pointer back to the private
-  method) and does **not** modify `replace_crypto_stop_limit`'s own call
-  site, which still calls the private method directly (PR #31's own logic
-  is untouched, per scope).
-- Both battery steps now poll `wait_for_order_terminal_cancel(order_id)`
-  after a successful `cancel_order()` call. If the terminal `canceled`
-  state is not confirmed within the timeout (or `cancel_order` itself
-  raised), the affected pair/order is added to the step's `failures` list
-  instead of `placed_and_cancelled` -- the step reports **FAIL**, naming
-  the pair and order id, never a silent PASS. `order_details[pair]` now
-  also carries a `cancel_confirmed: bool` field for the report/log trail.
-- New tests (`test_gtc_acceptance_fails_when_cancellation_not_confirmed`,
-  `test_stop_limit_acceptance_fails_when_cancellation_not_confirmed`) drive
-  a fake client whose `get_order_by_id` reports a resting, non-terminal
-  status (`"accepted"`) forever after cancellation is requested, with a
-  deliberately tiny timeout/poll interval (0.05s / 0.01s) passed as new
-  keyword-only parameters (`cancel_confirm_timeout_seconds`,
-  `cancel_confirm_poll_interval_seconds`, both default to the same 5.0s /
-  0.25s production defaults as `_wait_for_order_terminal_cancel`) so the new
-  tests run in well under a second. Existing happy-path tests were
-  unaffected: the fake client's default behavior (`cancel_order_by_id`
-  marks the order `"canceled"` immediately, mirroring the convention
-  already used in `tests/test_crypto_order_semantics.py` for the #31
-  tests) makes `wait_for_order_terminal_cancel` return `True` on the very
-  first poll, with zero added test runtime.
-- Full suite: 421 passed, 2 skipped (was 419 passed, 2 skipped before this
-  revision; +2 new tests) `[VERIFIED]`.
+  consistency: this PR's whole design principle for its thin wrappers
+  (`get_account_info`, `get_crypto_asset_spec`, `place_crypto_limit_order`,
+  `place_crypto_stop_limit_order`, and now `get_crypto_reference_price`,
+  finding 3) is that the battery module never reaches into `AlpacaBroker`
+  private *methods* (it does directly reuse two private *module-level pure
+  functions*, `_enum_value`/`_is_resting_order_status` -- see finding 2's
+  note on why that's a different, lower-risk judgment call). The wrapper is
+  a pure pass-through and does **not** modify `replace_crypto_stop_limit`'s
+  own call site (PR #31's own logic is untouched, per scope).
+- A probe order that fills (or partially fills) is now reported as a
+  DISTINCT, more severe Tier-1 condition ("real paper inventory acquired")
+  from a merely-rejected one, and no cancel is attempted against it (there
+  is nothing resting to cancel).
+- A resting order is cancelled and the cancellation is polled via
+  `wait_for_order_terminal_cancel`; if not confirmed within the timeout (or
+  `cancel_order` itself raised), the step reports **FAIL** naming the
+  pair/order id and `order_details[pair]["cancel_confirmed"] = False` --
+  never a silent PASS.
+
+### Finding 2 -- acceptance must be a genuinely resting, field-matching order
+
+A nonempty `order_id` used to be treated as full proof of acceptance.
+`place_crypto_limit_order`/`place_crypto_stop_limit_order` (this PR's own
+two new wrapper methods -- not PR #31's) now re-derive `status`/`order_type`/
+`side`/`confirmed_time_in_force`/`confirmed_limit_price`/
+`confirmed_stop_price` via `_enum_value(getattr(order, ...))` instead of
+trusting `_order_to_dict`'s naive `str()` cast -- the exact normalization
+`get_open_orders_detailed` already applies elsewhere in this file for the
+same reason (a real alpaca-py `(str, Enum)` field stringifies to
+`"ClassName.MEMBER"`, not the lowercase wire value). `crypto_stage0_checks.py`
+directly imports `_is_resting_order_status` from `alpaca_broker.py` (a
+same-package private *function*, not a private *method* -- Codex's own
+review explicitly suggested reusing it, and as a stateless pure function it
+carries materially less encapsulation risk than reaching into instance
+private methods, so direct import was the right call here even though
+finding 1's wrapper decision went the other way for a stateful method).
+`_place_probe_and_confirm_cleanup` now:
+
+- rejects `filled`/`partially_filled` as the distinct Tier-1 case above;
+- rejects any other non-genuinely-resting status (reusing
+  `_is_resting_order_status`, the single canonical helper PR #31
+  established -- notably this does NOT reject `"new"`, since that helper's
+  own established contract already treats `new` as genuinely resting;
+  duplicating a second, subtly different "resting" definition here would
+  contradict the existing single source of truth, so the review's literal
+  phrasing was interpreted as "don't infer acceptance without checking
+  status", not as a request to redefine what counts as resting);
+- after a confirmed-clean cancellation, validates `order_type`/`side`/
+  `confirmed_time_in_force`/price fields against what was actually
+  requested, and reports FAIL (naming the mismatch) if any disagree -- the
+  order is still cleaned up either way.
+
+### Finding 3 -- canary prices must be derived from the pair's real price, not magic constants
+
+Replaced the fixed `$0.01` limit-BUY / `$999,999,999` stop-BUY constants
+with prices derived from a new `AlpacaBroker.get_crypto_reference_price(symbol)`
+method (a `CryptoHistoricalDataClient.get_crypto_latest_quote` lookup,
+mid-of-bid-ask with single-sided fallback) -- deliberately scoped: one
+latest-quote lookup, not a versioned price-band/quote-schema system. GTC
+limit-BUY probe = ~50% of the reference price
+(`DEFAULT_CANARY_LIMIT_BUY_FRACTION_OF_REFERENCE`); stop-BUY probe = ~3x the
+reference price with a 1% buffer on the limit
+(`DEFAULT_CANARY_STOP_MULTIPLE_OF_REFERENCE` /
+`DEFAULT_CANARY_STOP_LIMIT_BUFFER`), both rounded to the pair's real
+`price_increment` via the existing `round_price_to_increment` helper. A
+reference-price lookup failure is a step FAIL for that pair (never silently
+falls back to a fixed constant). Note: this surfaced a pre-existing
+precision-ordering quirk in `place_crypto_limit_order` -- its preflight
+`validate_crypto_order` checks the qty it's GIVEN for excess decimal
+precision (9dp grid) BEFORE its own internal `snap_qty_to_increment` call,
+so a raw `test_notional_usd / quote_derived_price` division (which can
+carry many more significant digits than the old fixed `$0.01` ever did) was
+occasionally rejected even though the properly-snapped quantity would have
+been fine. Fixed by snapping the qty in `_check_gtc_order_acceptance`
+itself before calling `place_crypto_limit_order` (a caller-side fix, not a
+change to `place_crypto_limit_order`'s own preflight order).
+
+### Finding 4 -- single public entry point for transactional probes
+
+`_check_gtc_order_acceptance` and `_check_stop_limit_acceptance` (formerly
+`check_gtc_order_acceptance`/`check_stop_limit_acceptance`) are now private
+(underscore-prefixed) and removed from `__all__` -- `run_full_battery` is
+the only sanctioned public entry point that can place a probe order; an
+orchestrator caller can no longer call the transactional checks piecemeal.
+Separately, `run_full_battery`'s environment/account-identity resolution no
+longer defaults to `environment="paper"` on a failed lookup: it now runs
+`check_crypto_account_status` FIRST, and if that step ERRORs, OR if it
+succeeds but reports `paper=False` (despite `broker.paper=True` already
+passing the hard `_assert_paper_mode` gate), the battery returns immediately
+with `environment="unverified"` and a single `environment_verification`
+ERROR step -- no transactional (or even further passive) steps run. Both
+`broker.paper is True` AND a successfully-verified, paper-reporting account
+lookup are now required before any probe order can be placed.
+
+### Finding 5 -- required/optional step policy
+
+`StepResult` gained a `required: bool = True` field. `check_data_parity`
+(an always-SKIP data-domain placeholder, outside this repo's
+execution-capability boundary) is `required=False`.
+`BatteryReport.all_passed` now only requires every `required=True` step to
+PASS, so a SKIP on `data_parity` no longer makes a clean, fully-passing
+battery run structurally impossible to report as passing (the previous
+behavior Codex flagged).
+
+### Finding 6 -- buying-power check relabeled observational
+
+`check_buying_power_behavior` doesn't establish (and never claimed to
+establish, on inspection) a specific documented Alpaca account-field
+invariant for non-marginable crypto behavior -- it only flags an internally
+inconsistent reading as a misconfiguration signal. Kept the same heuristic
+(a real, useful sanity check) but relabeled it explicitly: `required=False`,
+and both the PASS and FAIL `detail` strings now say "observational only,
+not a verified invariant" rather than implying a proven guarantee.
+
+### Tests and verification
+
+`tests/test_crypto_stage0_checks.py` gained coverage for: order-fill
+Tier-1 rejection, order-field-mismatch rejection (side), reference-price
+lookup failure, quote-derived pricing (asserting prices are in the
+expected reference-relative range, not the old fixed constants),
+`AlpacaBroker.get_crypto_reference_price` itself (mid-of-bid-ask, single-
+sided fallback, lookup failure, no-usable-quote), the two
+environment-verification fail-closed paths (account lookup ERROR; account
+lookup succeeds but reports `paper=False`), and the required/optional
+`all_passed` policy (a required-step failure still fails the battery; the
+two `required=False` steps no longer block an otherwise-clean pass). All
+existing happy-path tests were updated for the renamed private functions
+and the enhanced fake `_FakeTradingClient` (which now echoes
+`order_type`/`time_in_force`/`limit_price`/`stop_price` from the real
+alpaca-py request object onto the returned fake order, so default
+happy-path tests satisfy the new field-validation naturally, and a
+`reference_prices=` override lets a test simulate a lookup failure).
+
+Full suite: 434 passed, 2 skipped (was 419 passed, 2 skipped before any of
+this revision's changes; +15 new tests net) `[VERIFIED]`.

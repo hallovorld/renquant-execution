@@ -1323,6 +1323,21 @@ class AlpacaBroker(BaseBroker):
         )
         order = self._require_client().submit_order(order_data=request)
         result = _order_to_dict(order)
+        # Re-derive the enum-bearing fields via _enum_value rather than
+        # trusting _order_to_dict's naive str() cast (Codex review
+        # 2026-07-12 finding 2 on the crypto Stage-0 battery: acceptance
+        # must be confirmed from a genuinely-resting order, not inferred
+        # from a nonempty order_id) -- same normalization
+        # get_open_orders_detailed already applies for the same reason.
+        result["status"] = _enum_value(getattr(order, "status", ""))
+        result["order_type"] = _enum_value(getattr(order, "order_type", ""))
+        result["side"] = _enum_value(getattr(order, "side", "")).upper()
+        result["confirmed_time_in_force"] = _enum_value(
+            getattr(order, "time_in_force", "")
+        )
+        result["confirmed_limit_price"] = float(
+            getattr(order, "limit_price", 0.0) or 0.0
+        )
         result.update({
             "action": action_u,
             "quantity": float(submit_qty),
@@ -1333,6 +1348,43 @@ class AlpacaBroker(BaseBroker):
             "skipped": False,
         })
         return result
+
+    def get_crypto_reference_price(self, symbol: str) -> float:
+        """Latest reference price for a crypto pair (mid of bid/ask, falling
+        back to whichever side is available), via the market-data
+        ``CryptoHistoricalDataClient`` -- NOT the trading client.
+
+        Added (2026-07-12, Codex review finding 3 on execution#34) so the
+        Stage-0 battery's transactional probes can derive canary prices from
+        the pair's REAL current price instead of universal magic constants
+        ($0.01 buy-limit / $999,999,999 stop) that say nothing about
+        whether a given pair's actual price band/tick grid would even
+        accept an order at all -- a rejection at an implausible fixed price
+        proves nothing about genuine GTC/stop-limit support. Deliberately
+        scoped: this is a single latest-quote lookup, not a versioned
+        price-band/quote-schema system.
+        """
+        from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+        from alpaca.data.requests import CryptoLatestQuoteRequest
+
+        client = CryptoHistoricalDataClient(self.api_key, self.secret_key)
+        request = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
+        try:
+            quotes = client.get_crypto_latest_quote(request)
+            quote = quotes[symbol] if hasattr(quotes, "__getitem__") else quotes
+        except Exception as exc:
+            raise RuntimeError(
+                f"crypto latest-quote lookup for {symbol!r} failed: {exc}"
+            ) from exc
+        bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
+        ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
+        if bid > 0.0 and ask > 0.0:
+            return (bid + ask) / 2.0
+        if ask > 0.0:
+            return ask
+        if bid > 0.0:
+            return bid
+        raise RuntimeError(f"no usable bid/ask quote for {symbol!r}")
 
     def place_crypto_stop_limit_order(
         self,
@@ -1409,6 +1461,21 @@ class AlpacaBroker(BaseBroker):
         )
         order = self._require_client().submit_order(order_data=request)
         result = _order_to_dict(order)
+        # See place_crypto_limit_order's identical comment: normalize the
+        # enum-bearing fields via _enum_value instead of trusting
+        # _order_to_dict's naive str() cast.
+        result["status"] = _enum_value(getattr(order, "status", ""))
+        result["order_type"] = _enum_value(getattr(order, "order_type", ""))
+        result["side"] = _enum_value(getattr(order, "side", "")).upper()
+        result["confirmed_time_in_force"] = _enum_value(
+            getattr(order, "time_in_force", "")
+        )
+        result["confirmed_stop_price"] = float(
+            getattr(order, "stop_price", 0.0) or 0.0
+        )
+        result["confirmed_limit_price"] = float(
+            getattr(order, "limit_price", 0.0) or 0.0
+        )
         result.update({
             "action": action_u,
             "quantity": float(submit_qty),

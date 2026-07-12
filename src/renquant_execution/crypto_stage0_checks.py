@@ -27,6 +27,21 @@ This exactly mirrors the ``software_stops_liveness.py`` precedent
 (renquant-execution#29/#30): a broker/runtime-facing checker moved out of
 orchestrator into this repo, with orchestrator kept as a thin CLI/reporting
 consumer.
+
+Required/optional step policy (Codex review 2026-07-12 finding 5): every
+:class:`StepResult` carries a ``required: bool`` field. :attr:`BatteryReport
+.all_passed` only requires every ``required=True`` step to PASS — a SKIP on a
+``required=False`` step (currently only :func:`check_data_parity`, a
+data-domain placeholder outside this repo's execution-capability boundary)
+must not block an otherwise-clean battery run from reporting overall success.
+
+Single public entry point for transactional probes (Codex review 2026-07-12
+finding 4): the two steps that place (and cancel) real paper orders --
+GTC-limit and stop-limit acceptance -- are private
+(``_check_gtc_order_acceptance`` / ``_check_stop_limit_acceptance``), not
+exported in ``__all__``. :func:`run_full_battery` is the only sanctioned path
+that can create a probe order; an orchestrator caller must go through it, not
+call the transactional checks piecemeal.
 """
 from __future__ import annotations
 
@@ -34,10 +49,15 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
-from .alpaca_broker import AlpacaBroker
-from .crypto import CryptoAssetSpec, is_crypto_pair
+from .alpaca_broker import AlpacaBroker, _is_resting_order_status
+from .crypto import (
+    CryptoAssetSpec,
+    is_crypto_pair,
+    round_price_to_increment,
+    snap_qty_to_increment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -50,15 +70,24 @@ DEFAULT_CANARY_PAIRS: tuple[str, ...] = ("BTC/USD", "ETH/USD", "SOL/USD")
 #: small enough to be immaterial on paper).
 DEFAULT_TEST_NOTIONAL_USD: float = 1.10
 
-#: Limit price floor for canary limit-buy orders — set far below any
-#: conceivable market price so the order never fills (it will be cancelled
-#: immediately).
-_CANARY_LIMIT_BUY_PRICE: float = 0.01
+#: GTC limit-BUY canary probe price, as a fraction of the pair's REAL current
+#: reference price (Codex review 2026-07-12 finding 3 on #34: a universal
+#: fixed price like $0.01 says nothing about whether a given pair's actual
+#: price band/tick grid would even accept the order -- a rejection there
+#: proves nothing about genuine GTC support). Half of the current price is
+#: comfortably below market (won't fill) while staying within the pair's
+#: real, currently-valid price grid.
+DEFAULT_CANARY_LIMIT_BUY_FRACTION_OF_REFERENCE: float = 0.5
 
-#: Stop/limit prices for canary BUY stop-limit orders — set far above any
-#: conceivable market price so the stop never triggers (cancelled immediately).
-_CANARY_STOP_LIMIT_STOP_PRICE: float = 999_999_999.00
-_CANARY_STOP_LIMIT_LIMIT_PRICE: float = 999_999_999.00
+#: Stop-BUY canary probe stop price, as a multiple of the pair's REAL current
+#: reference price -- far enough above market that the stop cannot trigger,
+#: while still being derived from (and therefore validated against) the
+#: pair's real price grid rather than a universal implausible constant.
+DEFAULT_CANARY_STOP_MULTIPLE_OF_REFERENCE: float = 3.0
+
+#: BUY stop-limit requires limit_price >= stop_price (the limit caps how high
+#: you pay once triggered) -- this is the buffer above the derived stop price.
+DEFAULT_CANARY_STOP_LIMIT_BUFFER: float = 1.01
 
 #: Timeout/poll interval for confirming a canary order's cancellation
 #: actually reached a terminal ``canceled`` state (same "confirm, don't
@@ -69,6 +98,12 @@ _CANARY_STOP_LIMIT_LIMIT_PRICE: float = 999_999_999.00
 #: here, ahead of review, to the two order-placing battery steps below.
 DEFAULT_CANCEL_CONFIRM_TIMEOUT_SECONDS: float = 5.0
 DEFAULT_CANCEL_CONFIRM_POLL_INTERVAL_SECONDS: float = 0.25
+
+#: Order statuses meaning the probe order actually FILLED (or partially
+#: filled) instead of resting -- real paper inventory was acquired. Reported
+#: distinctly from a generic "not resting" rejection because it is the more
+#: severe Tier-1 condition (Codex review 2026-07-12 finding 1/2).
+_FILLED_ORDER_STATUSES = frozenset({"filled", "partially_filled"})
 
 
 # ── result types ────────────────────────────────────────────────────────────
@@ -85,12 +120,21 @@ class StepStatus(str, Enum):
 
 @dataclass(frozen=True)
 class StepResult:
-    """Result of a single battery step."""
+    """Result of a single battery step.
+
+    ``required`` (Codex review 2026-07-12 finding 5): whether this step must
+    PASS for :attr:`BatteryReport.all_passed` to be True. Defaults to
+    ``True`` (a genuine execution-capability check); the one current
+    ``required=False`` step is :func:`check_data_parity` (an always-SKIP
+    placeholder for a data-domain concern outside this repo's boundary --
+    see its docstring).
+    """
 
     name: str
     status: StepStatus
     detail: str
     data: dict[str, Any] = field(default_factory=dict)
+    required: bool = True
 
 
 @dataclass(frozen=True)
@@ -105,7 +149,15 @@ class BatteryReport:
 
     @property
     def all_passed(self) -> bool:
-        return all(s.status == StepStatus.PASS for s in self.steps)
+        """Whether every ``required=True`` step PASSed.
+
+        A SKIP/FAIL/ERROR on a ``required=False`` step (currently only
+        ``data_parity``) does not block overall success (Codex review
+        2026-07-12 finding 5) -- required steps still must all PASS.
+        """
+        return all(
+            s.status == StepStatus.PASS for s in self.steps if s.required
+        )
 
     @property
     def summary(self) -> str:
@@ -207,7 +259,134 @@ def check_pair_snapshot(
     )
 
 
-def check_gtc_order_acceptance(
+def _place_probe_and_confirm_cleanup(
+    broker: AlpacaBroker,
+    *,
+    place_fn: Callable[[], dict[str, Any]],
+    expected_order_type: str,
+    expected_side: str,
+    expected_time_in_force: str,
+    expected_price_fields: dict[str, float],
+    cancel_confirm_timeout_seconds: float,
+    cancel_confirm_poll_interval_seconds: float,
+) -> tuple[bool, str | None, dict[str, Any]]:
+    """Place one transactional probe order, validate genuine acceptance, then
+    cancel and CONFIRM the cancellation reached a terminal state.
+
+    Shared by :func:`_check_gtc_order_acceptance` and
+    :func:`_check_stop_limit_acceptance` -- both probes follow the exact same
+    place -> validate -> cancel -> confirm lifecycle, so the safety-critical
+    logic lives in exactly one place.
+
+    Returns ``(ok, failure_reason, detail)``. ``ok`` is True only when the
+    order was genuinely accepted in a resting state, its type/side/TIF/price
+    match what was requested, AND the subsequent cancellation was confirmed
+    terminal -- never merely "the place/cancel calls didn't raise" (Codex
+    review 2026-07-12 findings 1 and 2 on execution#34).
+    """
+    try:
+        result = place_fn()
+    except Exception as exc:
+        return False, f"place failed ({exc})", {}
+
+    order_id = result.get("order_id", "")
+    status = result.get("status", "")
+    detail: dict[str, Any] = {
+        "order_id": order_id,
+        "status": status,
+        "order_type": result.get("order_type", ""),
+        "side": result.get("side", ""),
+        "confirmed_time_in_force": result.get("confirmed_time_in_force", ""),
+        "qty": result.get("quantity", 0.0),
+    }
+    for field_name in expected_price_fields:
+        detail[field_name] = result.get(field_name)
+
+    if not order_id:
+        return False, "order accepted but no order_id returned", detail
+
+    # A FILLED probe order is a distinct, MORE severe Tier-1 condition than a
+    # merely-rejected one: real (paper) inventory was acquired, not just "no
+    # resting order to clean up".
+    if status in _FILLED_ORDER_STATUSES:
+        return (
+            False,
+            f"order {order_id} reports status={status!r} -- probe order "
+            "FILLED instead of resting; real paper inventory acquired "
+            "(Tier-1 condition)",
+            detail,
+        )
+
+    # Acceptance must be a genuinely resting/accepted status, not merely a
+    # nonempty order_id (Codex review 2026-07-12 finding 2). Reuses the same
+    # canonical helper PR #31 established for exactly this "genuinely
+    # resting, not a transitional pending_* sub-state" distinction.
+    if not _is_resting_order_status(status):
+        return (
+            False,
+            f"order {order_id} status {status!r} rejected the probe "
+            "(not a genuinely resting/accepted order)",
+            detail,
+        )
+
+    # The order IS resting -- attempt cleanup and CONFIRM terminal
+    # cancellation before doing anything else (Codex review 2026-07-12
+    # finding 1: a cancel_order() call that doesn't raise is not proof the
+    # order is gone).
+    try:
+        broker.cancel_order(order_id)
+    except Exception as cancel_exc:
+        detail["cancel_confirmed"] = False
+        return False, f"cancel_order raised: {cancel_exc}", detail
+
+    cancel_confirmed = broker.wait_for_order_terminal_cancel(
+        order_id,
+        timeout_seconds=cancel_confirm_timeout_seconds,
+        poll_interval_seconds=cancel_confirm_poll_interval_seconds,
+    )
+    detail["cancel_confirmed"] = cancel_confirmed
+    if not cancel_confirmed:
+        return (
+            False,
+            f"cancellation of order {order_id} not confirmed terminally "
+            f"canceled within {cancel_confirm_timeout_seconds}s -- order may "
+            "still be resting/uncancelled",
+            detail,
+        )
+
+    # Field validation (Codex review 2026-07-12 finding 2), checked AFTER
+    # cleanup so a mismatched-but-resting order is cleaned up regardless of
+    # whether the mismatch itself is reported as a failure.
+    field_failures: list[str] = []
+    order_type = result.get("order_type", "")
+    if order_type and order_type != expected_order_type:
+        field_failures.append(
+            f"order_type {order_type!r} != expected {expected_order_type!r}"
+        )
+    side = result.get("side", "")
+    if side and side != expected_side:
+        field_failures.append(f"side {side!r} != expected {expected_side!r}")
+    tif = result.get("confirmed_time_in_force", "")
+    if tif and tif != expected_time_in_force:
+        field_failures.append(
+            f"time_in_force {tif!r} != expected {expected_time_in_force!r}"
+        )
+    for field_name, expected_value in expected_price_fields.items():
+        actual = result.get(field_name)
+        if actual is None or expected_value is None:
+            continue
+        tolerance = max(1e-6, abs(float(expected_value)) * 1e-6)
+        if abs(float(actual) - float(expected_value)) > tolerance:
+            field_failures.append(
+                f"{field_name} {actual!r} != requested {expected_value!r}"
+            )
+    if field_failures:
+        return False, "; ".join(field_failures), detail
+
+    return True, None, detail
+
+
+def _check_gtc_order_acceptance(
     broker: AlpacaBroker,
     pairs: tuple[str, ...] = DEFAULT_CANARY_PAIRS,
     test_notional_usd: float = DEFAULT_TEST_NOTIONAL_USD,
@@ -219,17 +398,18 @@ def check_gtc_order_acceptance(
 ) -> StepResult:
     """Place and immediately cancel small GTC limit-buy orders.
 
-    For each canary pair, places a GTC limit-buy order at a price far below
-    market ($0.01) so it will never fill, verifies the broker accepts it, and
+    For each canary pair, places a GTC limit-buy order at roughly half the
+    pair's REAL current reference price (derived via
+    :meth:`AlpacaBroker.get_crypto_reference_price` -- Codex review
+    2026-07-12 finding 3: a universal fixed price like $0.01 says nothing
+    about whether a given pair's actual price band/tick grid would even
+    accept the order) so it will never fill, verifies the broker accepts it
+    in a genuinely resting state with matching order fields (finding 2), and
     then cancels it -- CONFIRMING the cancellation actually reached a
-    terminal ``canceled`` state via
-    :meth:`AlpacaBroker.wait_for_order_terminal_cancel` (same "confirm, don't
-    assume" discipline Codex required on PR #31's
-    ``replace_crypto_stop_limit``). A cancel request that doesn't raise is
-    NOT proof the order is gone -- it can still be resting, or have
-    filled/rejected before the cancel took effect -- so an unconfirmed
-    cancellation is a Tier-1 FAIL for the affected pair/order, never a
-    silent PASS.
+    terminal ``canceled`` state (finding 1 / PR #31 precedent). Private:
+    this is a transactional probe -- the only sanctioned public entry point
+    that may place battery probe orders is :func:`run_full_battery`
+    (finding 4).
     """
     name = "gtc_order_acceptance"
     placed_and_cancelled: list[str] = []
@@ -242,76 +422,52 @@ def check_gtc_order_acceptance(
         except Exception as exc:
             failures.append(f"{pair}: spec lookup failed ({exc})")
             continue
-
-        # Compute a qty from the test notional at the canary price — must
-        # meet the pair's min_order_size.
-        raw_qty = test_notional_usd / _CANARY_LIMIT_BUY_PRICE
-        # The qty will be huge at $0.01 but that's fine — the order won't fill.
-        # Just ensure it meets min_order_size.
-        qty = max(raw_qty, spec.min_order_size)
-
-        order_id = None
-        placed = False
         try:
-            result = broker.place_crypto_limit_order(
-                symbol=pair,
-                action="BUY",
-                qty=qty,
-                limit_price=_CANARY_LIMIT_BUY_PRICE,
-                time_in_force="gtc",
-            )
-            order_id = result.get("order_id", "")
-            order_details[pair] = {
-                "order_id": order_id,
-                "status": result.get("status", ""),
-                "qty": result.get("quantity", 0.0),
-                "limit_price": result.get("limit_price", 0.0),
-            }
-            if not order_id:
-                failures.append(f"{pair}: order accepted but no order_id returned")
-                continue
-            placed = True
+            reference_price = broker.get_crypto_reference_price(pair)
         except Exception as exc:
-            failures.append(f"{pair}: place failed ({exc})")
+            failures.append(f"{pair}: reference price lookup failed ({exc})")
             continue
-        finally:
-            # Always try to cancel if we got an order_id, and CONFIRM the
-            # cancellation reached a terminal state before treating this
-            # pair as a clean PASS.
-            if order_id:
-                cancel_confirmed = False
-                cancel_raised: str | None = None
-                try:
-                    broker.cancel_order(order_id)
-                except Exception as cancel_exc:
-                    cancel_raised = str(cancel_exc)
-                    logger.warning(
-                        "battery: cancel of %s order %s failed: %s",
-                        pair, order_id, cancel_exc,
-                    )
-                else:
-                    cancel_confirmed = broker.wait_for_order_terminal_cancel(
-                        order_id,
-                        timeout_seconds=cancel_confirm_timeout_seconds,
-                        poll_interval_seconds=cancel_confirm_poll_interval_seconds,
-                    )
-                order_details[pair]["cancel_confirmed"] = cancel_confirmed
-                if placed and not cancel_confirmed:
-                    reason = (
-                        f"cancel_order raised: {cancel_raised}"
-                        if cancel_raised is not None
-                        else (
-                            f"cancellation of order {order_id} not confirmed "
-                            f"terminally canceled within "
-                            f"{cancel_confirm_timeout_seconds}s"
-                        )
-                    )
-                    failures.append(
-                        f"{pair}: order {order_id} cancellation NOT confirmed "
-                        f"({reason}) -- order may still be resting/uncancelled"
-                    )
-                elif placed:
-                    placed_and_cancelled.append(pair)
+
+        raw_limit_price = (
+            reference_price * DEFAULT_CANARY_LIMIT_BUY_FRACTION_OF_REFERENCE
+        )
+        limit_price = round_price_to_increment(raw_limit_price, spec.price_increment)
+        raw_qty = test_notional_usd / limit_price
+        # Snap onto the pair's min_trade_increment grid BEFORE handing off
+        # to place_crypto_limit_order: a raw float division (test_notional /
+        # a quote-derived, non-round limit_price) can carry more significant
+        # decimal digits than the broker's 9dp precision grid allows, and
+        # place_crypto_limit_order's own preflight (validate_crypto_order)
+        # checks precision on the qty it's GIVEN, before its own internal
+        # snapping runs -- so an unsnapped qty here can be spuriously
+        # rejected even though the properly-snapped quantity would be fine.
+        qty = snap_qty_to_increment(
+            max(raw_qty, spec.min_order_size), spec.min_trade_increment
+        )
+
+        ok, reason, detail = _place_probe_and_confirm_cleanup(
+            broker,
+            place_fn=lambda pair=pair, qty=qty, limit_price=limit_price: (
+                broker.place_crypto_limit_order(
+                    symbol=pair,
+                    action="BUY",
+                    qty=qty,
+                    limit_price=limit_price,
+                    time_in_force="gtc",
+                )
+            ),
+            expected_order_type="limit",
+            expected_side="BUY",
+            expected_time_in_force="gtc",
+            expected_price_fields={"confirmed_limit_price": limit_price},
+            cancel_confirm_timeout_seconds=cancel_confirm_timeout_seconds,
+            cancel_confirm_poll_interval_seconds=cancel_confirm_poll_interval_seconds,
+        )
+        order_details[pair] = detail
+        if ok:
+            placed_and_cancelled.append(pair)
+        else:
+            failures.append(f"{pair}: {reason}")
 
     if failures:
         return StepResult(
@@ -334,7 +490,7 @@ def check_gtc_order_acceptance(
     )
 
 
-def check_stop_limit_acceptance(
+def _check_stop_limit_acceptance(
     broker: AlpacaBroker,
     pairs: tuple[str, ...] = DEFAULT_CANARY_PAIRS,
     *,
@@ -345,16 +501,17 @@ def check_stop_limit_acceptance(
 ) -> StepResult:
     """Place and immediately cancel small GTC stop-limit BUY orders.
 
-    For each canary pair, places a GTC stop-limit BUY order at unreachable
-    prices (stop far above market, so the stop never triggers), verifies the
-    broker accepts it, and then cancels it -- CONFIRMING the cancellation
-    actually reached a terminal ``canceled`` state via
-    :meth:`AlpacaBroker.wait_for_order_terminal_cancel` (same "confirm, don't
-    assume" discipline Codex required on PR #31's
-    ``replace_crypto_stop_limit``). BUY-side stop-limits avoid the need for a
-    held position (which SELL-side would require due to E11 no-short). An
-    unconfirmed cancellation is a Tier-1 FAIL for the affected pair/order,
-    never a silent PASS.
+    For each canary pair, places a GTC stop-limit BUY order derived from the
+    pair's REAL current reference price (stop at ~3x current price, limit a
+    small buffer above the stop -- Codex review 2026-07-12 finding 3; a fixed
+    $999,999,999 constant is not a valid cross-pair capability test), verifies
+    the broker accepts it in a genuinely resting state with matching order
+    fields (finding 2), and then cancels it -- CONFIRMING the cancellation
+    actually reached a terminal ``canceled`` state (finding 1 / PR #31
+    precedent). BUY-side stop-limits avoid the need for a held position
+    (which SELL-side would require due to E11 no-short). Private: this is a
+    transactional probe -- the only sanctioned public entry point that may
+    place battery probe orders is :func:`run_full_battery` (finding 4).
     """
     name = "stop_limit_acceptance"
     placed_and_cancelled: list[str] = []
@@ -367,69 +524,45 @@ def check_stop_limit_acceptance(
         except Exception as exc:
             failures.append(f"{pair}: spec lookup failed ({exc})")
             continue
-
-        qty = spec.min_order_size
-        order_id = None
-        placed = False
         try:
-            result = broker.place_crypto_stop_limit_order(
-                symbol=pair,
-                action="BUY",
-                qty=qty,
-                stop_price=_CANARY_STOP_LIMIT_STOP_PRICE,
-                limit_price=_CANARY_STOP_LIMIT_LIMIT_PRICE,
-                time_in_force="gtc",
-            )
-            order_id = result.get("order_id", "")
-            order_details[pair] = {
-                "order_id": order_id,
-                "status": result.get("status", ""),
-                "qty": result.get("quantity", 0.0),
-                "stop_price": result.get("stop_price", 0.0),
-                "limit_price": result.get("limit_price", 0.0),
-            }
-            if not order_id:
-                failures.append(f"{pair}: order accepted but no order_id returned")
-                continue
-            placed = True
+            reference_price = broker.get_crypto_reference_price(pair)
         except Exception as exc:
-            failures.append(f"{pair}: place failed ({exc})")
+            failures.append(f"{pair}: reference price lookup failed ({exc})")
             continue
-        finally:
-            if order_id:
-                cancel_confirmed = False
-                cancel_raised: str | None = None
-                try:
-                    broker.cancel_order(order_id)
-                except Exception as cancel_exc:
-                    cancel_raised = str(cancel_exc)
-                    logger.warning(
-                        "battery: cancel of %s stop-limit order %s failed: %s",
-                        pair, order_id, cancel_exc,
-                    )
-                else:
-                    cancel_confirmed = broker.wait_for_order_terminal_cancel(
-                        order_id,
-                        timeout_seconds=cancel_confirm_timeout_seconds,
-                        poll_interval_seconds=cancel_confirm_poll_interval_seconds,
-                    )
-                order_details[pair]["cancel_confirmed"] = cancel_confirmed
-                if placed and not cancel_confirmed:
-                    reason = (
-                        f"cancel_order raised: {cancel_raised}"
-                        if cancel_raised is not None
-                        else (
-                            f"cancellation of order {order_id} not confirmed "
-                            f"terminally canceled within "
-                            f"{cancel_confirm_timeout_seconds}s"
-                        )
-                    )
-                    failures.append(
-                        f"{pair}: order {order_id} cancellation NOT confirmed "
-                        f"({reason}) -- order may still be resting/uncancelled"
-                    )
-                elif placed:
-                    placed_and_cancelled.append(pair)
+
+        raw_stop_price = reference_price * DEFAULT_CANARY_STOP_MULTIPLE_OF_REFERENCE
+        stop_price = round_price_to_increment(raw_stop_price, spec.price_increment)
+        raw_limit_price = stop_price * DEFAULT_CANARY_STOP_LIMIT_BUFFER
+        limit_price = round_price_to_increment(raw_limit_price, spec.price_increment)
+        qty = spec.min_order_size
+
+        ok, reason, detail = _place_probe_and_confirm_cleanup(
+            broker,
+            place_fn=lambda pair=pair, qty=qty, stop_price=stop_price, limit_price=limit_price: (
+                broker.place_crypto_stop_limit_order(
+                    symbol=pair,
+                    action="BUY",
+                    qty=qty,
+                    stop_price=stop_price,
+                    limit_price=limit_price,
+                    time_in_force="gtc",
+                )
+            ),
+            expected_order_type="stop_limit",
+            expected_side="BUY",
+            expected_time_in_force="gtc",
+            expected_price_fields={
+                "confirmed_stop_price": stop_price,
+                "confirmed_limit_price": limit_price,
+            },
+            cancel_confirm_timeout_seconds=cancel_confirm_timeout_seconds,
+            cancel_confirm_poll_interval_seconds=cancel_confirm_poll_interval_seconds,
+        )
+        order_details[pair] = detail
+        if ok:
+            placed_and_cancelled.append(pair)
+        else:
+            failures.append(f"{pair}: {reason}")
 
     if failures:
         return StepResult(
@@ -454,12 +587,18 @@ def check_stop_limit_acceptance(
 
 
 def check_buying_power_behavior(broker: AlpacaBroker) -> StepResult:
-    """Verify crypto buying power is non-marginable.
+    """Observational check of crypto buying-power fields -- NOT a verified
+    invariant (Codex review 2026-07-12 finding 6).
 
-    Crypto on Alpaca is NOT marginable — buying power for crypto should equal
-    the non-marginable buying power (cash, not leveraged). This step checks
-    that the account's buying_power and non_marginable_buying_power are
-    consistent with a non-leveraged crypto environment.
+    Crypto on Alpaca is understood to be non-marginable (buying power for
+    crypto should track cash, not leverage), but this step does not have --
+    and does not claim to have -- a specific, documented Alpaca account-field
+    invariant it has verified. It only flags an internally-inconsistent
+    reading (``non_marginable_buying_power<=0`` while ``cash>0``) as a
+    misconfiguration signal, and reports the raw fields for a human to judge.
+    Marked ``required=False``: this step's PASS is not a proven capability
+    guarantee and must not gate overall battery eligibility the way a real
+    execution-capability check does.
     """
     name = "buying_power_behavior"
     try:
@@ -469,6 +608,7 @@ def check_buying_power_behavior(broker: AlpacaBroker) -> StepResult:
             name=name,
             status=StepStatus.ERROR,
             detail=f"get_account_info() failed: {exc}",
+            required=False,
         )
     bp = info.get("buying_power", 0.0)
     nmbp = info.get("non_marginable_buying_power", 0.0)
@@ -489,19 +629,24 @@ def check_buying_power_behavior(broker: AlpacaBroker) -> StepResult:
             status=StepStatus.FAIL,
             detail=(
                 f"non_marginable_buying_power={nmbp} but cash={cash} -- "
-                "crypto buying power appears misconfigured"
+                "crypto buying power appears misconfigured (observational "
+                "check, not a verified invariant)"
             ),
             data=data,
+            required=False,
         )
-    # Report the relationship for the operator to verify.
+    # Observational only -- this is NOT a verified Alpaca account-field
+    # invariant for non-marginable crypto behavior, just a consistency
+    # reading for a human to judge (Codex review 2026-07-12 finding 6).
     return StepResult(
         name=name,
         status=StepStatus.PASS,
         detail=(
-            f"non_marginable_buying_power={nmbp}, "
-            f"buying_power={bp}, cash={cash}"
+            f"non_marginable_buying_power={nmbp}, buying_power={bp}, "
+            f"cash={cash} -- observational only, not a verified invariant"
         ),
         data=data,
+        required=False,
     )
 
 
@@ -516,6 +661,11 @@ def check_data_parity(
     -- both of which are outside the execution repo's boundary (execution owns
     broker mutation, not data feeds). The orchestrator or data repo should
     wire this step once data-feed infrastructure is in place.
+
+    ``required=False`` (Codex review 2026-07-12 finding 5): this is a
+    data-domain concern, not an execution-capability one -- an always-SKIP
+    placeholder must not make a clean battery run structurally impossible to
+    report as passing.
     """
     name = "data_parity"
     return StepResult(
@@ -524,9 +674,11 @@ def check_data_parity(
         detail=(
             f"data parity check requires a market-data source outside the "
             f"execution repo boundary (pairs: {', '.join(pairs)}); "
-            "placeholder -- wire when data-feed infrastructure is available"
+            "placeholder -- wire when data-feed infrastructure is available "
+            "(required=False: data-domain concern, not execution-capability)"
         ),
         data={"pairs": list(pairs), "reason": "no_data_source"},
+        required=False,
     )
 
 
@@ -556,6 +708,12 @@ def run_full_battery(
 ) -> BatteryReport:
     """Run the full Stage-0 crypto battery and return a structured report.
 
+    The ONLY sanctioned public entry point that may place transactional
+    probe orders (Codex review 2026-07-12 finding 4) -- an orchestrator
+    caller must go through this function, never
+    ``_check_gtc_order_acceptance``/``_check_stop_limit_acceptance``
+    directly (both private, not exported).
+
     Parameters
     ----------
     broker : AlpacaBroker
@@ -581,20 +739,46 @@ def run_full_battery(
 
     timestamp = datetime.now(timezone.utc).isoformat()
 
-    # Get account info for the report header.
-    try:
-        info = broker.get_account_info()
-        account_id = info.get("account_id", "unknown")
-        environment = "paper" if info.get("paper", True) else "live"
-    except Exception:
-        account_id = "unknown"
-        environment = "paper"
+    # Account/environment identity verification runs FIRST and is fail-closed
+    # (Codex review 2026-07-12 finding 4): broker.paper=True alone is
+    # necessary but not sufficient -- the account-identity lookup itself must
+    # also succeed and independently confirm a paper account. A failed or
+    # ambiguous lookup must refuse to run the battery, never silently default
+    # environment="paper" and continue (the old behavior this replaces).
+    account_step = check_crypto_account_status(broker)
+    account_id = account_step.data.get("account_id", "") or "unknown"
+    reported_paper = bool(account_step.data.get("paper", False))
 
-    steps: list[StepResult] = []
+    if account_step.status == StepStatus.ERROR or not reported_paper:
+        reason = (
+            "account/environment identity could not be verified "
+            f"({account_step.detail})"
+            if account_step.status == StepStatus.ERROR
+            else (
+                "get_account_info() reports paper=False despite "
+                "broker.paper=True -- refusing to run the battery (never "
+                "default an unverified/failed environment lookup to "
+                "'paper', Codex review 2026-07-12 finding 4)"
+            )
+        )
+        return BatteryReport(
+            timestamp=timestamp,
+            account_id=account_id,
+            environment="unverified",
+            dry_run=dry_run,
+            steps=[
+                account_step,
+                StepResult(
+                    name="environment_verification",
+                    status=StepStatus.ERROR,
+                    detail=reason,
+                    required=True,
+                ),
+            ],
+        )
 
-    # Step 1: account status
-    logger.info("battery: checking crypto account status")
-    steps.append(check_crypto_account_status(broker))
+    environment = "paper"
+    steps: list[StepResult] = [account_step]
 
     # Step 2: pair snapshots
     logger.info("battery: checking pair snapshots for %s", pairs)
@@ -609,7 +793,9 @@ def run_full_battery(
         ))
     else:
         logger.info("battery: testing GTC order acceptance")
-        steps.append(check_gtc_order_acceptance(broker, pairs, test_notional_usd))
+        steps.append(
+            _check_gtc_order_acceptance(broker, pairs, test_notional_usd)
+        )
 
     # Step 4: stop-limit acceptance (skip in dry_run)
     if dry_run:
@@ -620,13 +806,13 @@ def run_full_battery(
         ))
     else:
         logger.info("battery: testing stop-limit order acceptance")
-        steps.append(check_stop_limit_acceptance(broker, pairs))
+        steps.append(_check_stop_limit_acceptance(broker, pairs))
 
-    # Step 5: buying power behavior
+    # Step 5: buying power behavior (observational only, required=False)
     logger.info("battery: checking buying power behavior")
     steps.append(check_buying_power_behavior(broker))
 
-    # Step 6: data parity (placeholder)
+    # Step 6: data parity (placeholder, required=False)
     steps.append(check_data_parity(pairs))
 
     report = BatteryReport(
@@ -641,7 +827,10 @@ def run_full_battery(
 
 
 __all__ = [
+    "DEFAULT_CANARY_LIMIT_BUY_FRACTION_OF_REFERENCE",
     "DEFAULT_CANARY_PAIRS",
+    "DEFAULT_CANARY_STOP_LIMIT_BUFFER",
+    "DEFAULT_CANARY_STOP_MULTIPLE_OF_REFERENCE",
     "DEFAULT_CANCEL_CONFIRM_POLL_INTERVAL_SECONDS",
     "DEFAULT_CANCEL_CONFIRM_TIMEOUT_SECONDS",
     "DEFAULT_TEST_NOTIONAL_USD",
@@ -651,8 +840,6 @@ __all__ = [
     "check_buying_power_behavior",
     "check_crypto_account_status",
     "check_data_parity",
-    "check_gtc_order_acceptance",
     "check_pair_snapshot",
-    "check_stop_limit_acceptance",
     "run_full_battery",
 ]
