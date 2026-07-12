@@ -20,8 +20,9 @@ What is (and is not) covered hermetically:
     pipeline's OWN staleness arithmetic is unit-tested in ITS repo
     (``renquant-pipeline/tests/test_software_stops.py``); this suite does
     not re-test it, only the contract this module depends on
-    (``compute_staleness`` / ``_validate_snapshot`` / ``registry_path_for``
-    / ``DEFAULT_REGISTRY_PATH``).
+    (``compute_staleness`` / ``validate_software_stop_snapshot`` (public,
+    round 8 — see renquant-pipeline#192) / ``registry_path_for`` /
+    ``DEFAULT_REGISTRY_PATH``).
   * Market-session gating: covered against the REAL
     ``renquant_common.market_calendar`` (an existing, already-declared,
     cheap dependency of this repo) by monkeypatching its
@@ -48,12 +49,16 @@ import pytest
 from renquant_execution.software_stops_liveness import (
     CORRUPT,
     OK,
+    REGISTRY_CORRUPT,
+    REGISTRY_MISSING,
+    REGISTRY_VALID,
     STALE,
     _PipelineStopsAPI,
     check,
     main,
     market_session_open,
     resolve_registry_path,
+    validate_registry,
 )
 
 
@@ -353,6 +358,122 @@ def test_main_posts_ntfy_on_non_ok_when_topic_supplied(tmp_path, monkeypatch):
     assert code == STALE
     assert len(posted) == 1
     assert posted[0][0] == "some-topic"
+
+
+# ------------------------------------------------------- validate_registry()
+
+def test_validate_registry_missing_path_is_missing():
+    code, msg = validate_registry(Path("/nonexistent/software_stops.json"), _api=FAKE_API)
+    assert code == REGISTRY_MISSING
+    assert code == 1
+    assert "MISSING" in msg
+    assert "no software-stop registry file" in msg
+
+
+def test_validate_registry_valid_file_is_valid(tmp_path):
+    path = _write_registry(tmp_path, stops={})
+    code, msg = validate_registry(path, _api=FAKE_API)
+    assert code == REGISTRY_VALID
+    assert code == 0
+    assert "VALID" in msg
+
+
+def test_validate_registry_malformed_json_is_corrupt(tmp_path):
+    path = tmp_path / "software_stops.json"
+    path.write_text("not json{{{")
+    code, msg = validate_registry(path, _api=FAKE_API)
+    assert code == REGISTRY_CORRUPT
+    assert code == 2
+    assert "CORRUPT" in msg
+
+
+def test_validate_registry_fails_schema_is_corrupt(tmp_path):
+    """Valid JSON, but fails validate_snapshot's schema check (version != 1
+    per the fake API's schema, mirroring the real pipeline's contract)."""
+    path = tmp_path / "software_stops.json"
+    path.write_text(json.dumps({"version": 99, "stops": {}}))
+    code, msg = validate_registry(path, _api=FAKE_API)
+    assert code == REGISTRY_CORRUPT
+    assert "CORRUPT" in msg
+
+
+def test_validate_registry_never_reports_stale():
+    """This mode has no staleness/session concept at all — REGISTRY_VALID
+    and STALE happen to collide numerically with OK==0 but are a wholly
+    separate verdict space (see module docstring)."""
+    assert REGISTRY_VALID == OK == 0
+    assert REGISTRY_MISSING == STALE == 1
+    assert REGISTRY_CORRUPT == CORRUPT == 2
+
+
+# --------------------------------------------------- CLI --validate-registry
+
+def test_main_validate_registry_exits_0_for_valid_file(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "renquant_execution.software_stops_liveness._pipeline_stops_api",
+        lambda: FAKE_API,
+    )
+    path = _write_registry(tmp_path, stops={})
+    code = main(["--validate-registry", "--registry", str(path)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "VALID" in out
+
+
+def test_main_validate_registry_exits_1_for_missing_file(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "renquant_execution.software_stops_liveness._pipeline_stops_api",
+        lambda: FAKE_API,
+    )
+    code = main(["--validate-registry", "--registry", str(tmp_path / "nope.json")])
+    assert code == 1
+    out = capsys.readouterr().out
+    assert "MISSING" in out
+
+
+def test_main_validate_registry_exits_2_for_corrupt_file(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(
+        "renquant_execution.software_stops_liveness._pipeline_stops_api",
+        lambda: FAKE_API,
+    )
+    path = tmp_path / "software_stops.json"
+    path.write_text("not json{{{")
+    code = main(["--validate-registry", "--registry", str(path)])
+    assert code == 2
+    out = capsys.readouterr().out
+    assert "CORRUPT" in out
+
+
+def test_main_validate_registry_ignores_market_session_and_staleness(
+    tmp_path, capsys, monkeypatch,
+):
+    """--validate-registry must never gate on market session or staleness:
+    a registry with a very stale/never-evaluated armed stop, checked with
+    NO --force-session and no --now override (i.e. real wall-clock time,
+    whatever it is), must still report VALID/0 purely on structural
+    grounds — proving this mode does not touch check()'s
+    session/staleness path at all."""
+    monkeypatch.setattr(
+        "renquant_execution.software_stops_liveness._pipeline_stops_api",
+        lambda: FAKE_API,
+    )
+    # Force market_session_open to explode if it's ever called by this
+    # mode -- validate-registry must not reach it.
+    monkeypatch.setattr(
+        "renquant_execution.software_stops_liveness.market_session_open",
+        lambda now: (_ for _ in ()).throw(AssertionError(
+            "validate-registry must never evaluate market session"
+        )),
+    )
+    path = _write_registry(
+        tmp_path,
+        stops={"AAPL": {"symbol": "AAPL", "qty": 1.0, "stop_price": 100.0, "source": "z9"}},
+        last_evaluated_at=None,  # would be STALE under check()'s semantics
+    )
+    code = main(["--validate-registry", "--registry", str(path)])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "VALID" in out
 
 
 # ------------------------------------------------ real pipeline (optional)
