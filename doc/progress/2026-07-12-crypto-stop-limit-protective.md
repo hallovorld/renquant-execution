@@ -127,4 +127,47 @@ field normalization, cancel-unconfirmed (no replacement placed), and
 placement-fails-after-confirmed-cancel. 15 tests in the affected area, 387
 passed + 2 skipped (389 total) in the full suite `[VERIFIED]`.
 
+## Revision note round 2 (2026-07-12T21:52:07Z, post-Codex CHANGES_REQUESTED)
+
+Codex found one remaining fail-open in the round-1 fix:
+
+> One remaining blocking fail-open in the revised replace path:
+> `place_crypto_stop_limit` can return a no-submit result (for example
+> invalid grid, below minimum, or spec lookup failure) without raising.
+> `replace_crypto_stop_limit` catches exceptions only, then unconditionally
+> sets `protected=True` and `status=replaced`. After a confirmed cancel this
+> can falsely report protection even though no replacement order exists.
+>
+> Treat a returned skipped/no-submit result, missing `order_id`, or
+> non-resting returned status exactly like
+> `replacement_failed_after_confirmed_cancel`: `protected=False`,
+> `unprotected_after_cancel`, durable Tier-1 signal. Add a regression test
+> using a non-throwing no-submit replacement path.
+
+Verified directly against the current code before fixing: as written today,
+`place_crypto_stop_limit` never actually returns a no-submit-shaped dict —
+every rejection path (invalid grid, below-minimum size, spec-lookup failure,
+no-short violation, bad prices) raises `ValueError`, by design, per its own
+docstring ("Fail-loud (not no-submit) on violations"). So the specific
+triggering scenario Codex names does not occur with today's code. That does
+not make the underlying concern wrong, though — `replace_crypto_stop_limit`
+should not depend on that invariant holding forever (a future change to
+`place_crypto_stop_limit`, or an Alpaca API edge case where a submission
+call returns normally with an order the exchange itself immediately
+rejected in the response body rather than via an exception, would silently
+defeat the round-1 fix). Applied the fix as a strictly-beneficial
+defensive improvement regardless of whether the current code can trigger
+it: after `place_crypto_stop_limit` returns without raising,
+`replace_crypto_stop_limit` now additionally validates the result has a
+non-empty `order_id` AND a genuinely resting status (reusing
+`_is_resting_order_status`/`_enum_value`) before declaring `protected=True`
+— either check failing routes through the same
+`unprotected_after_cancel`/Tier-1 path as an exception.
+
+Added `test_replace_crypto_stop_limit_treats_missing_order_id_as_unprotected`
+and `test_replace_crypto_stop_limit_treats_non_resting_returned_status_as_unprotected`
+(both inject a non-throwing no-submit-shaped return via a monkeypatched
+`place_crypto_stop_limit`, since the real method cannot currently produce
+one). Full suite: 389 passed, 2 skipped (391 total) `[VERIFIED]`.
+
 Not merged — left open for Codex re-review per the operating agreement.

@@ -912,7 +912,13 @@ class AlpacaBroker(BaseBroker):
         :meth:`check_crypto_stop_coverage` fails closed on). If the
         cancellation IS confirmed but the replacement placement itself then
         fails, the position is genuinely UNPROTECTED — the single most
-        severe case.
+        severe case. "Fails" here is deliberately broader than "raises"
+        (Codex review 2026-07-12T21:52:07Z, round 2): a returned result with
+        no ``order_id``, or whose own ``status`` is not a genuinely resting
+        one, is treated identically to a raised exception — ``protected``
+        is never set ``True`` on an unvalidated return value, even though
+        :meth:`place_crypto_stop_limit`'s own current contract always
+        raises rather than returning a no-submit-shaped dict.
 
         Returns a discriminated result dict — the return value must be
         checked explicitly, not inferred from the absence of an exception
@@ -967,16 +973,14 @@ class AlpacaBroker(BaseBroker):
                 "unprotected_reason": "cancel_unconfirmed",
                 "reason": reason,
             }
-        try:
-            result = self.place_crypto_stop_limit(symbol, quantity, stop_price, limit_price)
-        except Exception as exc:  # noqa: BLE001 — must surface as a Tier-1 result, not crash
+        def _unprotected_after_cancel(detail: str) -> dict[str, Any]:
             reason = (
                 f"cancellation of {old_order_id} for {symbol} CONFIRMED, but "
-                f"the replacement stop-limit placement failed ({exc!r}); "
+                f"the replacement stop-limit placement failed ({detail}); "
                 f"{symbol} is now genuinely UNPROTECTED (no resting stop at "
                 "all) — Tier-1 condition, most severe case"
             )
-            warnings.warn(reason, RuntimeWarning, stacklevel=2)
+            warnings.warn(reason, RuntimeWarning, stacklevel=3)
             return {
                 "protected": False,
                 "status": "unprotected_after_cancel",
@@ -985,16 +989,45 @@ class AlpacaBroker(BaseBroker):
                 "unprotected_reason": "replacement_failed_after_confirmed_cancel",
                 "reason": reason,
             }
+
+        try:
+            result = self.place_crypto_stop_limit(symbol, quantity, stop_price, limit_price)
+        except Exception as exc:  # noqa: BLE001 — must surface as a Tier-1 result, not crash
+            return _unprotected_after_cancel(repr(exc))
+
+        # Codex review 2026-07-12T21:52:07Z: place_crypto_stop_limit's own
+        # contract today always raises on any rejection (it never returns a
+        # no-submit-style dict) — but replace_crypto_stop_limit must not
+        # depend on that invariant holding forever, and a broker submit
+        # call can in principle return normally with an order that never
+        # actually became a resting stop (e.g. an immediate reject encoded
+        # in the response body rather than an exception). Treat a missing
+        # order_id, a no-submit-shaped result, or a returned order whose own
+        # status is not genuinely resting exactly like an exception here —
+        # never declare "protected" on an unvalidated return value.
+        new_order_id = result.get("order_id")
+        returned_status = _enum_value(result.get("status", ""))
+        if not new_order_id:
+            return _unprotected_after_cancel(
+                "place_crypto_stop_limit returned no order_id "
+                f"(status={returned_status!r})"
+            )
+        if not _is_resting_order_status(returned_status):
+            return _unprotected_after_cancel(
+                f"place_crypto_stop_limit returned a non-resting status "
+                f"{returned_status!r} for order {new_order_id}"
+            )
+
         result = dict(result)
         result.update({
             "protected": True,
             "status": "replaced",
             "old_order_id": old_order_id,
-            "new_order_id": result.get("order_id"),
+            "new_order_id": new_order_id,
             "unprotected_reason": None,
             "reason": (
                 f"cancelled {old_order_id} (confirmed) and replaced with "
-                f"{result.get('order_id')} for {symbol}"
+                f"{new_order_id} for {symbol}"
             ),
         })
         return result

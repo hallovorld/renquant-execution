@@ -1317,6 +1317,57 @@ def test_replace_crypto_stop_limit_unprotected_after_confirmed_cancel_when_place
     assert client.get_order_by_id_calls == ["old-stop-2"]
 
 
+def test_replace_crypto_stop_limit_treats_missing_order_id_as_unprotected() -> None:
+    """Codex round-2 review (2026-07-12T21:52:07Z): a non-throwing
+    no-submit-shaped return from place_crypto_stop_limit (empty order_id)
+    must be treated exactly like a raised exception -- never declare
+    protected=True on an unvalidated return value, even though
+    place_crypto_stop_limit's own current contract always raises rather
+    than returning such a dict."""
+    old_order = _stop_order("old-stop-3", qty=0.5)
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.5},
+        orders=[old_order],
+    )
+    broker = _broker(client)
+    broker.place_crypto_stop_limit = MagicMock(  # noqa: SLF001 -- test injection
+        return_value={"order_id": "", "status": "accepted", "symbol": BTC}
+    )
+    with pytest.warns(RuntimeWarning, match="unprotected_after_cancel|UNPROTECTED"):
+        result = broker.replace_crypto_stop_limit(
+            "old-stop-3", BTC, 0.5, 58000.0, 57500.0,
+        )
+    assert result["protected"] is False
+    assert result["status"] == "unprotected_after_cancel"
+    assert result["unprotected_reason"] == "replacement_failed_after_confirmed_cancel"
+    assert result["new_order_id"] is None
+
+
+def test_replace_crypto_stop_limit_treats_non_resting_returned_status_as_unprotected() -> None:
+    """Same finding: a returned order with a real order_id but a
+    non-resting status (e.g. immediately rejected in the response body,
+    never surfaced as an exception) must also be treated as unprotected."""
+    old_order = _stop_order("old-stop-4", qty=0.5)
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.5},
+        orders=[old_order],
+    )
+    broker = _broker(client)
+    broker.place_crypto_stop_limit = MagicMock(  # noqa: SLF001 -- test injection
+        return_value={"order_id": "new-rejected-1", "status": "rejected", "symbol": BTC}
+    )
+    with pytest.warns(RuntimeWarning, match="unprotected_after_cancel|UNPROTECTED"):
+        result = broker.replace_crypto_stop_limit(
+            "old-stop-4", BTC, 0.5, 58000.0, 57500.0,
+        )
+    assert result["protected"] is False
+    assert result["status"] == "unprotected_after_cancel"
+    assert result["unprotected_reason"] == "replacement_failed_after_confirmed_cancel"
+    assert result["new_order_id"] is None
+
+
 def test_check_crypto_stop_coverage_ignores_equity_positions() -> None:
     client = _FakeCryptoClient(
         positions={"AAPL": 10.0},
