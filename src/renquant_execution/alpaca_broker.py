@@ -839,6 +839,92 @@ class AlpacaBroker(BaseBroker):
         })
         return result
 
+    def replace_crypto_stop_limit(
+        self,
+        old_order_id: str,
+        symbol: str,
+        quantity: float,
+        stop_price: float,
+        limit_price: float,
+    ) -> dict[str, Any]:
+        """Cancel-then-replace a resting crypto protective stop-limit.
+
+        Alpaca has no atomic replace for stop-limit orders — this cancels the
+        old order first, then places a new one via :meth:`place_crypto_stop_limit`.
+        If the cancel succeeds but the new placement fails, the position is
+        UNPROTECTED — the caller MUST treat this as a Tier-1 condition.
+        """
+        self.cancel_order(old_order_id)
+        return self.place_crypto_stop_limit(symbol, quantity, stop_price, limit_price)
+
+    def get_open_orders_detailed(
+        self, asset_class: str | None = None
+    ) -> list[dict[str, Any]]:
+        """All open orders with full detail (type, stop/limit prices, TIF).
+
+        Unlike :meth:`get_open_orders` (which returns symbol names only), this
+        returns full order dicts needed for stop-coverage auditing.
+        """
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        wanted = self._normalize_asset_class_filter(asset_class)
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)
+        rows: list[dict[str, Any]] = []
+        for order in self._require_client().get_orders(filter=request):
+            if not self._order_matches_asset_class(order, wanted):
+                continue
+            d = _order_to_dict(order)
+            d["order_type"] = str(getattr(order, "order_type", "") or "").lower()
+            d["time_in_force"] = str(getattr(order, "time_in_force", "") or "").lower()
+            d["stop_price"] = float(getattr(order, "stop_price", 0.0) or 0.0)
+            d["limit_price"] = float(getattr(order, "limit_price", 0.0) or 0.0)
+            rows.append(d)
+        return rows
+
+    def check_crypto_stop_coverage(self) -> list[dict[str, Any]]:
+        """Tier-1 audit: every crypto position MUST have a resting GTC
+        stop-limit SELL order covering at least its held quantity.
+
+        Returns a list of violations (empty = all covered). Each violation is
+        ``{"symbol": ..., "held_qty": ..., "covered_qty": ..., "reason": ...}``.
+        A non-empty result is a Tier-1 condition: the caller must place
+        protective stops before any new crypto entry.
+        """
+        positions = self.get_all_positions()
+        crypto_positions = {
+            p["symbol"]: float(p["qty"])
+            for p in positions
+            if is_crypto_pair(p["symbol"]) and float(p["qty"]) > 0
+        }
+        if not crypto_positions:
+            return []
+
+        open_orders = self.get_open_orders_detailed(asset_class=ASSET_CLASS_CRYPTO)
+        stop_coverage: dict[str, float] = {}
+        for order in open_orders:
+            if (
+                order.get("order_type") == "stop_limit"
+                and order.get("side", "").upper() == "SELL"
+            ):
+                sym = order["symbol"]
+                stop_coverage[sym] = stop_coverage.get(sym, 0.0) + order["quantity"]
+
+        violations: list[dict[str, Any]] = []
+        for symbol, held_qty in crypto_positions.items():
+            covered = stop_coverage.get(symbol, 0.0)
+            if covered < held_qty - QTY_INTEGRAL_EPS:
+                violations.append({
+                    "symbol": symbol,
+                    "held_qty": held_qty,
+                    "covered_qty": covered,
+                    "reason": (
+                        f"{symbol}: held {held_qty}, stop coverage {covered} "
+                        f"(shortfall {held_qty - covered:.6f})"
+                    ),
+                })
+        return violations
+
     def cancel_order(self, order_id: str) -> bool:
         self._require_client().cancel_order_by_id(order_id)
         return True

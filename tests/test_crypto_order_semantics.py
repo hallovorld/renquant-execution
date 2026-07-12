@@ -212,6 +212,29 @@ class _FakeCryptoClient:
         self.get_orders_requests.append(filter)
         return list(self._orders)
 
+    def get_all_positions(self):
+        return [
+            SimpleNamespace(
+                symbol=sym,
+                qty=qty,
+                qty_available=qty,
+                market_value=qty * 60000.0,
+                avg_entry_price=60000.0,
+                current_price=60000.0,
+                unrealized_pl=0.0,
+                unrealized_plpc=0.0,
+                asset_class="crypto",
+            )
+            for sym, qty in self._positions.items()
+            if qty > 0
+        ]
+
+    def cancel_order_by_id(self, order_id: str) -> None:
+        self._orders = [
+            o for o in self._orders
+            if str(getattr(o, "id", "")) != order_id
+        ]
+
     def get_clock(self):
         self.get_clock_calls += 1
         return SimpleNamespace(is_open=False)
@@ -931,3 +954,124 @@ def test_alpaca_broker_port_refuses_crypto_pairs() -> None:
             client_order_id="pi-x:1", symbol=BTC, side="BUY", qty=0.5,
             limit_price=60_000.0,
         )
+
+
+# ── D-C5: replace_crypto_stop_limit + check_crypto_stop_coverage ──────────
+
+
+def test_replace_crypto_stop_limit_cancels_then_places() -> None:
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.5},
+        orders=[SimpleNamespace(
+            id="old-stop-1", status="accepted", symbol=BTC, side="SELL",
+            qty=0.5, filled_qty=0.0, filled_avg_price=0.0,
+            order_type="stop_limit", time_in_force="gtc",
+            stop_price=59000.0, limit_price=58500.0,
+        )],
+    )
+    broker = _broker(client)
+    result = broker.replace_crypto_stop_limit(
+        "old-stop-1", BTC, 0.5, 58000.0, 57500.0,
+    )
+    assert result["stop_price"] == 58000.0
+    assert result["limit_price"] == 57500.0
+    assert result["asset_class"] == ASSET_CLASS_CRYPTO
+    assert len(client.submitted) == 1
+
+
+def test_get_open_orders_detailed_returns_stop_prices() -> None:
+    orders = [SimpleNamespace(
+        id="ord-1", status="accepted", symbol=BTC, side="SELL",
+        qty=0.3, filled_qty=0.0, filled_avg_price=0.0,
+        order_type="stop_limit", time_in_force="gtc",
+        stop_price=59000.0, limit_price=58500.0,
+        created_at="2026-07-12", submitted_at="2026-07-12",
+        filled_at=None, asset_class="crypto",
+    )]
+    client = _FakeCryptoClient(orders=orders)
+    broker = _broker(client)
+    detailed = broker.get_open_orders_detailed(asset_class=ASSET_CLASS_CRYPTO)
+    assert len(detailed) == 1
+    d = detailed[0]
+    assert d["order_type"] == "stop_limit"
+    assert d["stop_price"] == 59000.0
+    assert d["limit_price"] == 58500.0
+    assert d["time_in_force"] == "gtc"
+
+
+def test_check_crypto_stop_coverage_all_covered() -> None:
+    orders = [SimpleNamespace(
+        id="stop-1", status="accepted", symbol=BTC, side="SELL",
+        qty=0.5, filled_qty=0.0, filled_avg_price=0.0,
+        order_type="stop_limit", time_in_force="gtc",
+        stop_price=59000.0, limit_price=58500.0,
+        created_at="", submitted_at="", filled_at=None,
+        asset_class="crypto",
+    )]
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.5},
+        orders=orders,
+    )
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert violations == []
+
+
+def test_check_crypto_stop_coverage_detects_unprotected_position() -> None:
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.5},
+        orders=[],
+    )
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert len(violations) == 1
+    assert violations[0]["symbol"] == BTC
+    assert violations[0]["held_qty"] == 0.5
+    assert violations[0]["covered_qty"] == 0.0
+
+
+def test_check_crypto_stop_coverage_partial_shortfall() -> None:
+    orders = [SimpleNamespace(
+        id="stop-1", status="accepted", symbol=BTC, side="SELL",
+        qty=0.3, filled_qty=0.0, filled_avg_price=0.0,
+        order_type="stop_limit", time_in_force="gtc",
+        stop_price=59000.0, limit_price=58500.0,
+        created_at="", submitted_at="", filled_at=None,
+        asset_class="crypto",
+    )]
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.5},
+        orders=orders,
+    )
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert len(violations) == 1
+    assert violations[0]["covered_qty"] == 0.3
+    assert "shortfall" in violations[0]["reason"]
+
+
+def test_check_crypto_stop_coverage_ignores_equity_positions() -> None:
+    client = _FakeCryptoClient(
+        positions={"AAPL": 10.0},
+        orders=[],
+    )
+    client.get_all_positions = lambda: [
+        SimpleNamespace(symbol="AAPL", qty=10.0, qty_available=10.0,
+                        market_value=1000.0, avg_entry_price=100.0,
+                        current_price=100.0, unrealized_pl=0.0,
+                        unrealized_plpc=0.0, asset_class="us_equity"),
+    ]
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert violations == []
+
+
+def test_check_crypto_stop_coverage_no_positions() -> None:
+    client = _FakeCryptoClient(positions={}, orders=[])
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert violations == []
