@@ -1204,6 +1204,194 @@ class AlpacaBroker(BaseBroker):
                 })
         return violations
 
+    # ── thin wrappers for crypto Stage-0 battery (2026-07-12) ──────────────
+
+    def get_account_info(self) -> dict[str, Any]:
+        """Account metadata: status, crypto_status, buying power, paper flag.
+
+        Thin wrapper over ``get_account()`` that surfaces the fields the
+        Stage-0 crypto battery needs to verify the account is crypto-enabled
+        on the correct environment -- without the battery importing alpaca-py
+        or reaching into private broker state.
+        """
+        account = self._refresh_account()
+        return {
+            "account_id": str(getattr(account, "account_number", "") or ""),
+            "status": str(getattr(account, "status", "") or "").upper(),
+            "crypto_status": str(getattr(account, "crypto_status", "") or "").upper(),
+            "buying_power": float(getattr(account, "buying_power", 0.0) or 0.0),
+            "non_marginable_buying_power": float(
+                getattr(account, "non_marginable_buying_power", 0.0) or 0.0
+            ),
+            "cash": float(getattr(account, "cash", 0.0) or 0.0),
+            "portfolio_value": float(getattr(account, "portfolio_value", 0.0) or 0.0),
+            "paper": self.paper,
+        }
+
+    def get_crypto_asset_spec(self, symbol: str) -> CryptoAssetSpec:
+        """Public wrapper for the per-pair crypto order-grid spec lookup.
+
+        Returns the ``CryptoAssetSpec`` for ``symbol`` -- either from the
+        pinned snapshot or a live ``get_asset`` lookup (fail-closed, cached
+        only on confirmed success). Raises ``RuntimeError`` on lookup
+        failure so the caller can distinguish "pair not found" from "pair
+        found with spec X".
+        """
+        try:
+            return self._resolve_crypto_spec(symbol)
+        except _CryptoSpecLookupError as exc:
+            raise RuntimeError(
+                f"crypto order-grid spec lookup for {symbol!r} failed: {exc}"
+            ) from exc
+
+    def place_crypto_limit_order(
+        self,
+        symbol: str,
+        action: str,
+        qty: float,
+        limit_price: float,
+        *,
+        time_in_force: str = "gtc",
+    ) -> dict[str, Any]:
+        """Place a crypto GTC/IOC limit order (BUY or SELL).
+
+        Thin wrapper for the SDK ``LimitOrderRequest`` -- the crypto limit
+        order type that the production market-order and stop-limit paths do
+        not cover. Primary consumer: the Stage-0 battery's GTC order
+        acceptance test (place a limit BUY far below market, verify accepted,
+        cancel immediately). Same crypto-only / paper-mode / TIF / spec
+        preflight as the other crypto order methods.
+        """
+        from alpaca.trading.enums import OrderSide
+        from alpaca.trading.requests import LimitOrderRequest
+
+        self._assert_account_active()
+        action_u = action.upper()
+        if action_u not in {"BUY", "SELL"}:
+            raise ValueError(f"unsupported action: {action!r}")
+        if not is_crypto_pair(symbol):
+            raise ValueError(
+                f"place_crypto_limit_order is crypto-only; got {symbol!r}"
+            )
+        tif = str(time_in_force or "gtc").strip().lower()
+        violation = validate_crypto_order(
+            order_type="limit", time_in_force=tif, qty=float(qty),
+        )
+        if violation is not None:
+            _, why = violation
+            raise ValueError(
+                f"crypto limit order for {symbol} rejected at preflight: {why}"
+            )
+        spec = self._resolve_crypto_spec(symbol)
+        submit_qty = snap_qty_to_increment(float(qty), spec.min_trade_increment)
+        submit_price = round_price_to_increment(float(limit_price), spec.price_increment)
+        request = LimitOrderRequest(
+            symbol=symbol,
+            qty=submit_qty,
+            side=OrderSide.BUY if action_u == "BUY" else OrderSide.SELL,
+            time_in_force=self._crypto_tif_enum(tif),
+            limit_price=submit_price,
+        )
+        order = self._require_client().submit_order(order_data=request)
+        result = _order_to_dict(order)
+        result.update({
+            "action": action_u,
+            "quantity": float(submit_qty),
+            "requested_quantity": float(qty),
+            "limit_price": float(submit_price),
+            "asset_class": ASSET_CLASS_CRYPTO,
+            "time_in_force": tif,
+            "skipped": False,
+        })
+        return result
+
+    def place_crypto_stop_limit_order(
+        self,
+        symbol: str,
+        action: str,
+        qty: float,
+        stop_price: float,
+        limit_price: float,
+        *,
+        time_in_force: str = "gtc",
+    ) -> dict[str, Any]:
+        """Place a crypto GTC/IOC stop-limit order (BUY or SELL).
+
+        General-purpose stop-limit wrapper that handles both sides -- unlike
+        the protective-SELL-only :meth:`place_crypto_stop_limit` which
+        carries E11 no-short / held-qty / Tier-1 safety gates. Primary
+        consumer: the Stage-0 battery's stop-limit acceptance test (place a
+        BUY stop-limit at unreachable prices, verify accepted, cancel
+        immediately).
+
+        Price validation: BUY stop-limit requires ``limit_price >= stop_price``
+        (the limit caps how HIGH you pay after the stop triggers). SELL
+        stop-limit requires ``limit_price <= stop_price`` (same as the
+        protective path).
+        """
+        from alpaca.trading.enums import OrderSide
+        from alpaca.trading.requests import StopLimitOrderRequest
+
+        self._assert_account_active()
+        action_u = action.upper()
+        if action_u not in {"BUY", "SELL"}:
+            raise ValueError(f"unsupported action: {action!r}")
+        if not is_crypto_pair(symbol):
+            raise ValueError(
+                f"place_crypto_stop_limit_order is crypto-only; got {symbol!r}"
+            )
+        tif = str(time_in_force or "gtc").strip().lower()
+        violation = validate_crypto_order(
+            order_type="stop_limit", time_in_force=tif, qty=float(qty),
+        )
+        if violation is not None:
+            _, why = violation
+            raise ValueError(
+                f"crypto stop-limit order for {symbol} rejected at preflight: {why}"
+            )
+        stop_f = float(stop_price)
+        limit_f = float(limit_price)
+        if not (stop_f > 0.0 and limit_f > 0.0):
+            raise ValueError(
+                f"stop/limit prices must be positive: stop={stop_price!r}, "
+                f"limit={limit_price!r}"
+            )
+        if action_u == "BUY" and limit_f < stop_f:
+            raise ValueError(
+                f"BUY stop-limit requires limit >= stop (the limit caps how "
+                f"high you pay); got stop={stop_f}, limit={limit_f}"
+            )
+        if action_u == "SELL" and limit_f > stop_f:
+            raise ValueError(
+                f"SELL stop-limit requires limit <= stop; "
+                f"got stop={stop_f}, limit={limit_f}"
+            )
+        spec = self._resolve_crypto_spec(symbol)
+        submit_qty = snap_qty_to_increment(float(qty), spec.min_trade_increment)
+        submit_stop = round_price_to_increment(stop_f, spec.price_increment)
+        submit_limit = round_price_to_increment(limit_f, spec.price_increment)
+        request = StopLimitOrderRequest(
+            symbol=symbol,
+            qty=submit_qty,
+            side=OrderSide.BUY if action_u == "BUY" else OrderSide.SELL,
+            time_in_force=self._crypto_tif_enum(tif),
+            stop_price=submit_stop,
+            limit_price=submit_limit,
+        )
+        order = self._require_client().submit_order(order_data=request)
+        result = _order_to_dict(order)
+        result.update({
+            "action": action_u,
+            "quantity": float(submit_qty),
+            "requested_quantity": float(qty),
+            "stop_price": float(submit_stop),
+            "limit_price": float(submit_limit),
+            "asset_class": ASSET_CLASS_CRYPTO,
+            "time_in_force": tif,
+            "skipped": False,
+        })
+        return result
+
     def cancel_order(self, order_id: str) -> bool:
         self._require_client().cancel_order_by_id(order_id)
         return True
