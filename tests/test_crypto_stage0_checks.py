@@ -27,6 +27,13 @@ from renquant_execution.crypto_stage0_checks import (
     run_full_battery,
 )
 
+#: Cancellation-confirmation timeout/poll interval for tests that exercise
+#: the "cancellation never confirms" path -- small enough that the real
+#: ``time.sleep`` calls inside ``AlpacaBroker._wait_for_order_terminal_cancel``
+#: cost a few tens of milliseconds, not the 5s production default.
+_FAST_CANCEL_TIMEOUT_SECONDS = 0.05
+_FAST_CANCEL_POLL_INTERVAL_SECONDS = 0.01
+
 BTC = "BTC/USD"
 ETH = "ETH/USD"
 SOL = "SOL/USD"
@@ -61,17 +68,33 @@ class _FakeAccount:
 
 
 class _FakeTradingClient:
-    """Fake TradingClient for battery tests -- no alpaca-py required."""
+    """Fake TradingClient for battery tests -- no alpaca-py required.
+
+    ``order_status_sequence`` mirrors the convention already established in
+    ``tests/test_crypto_order_semantics.py`` for the PR #31 confirmed-cancel
+    tests: a mapping of order_id -> list of statuses that
+    ``get_order_by_id`` reports on each successive poll (a single-element
+    list repeats forever -- e.g. to simulate a cancellation that never
+    confirms within the timeout). Omitting an id entirely gets the default
+    "cancel_order_by_id marks it canceled immediately" behavior, so existing
+    happy-path tests don't need to know about polling at all.
+    """
 
     def __init__(
         self,
         account: Any | None = None,
         assets: dict[str, Any] | None = None,
+        order_status_sequence: dict[str, list[str]] | None = None,
     ) -> None:
         self._account = account or _FakeAccount()
         self._assets = assets or {}
+        self._orders_by_id: dict[str, SimpleNamespace] = {}
+        self._order_status_sequence = {
+            k: list(v) for k, v in (order_status_sequence or {}).items()
+        }
         self.submitted: list[Any] = []
         self.cancelled: list[str] = []
+        self.get_order_by_id_calls: list[str] = []
 
     def get_account(self):
         return self._account
@@ -87,8 +110,9 @@ class _FakeTradingClient:
         side = str(
             getattr(getattr(order_data, "side", ""), "value", "") or ""
         ).upper()
-        return SimpleNamespace(
-            id=f"ord-{len(self.submitted)}",
+        order_id = f"ord-{len(self.submitted)}"
+        order = SimpleNamespace(
+            id=order_id,
             status="accepted",
             symbol=getattr(order_data, "symbol", ""),
             side=side or "BUY",
@@ -96,9 +120,29 @@ class _FakeTradingClient:
             filled_qty=0.0,
             filled_avg_price=0.0,
         )
+        self._orders_by_id[order_id] = order
+        return order
 
     def cancel_order_by_id(self, order_id: str) -> None:
         self.cancelled.append(order_id)
+        # Default (no explicit order_status_sequence for this id): the
+        # cancellation reaches a confirmed terminal CANCELED state right
+        # away -- the common happy-path test shape.
+        if order_id not in self._order_status_sequence:
+            order = self._orders_by_id.get(order_id)
+            if order is not None:
+                order.status = "canceled"
+
+    def get_order_by_id(self, order_id: str):
+        self.get_order_by_id_calls.append(order_id)
+        sequence = self._order_status_sequence.get(order_id)
+        if sequence:
+            status = sequence.pop(0) if len(sequence) > 1 else sequence[0]
+            return SimpleNamespace(id=order_id, status=status)
+        order = self._orders_by_id.get(order_id)
+        if order is not None:
+            return order
+        return SimpleNamespace(id=order_id, status="canceled")
 
 
 def _crypto_asset(**overrides) -> SimpleNamespace:
@@ -253,6 +297,36 @@ def test_gtc_acceptance_cancels_even_on_partial_failure() -> None:
     assert len(client.cancelled) == 2
 
 
+def test_gtc_acceptance_fails_when_cancellation_not_confirmed() -> None:
+    """A cancel_order() call that doesn't raise is NOT proof the order is
+    gone -- if AlpacaBroker.wait_for_order_terminal_cancel() never observes
+    a confirmed terminal ``canceled`` status within the timeout, the step
+    must report FAIL (naming the affected pair/order), never a silent PASS.
+    """
+    assets = {BTC: _crypto_asset()}
+    # ord-1 (the only order, for BTC) is reported "accepted" (a resting,
+    # non-terminal, non-cancel status) on every poll -- the cancellation
+    # request is accepted (no exception) but never actually confirmed.
+    client = _FakeTradingClient(
+        assets=assets, order_status_sequence={"ord-1": ["accepted"]},
+    )
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = check_gtc_order_acceptance(
+        broker,
+        (BTC,),
+        cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+        cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+    )
+    assert result.status == StepStatus.FAIL
+    assert BTC in result.detail
+    assert "ord-1" in result.detail
+    assert "NOT confirmed" in result.detail
+    # cancel_order() was called (and did not raise) -- the order was placed
+    # and a cancel was requested, but never confirmed as terminally canceled.
+    assert client.cancelled == ["ord-1"]
+    assert result.data["orders"][BTC]["cancel_confirmed"] is False
+
+
 # ── check_stop_limit_acceptance ─────────────────────────────────────────────
 
 
@@ -274,6 +348,30 @@ def test_stop_limit_acceptance_fail_on_spec_lookup() -> None:
     result = check_stop_limit_acceptance(broker, ("BTC/USD",))
     assert result.status == StepStatus.FAIL
     assert "spec lookup failed" in result.detail
+
+
+def test_stop_limit_acceptance_fails_when_cancellation_not_confirmed() -> None:
+    """Same confirmed-cancel discipline as the GTC limit-order step: a
+    cancel request that didn't raise is not proof the resting BUY
+    stop-limit is actually gone.
+    """
+    assets = {BTC: _crypto_asset()}
+    client = _FakeTradingClient(
+        assets=assets, order_status_sequence={"ord-1": ["accepted"]},
+    )
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = check_stop_limit_acceptance(
+        broker,
+        (BTC,),
+        cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+        cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+    )
+    assert result.status == StepStatus.FAIL
+    assert BTC in result.detail
+    assert "ord-1" in result.detail
+    assert "NOT confirmed" in result.detail
+    assert client.cancelled == ["ord-1"]
+    assert result.data["orders"][BTC]["cancel_confirmed"] is False
 
 
 # ── check_buying_power_behavior ─────────────────────────────────────────────

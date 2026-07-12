@@ -60,6 +60,16 @@ _CANARY_LIMIT_BUY_PRICE: float = 0.01
 _CANARY_STOP_LIMIT_STOP_PRICE: float = 999_999_999.00
 _CANARY_STOP_LIMIT_LIMIT_PRICE: float = 999_999_999.00
 
+#: Timeout/poll interval for confirming a canary order's cancellation
+#: actually reached a terminal ``canceled`` state (same "confirm, don't
+#: assume" discipline Codex required on PR #31's
+#: ``AlpacaBroker.replace_crypto_stop_limit`` -- a cancel *request* that
+#: didn't raise is not proof the order is gone; it can still be resting or
+#: have filled/rejected before the cancel took effect). Applied proactively
+#: here, ahead of review, to the two order-placing battery steps below.
+DEFAULT_CANCEL_CONFIRM_TIMEOUT_SECONDS: float = 5.0
+DEFAULT_CANCEL_CONFIRM_POLL_INTERVAL_SECONDS: float = 0.25
+
 
 # ── result types ────────────────────────────────────────────────────────────
 
@@ -201,12 +211,25 @@ def check_gtc_order_acceptance(
     broker: AlpacaBroker,
     pairs: tuple[str, ...] = DEFAULT_CANARY_PAIRS,
     test_notional_usd: float = DEFAULT_TEST_NOTIONAL_USD,
+    *,
+    cancel_confirm_timeout_seconds: float = DEFAULT_CANCEL_CONFIRM_TIMEOUT_SECONDS,
+    cancel_confirm_poll_interval_seconds: float = (
+        DEFAULT_CANCEL_CONFIRM_POLL_INTERVAL_SECONDS
+    ),
 ) -> StepResult:
     """Place and immediately cancel small GTC limit-buy orders.
 
     For each canary pair, places a GTC limit-buy order at a price far below
     market ($0.01) so it will never fill, verifies the broker accepts it, and
-    then cancels it. This proves the account can place resting crypto orders.
+    then cancels it -- CONFIRMING the cancellation actually reached a
+    terminal ``canceled`` state via
+    :meth:`AlpacaBroker.wait_for_order_terminal_cancel` (same "confirm, don't
+    assume" discipline Codex required on PR #31's
+    ``replace_crypto_stop_limit``). A cancel request that doesn't raise is
+    NOT proof the order is gone -- it can still be resting, or have
+    filled/rejected before the cancel took effect -- so an unconfirmed
+    cancellation is a Tier-1 FAIL for the affected pair/order, never a
+    silent PASS.
     """
     name = "gtc_order_acceptance"
     placed_and_cancelled: list[str] = []
@@ -228,6 +251,7 @@ def check_gtc_order_acceptance(
         qty = max(raw_qty, spec.min_order_size)
 
         order_id = None
+        placed = False
         try:
             result = broker.place_crypto_limit_order(
                 symbol=pair,
@@ -246,20 +270,48 @@ def check_gtc_order_acceptance(
             if not order_id:
                 failures.append(f"{pair}: order accepted but no order_id returned")
                 continue
-            placed_and_cancelled.append(pair)
+            placed = True
         except Exception as exc:
             failures.append(f"{pair}: place failed ({exc})")
             continue
         finally:
-            # Always try to cancel if we got an order_id.
+            # Always try to cancel if we got an order_id, and CONFIRM the
+            # cancellation reached a terminal state before treating this
+            # pair as a clean PASS.
             if order_id:
+                cancel_confirmed = False
+                cancel_raised: str | None = None
                 try:
                     broker.cancel_order(order_id)
                 except Exception as cancel_exc:
+                    cancel_raised = str(cancel_exc)
                     logger.warning(
                         "battery: cancel of %s order %s failed: %s",
                         pair, order_id, cancel_exc,
                     )
+                else:
+                    cancel_confirmed = broker.wait_for_order_terminal_cancel(
+                        order_id,
+                        timeout_seconds=cancel_confirm_timeout_seconds,
+                        poll_interval_seconds=cancel_confirm_poll_interval_seconds,
+                    )
+                order_details[pair]["cancel_confirmed"] = cancel_confirmed
+                if placed and not cancel_confirmed:
+                    reason = (
+                        f"cancel_order raised: {cancel_raised}"
+                        if cancel_raised is not None
+                        else (
+                            f"cancellation of order {order_id} not confirmed "
+                            f"terminally canceled within "
+                            f"{cancel_confirm_timeout_seconds}s"
+                        )
+                    )
+                    failures.append(
+                        f"{pair}: order {order_id} cancellation NOT confirmed "
+                        f"({reason}) -- order may still be resting/uncancelled"
+                    )
+                elif placed:
+                    placed_and_cancelled.append(pair)
 
     if failures:
         return StepResult(
@@ -275,8 +327,8 @@ def check_gtc_order_acceptance(
         name=name,
         status=StepStatus.PASS,
         detail=(
-            f"{len(placed_and_cancelled)} GTC limit-buy orders placed+cancelled: "
-            f"{', '.join(placed_and_cancelled)}"
+            f"{len(placed_and_cancelled)} GTC limit-buy orders placed+cancelled "
+            f"(cancellation confirmed): {', '.join(placed_and_cancelled)}"
         ),
         data={"orders": order_details},
     )
@@ -285,14 +337,24 @@ def check_gtc_order_acceptance(
 def check_stop_limit_acceptance(
     broker: AlpacaBroker,
     pairs: tuple[str, ...] = DEFAULT_CANARY_PAIRS,
+    *,
+    cancel_confirm_timeout_seconds: float = DEFAULT_CANCEL_CONFIRM_TIMEOUT_SECONDS,
+    cancel_confirm_poll_interval_seconds: float = (
+        DEFAULT_CANCEL_CONFIRM_POLL_INTERVAL_SECONDS
+    ),
 ) -> StepResult:
     """Place and immediately cancel small GTC stop-limit BUY orders.
 
     For each canary pair, places a GTC stop-limit BUY order at unreachable
     prices (stop far above market, so the stop never triggers), verifies the
-    broker accepts it, and then cancels it. BUY-side stop-limits avoid the
-    need for a held position (which SELL-side would require due to E11
-    no-short).
+    broker accepts it, and then cancels it -- CONFIRMING the cancellation
+    actually reached a terminal ``canceled`` state via
+    :meth:`AlpacaBroker.wait_for_order_terminal_cancel` (same "confirm, don't
+    assume" discipline Codex required on PR #31's
+    ``replace_crypto_stop_limit``). BUY-side stop-limits avoid the need for a
+    held position (which SELL-side would require due to E11 no-short). An
+    unconfirmed cancellation is a Tier-1 FAIL for the affected pair/order,
+    never a silent PASS.
     """
     name = "stop_limit_acceptance"
     placed_and_cancelled: list[str] = []
@@ -308,6 +370,7 @@ def check_stop_limit_acceptance(
 
         qty = spec.min_order_size
         order_id = None
+        placed = False
         try:
             result = broker.place_crypto_stop_limit_order(
                 symbol=pair,
@@ -328,19 +391,45 @@ def check_stop_limit_acceptance(
             if not order_id:
                 failures.append(f"{pair}: order accepted but no order_id returned")
                 continue
-            placed_and_cancelled.append(pair)
+            placed = True
         except Exception as exc:
             failures.append(f"{pair}: place failed ({exc})")
             continue
         finally:
             if order_id:
+                cancel_confirmed = False
+                cancel_raised: str | None = None
                 try:
                     broker.cancel_order(order_id)
                 except Exception as cancel_exc:
+                    cancel_raised = str(cancel_exc)
                     logger.warning(
                         "battery: cancel of %s stop-limit order %s failed: %s",
                         pair, order_id, cancel_exc,
                     )
+                else:
+                    cancel_confirmed = broker.wait_for_order_terminal_cancel(
+                        order_id,
+                        timeout_seconds=cancel_confirm_timeout_seconds,
+                        poll_interval_seconds=cancel_confirm_poll_interval_seconds,
+                    )
+                order_details[pair]["cancel_confirmed"] = cancel_confirmed
+                if placed and not cancel_confirmed:
+                    reason = (
+                        f"cancel_order raised: {cancel_raised}"
+                        if cancel_raised is not None
+                        else (
+                            f"cancellation of order {order_id} not confirmed "
+                            f"terminally canceled within "
+                            f"{cancel_confirm_timeout_seconds}s"
+                        )
+                    )
+                    failures.append(
+                        f"{pair}: order {order_id} cancellation NOT confirmed "
+                        f"({reason}) -- order may still be resting/uncancelled"
+                    )
+                elif placed:
+                    placed_and_cancelled.append(pair)
 
     if failures:
         return StepResult(
@@ -357,7 +446,8 @@ def check_stop_limit_acceptance(
         status=StepStatus.PASS,
         detail=(
             f"{len(placed_and_cancelled)} GTC stop-limit BUY orders "
-            f"placed+cancelled: {', '.join(placed_and_cancelled)}"
+            f"placed+cancelled (cancellation confirmed): "
+            f"{', '.join(placed_and_cancelled)}"
         ),
         data={"orders": order_details},
     )
@@ -552,6 +642,8 @@ def run_full_battery(
 
 __all__ = [
     "DEFAULT_CANARY_PAIRS",
+    "DEFAULT_CANCEL_CONFIRM_POLL_INTERVAL_SECONDS",
+    "DEFAULT_CANCEL_CONFIRM_TIMEOUT_SECONDS",
     "DEFAULT_TEST_NOTIONAL_USD",
     "BatteryReport",
     "StepResult",

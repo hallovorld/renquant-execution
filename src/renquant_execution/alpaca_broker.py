@@ -888,6 +888,35 @@ class AlpacaBroker(BaseBroker):
                 return False
             time.sleep(poll_interval_seconds)
 
+    def wait_for_order_terminal_cancel(
+        self,
+        order_id: str,
+        *,
+        timeout_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> bool:
+        """Public wrapper for :meth:`_wait_for_order_terminal_cancel`.
+
+        Added (2026-07-12) so same-package callers outside this class do not
+        need to reach into the underscore-prefixed method directly. Shares
+        the exact same "confirm, don't assume" polling discipline Codex
+        required on PR #31 between two call sites: :meth:`replace_crypto_stop_limit`
+        (the protective-stop cancel-then-replace path, unchanged -- it still
+        calls the private method directly, this wrapper does not alter that
+        logic) and the crypto Stage-0 battery's transactional probes
+        (``crypto_stage0_checks.check_gtc_order_acceptance`` /
+        ``check_stop_limit_acceptance``) -- both of which request cancellation
+        of a canary order and must confirm a genuinely CONFIRMED terminal
+        ``canceled`` state before reporting PASS, not merely that
+        ``cancel_order`` didn't raise. See :meth:`_wait_for_order_terminal_cancel`
+        for the full poll-loop docstring/rationale and default timeout choice.
+        """
+        return self._wait_for_order_terminal_cancel(
+            order_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
     def replace_crypto_stop_limit(
         self,
         old_order_id: str,
