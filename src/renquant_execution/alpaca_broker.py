@@ -6,6 +6,7 @@ orchestration can import renquant-execution without broker SDK credentials.
 from __future__ import annotations
 
 import os
+import time
 import warnings
 from datetime import datetime, timezone
 from typing import Any
@@ -839,6 +840,370 @@ class AlpacaBroker(BaseBroker):
         })
         return result
 
+    def _wait_for_order_terminal_cancel(
+        self,
+        order_id: str,
+        *,
+        timeout_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> bool:
+        """Poll Alpaca until ``order_id`` reaches a genuinely terminal
+        ``canceled`` state, or ``timeout_seconds`` elapses.
+
+        Alpaca's cancellation is ASYNCHRONOUS (Codex review 2026-07-12
+        finding 3): ``cancel_order`` returns as soon as the cancel *request*
+        is accepted, not once the order has actually reached a terminal
+        state — the order can sit in ``pending_cancel`` for a short window,
+        or (rare race) fill/reject before the cancel takes effect.
+
+        Deliberate, explicit defaults for a synchronous broker-adapter call
+        inside the daily-run loop (a judgment call, not tuned against a
+        production SLA): ``timeout_seconds=5.0`` — Alpaca paper/live cancel
+        acks are typically sub-second, so 5s gives ample margin without
+        stalling the caller noticeably — and ``poll_interval_seconds=0.25``
+        — frequent enough to resolve quickly, coarse enough not to hammer the
+        API. Callers with a tighter or looser SLA may override both.
+
+        Returns ``True`` only once the order's status is a CONFIRMED terminal
+        ``canceled``. Returns ``False`` on timeout OR if the order reaches a
+        *different* terminal state first (e.g. it filled before the cancel
+        could take effect) — either way the caller must NOT treat the old
+        stop as gone and must NOT proceed to place a replacement (that could
+        create two overlapping resting stops).
+        """
+        client = self._require_client()
+        deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+        while True:
+            try:
+                order = client.get_order_by_id(order_id)
+            except Exception:  # noqa: BLE001 — treat as "not yet confirmed", keep polling
+                order = None
+            if order is not None:
+                status = _enum_value(getattr(order, "status", ""))
+                if status == _TERMINAL_CANCELED_STATUS:
+                    return True
+                if status in _TERMINAL_NON_CANCEL_STATUSES:
+                    return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll_interval_seconds)
+
+    def replace_crypto_stop_limit(
+        self,
+        old_order_id: str,
+        symbol: str,
+        quantity: float,
+        stop_price: float,
+        limit_price: float,
+        *,
+        timeout_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> dict[str, Any]:
+        """Cancel-then-replace a resting crypto protective stop-limit.
+
+        Alpaca has no atomic replace for stop-limit orders — this cancels the
+        old order first, CONFIRMS the cancellation actually reached a
+        terminal ``canceled`` state (:meth:`_wait_for_order_terminal_cancel`
+        — Codex review 2026-07-12 finding 3), and only then places the
+        replacement via :meth:`place_crypto_stop_limit`. If the cancel is
+        never confirmed, the replacement is deliberately NOT submitted (that
+        could create two overlapping resting stops — the exact
+        "duplicate/competing protective stops" condition
+        :meth:`check_crypto_stop_coverage` fails closed on). If the
+        cancellation IS confirmed but the replacement placement itself then
+        fails, the position is genuinely UNPROTECTED — the single most
+        severe case. "Fails" here is deliberately broader than "raises"
+        (Codex review 2026-07-12T21:52:07Z, round 2): a returned result with
+        no ``order_id``, or whose own ``status`` is not a genuinely resting
+        one, is treated identically to a raised exception — ``protected``
+        is never set ``True`` on an unvalidated return value, even though
+        :meth:`place_crypto_stop_limit`'s own current contract always
+        raises rather than returning a no-submit-shaped dict.
+
+        Returns a discriminated result dict — the return value must be
+        checked explicitly, not inferred from the absence of an exception
+        (Codex review 2026-07-12 finding 4: "a plain no-submit/exception is
+        insufficient because callers can forget to interpret it")::
+
+            {
+                "protected": bool,   # True only on a confirmed clean replace
+                "status": "replaced" | "cancel_unconfirmed" | "unprotected_after_cancel",
+                "old_order_id": str,
+                "new_order_id": str | None,  # set only when status == "replaced"
+                "unprotected_reason": str | None,  # "cancel_unconfirmed" or
+                                                    # "replacement_failed_after_confirmed_cancel"
+                "reason": str,        # human-readable detail, always present
+                ...                   # place_crypto_stop_limit's own fields, on success
+            }
+
+        On the two failure statuses this ALSO emits a ``RuntimeWarning``
+        (this file's existing fail-closed signaling convention — see
+        ``_no_submit_result``), so a caller that only watches
+        warnings/logs — not the return value — still notices. And beyond
+        this function's own return value: the true "upstream orchestration
+        consumes this to block new entries and page the owner" wiring is
+        :meth:`check_crypto_stop_coverage` — a failed replace leaves
+        ``symbol`` uncovered, so the very next scheduled
+        ``check_crypto_stop_coverage()`` call (the orchestrator scheduler is
+        meant to call it before every crypto entry, per orchestrator PR
+        #497's own Codex review, fixed in parallel) independently
+        re-discovers the same symbol as a violation — a second, independent
+        layer of protection beyond this function's own return value.
+        """
+        self.cancel_order(old_order_id)
+        confirmed = self._wait_for_order_terminal_cancel(
+            old_order_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        if not confirmed:
+            reason = (
+                f"cancellation of {old_order_id} for {symbol} did not reach "
+                f"a confirmed terminal CANCELED state within "
+                f"{timeout_seconds}s; replacement stop-limit NOT submitted "
+                "(would risk two overlapping resting stops) — position may "
+                "be UNPROTECTED, Tier-1 condition"
+            )
+            warnings.warn(reason, RuntimeWarning, stacklevel=2)
+            return {
+                "protected": False,
+                "status": "cancel_unconfirmed",
+                "old_order_id": old_order_id,
+                "new_order_id": None,
+                "unprotected_reason": "cancel_unconfirmed",
+                "reason": reason,
+            }
+        def _unprotected_after_cancel(detail: str) -> dict[str, Any]:
+            reason = (
+                f"cancellation of {old_order_id} for {symbol} CONFIRMED, but "
+                f"the replacement stop-limit placement failed ({detail}); "
+                f"{symbol} is now genuinely UNPROTECTED (no resting stop at "
+                "all) — Tier-1 condition, most severe case"
+            )
+            warnings.warn(reason, RuntimeWarning, stacklevel=3)
+            return {
+                "protected": False,
+                "status": "unprotected_after_cancel",
+                "old_order_id": old_order_id,
+                "new_order_id": None,
+                "unprotected_reason": "replacement_failed_after_confirmed_cancel",
+                "reason": reason,
+            }
+
+        try:
+            result = self.place_crypto_stop_limit(symbol, quantity, stop_price, limit_price)
+        except Exception as exc:  # noqa: BLE001 — must surface as a Tier-1 result, not crash
+            return _unprotected_after_cancel(repr(exc))
+
+        # Codex review 2026-07-12T21:52:07Z: place_crypto_stop_limit's own
+        # contract today always raises on any rejection (it never returns a
+        # no-submit-style dict) — but replace_crypto_stop_limit must not
+        # depend on that invariant holding forever, and a broker submit
+        # call can in principle return normally with an order that never
+        # actually became a resting stop (e.g. an immediate reject encoded
+        # in the response body rather than an exception). Treat a missing
+        # order_id, a no-submit-shaped result, or a returned order whose own
+        # status is not genuinely resting exactly like an exception here —
+        # never declare "protected" on an unvalidated return value.
+        new_order_id = result.get("order_id")
+        returned_status = _enum_value(result.get("status", ""))
+        if not new_order_id:
+            return _unprotected_after_cancel(
+                "place_crypto_stop_limit returned no order_id "
+                f"(status={returned_status!r})"
+            )
+        if not _is_resting_order_status(returned_status):
+            return _unprotected_after_cancel(
+                f"place_crypto_stop_limit returned a non-resting status "
+                f"{returned_status!r} for order {new_order_id}"
+            )
+
+        result = dict(result)
+        result.update({
+            "protected": True,
+            "status": "replaced",
+            "old_order_id": old_order_id,
+            "new_order_id": new_order_id,
+            "unprotected_reason": None,
+            "reason": (
+                f"cancelled {old_order_id} (confirmed) and replaced with "
+                f"{new_order_id} for {symbol}"
+            ),
+        })
+        return result
+
+    def get_open_orders_detailed(
+        self, asset_class: str | None = None
+    ) -> list[dict[str, Any]]:
+        """All open orders with full detail (type, stop/limit prices, TIF).
+
+        Unlike :meth:`get_open_orders` (which returns symbol names only), this
+        returns full order dicts needed for stop-coverage auditing.
+
+        Every enum-bearing field is re-derived via :func:`_enum_value` rather
+        than trusting ``_order_to_dict``'s naive ``str(...)`` cast: a real
+        alpaca-py SDK ``Order``'s enum fields (``status``, ``side``,
+        ``order_type``, ``time_in_force``, ...) stringify via plain ``str()``
+        to ``"ClassName.MEMBER"`` (`Enum.__str__`), NOT the lowercase wire
+        value — only ``.value`` gives that. The stop-coverage / replace logic
+        that consumes these rows depends on exact matches against
+        ``"stop_limit"`` / ``"sell"`` / ``"gtc"`` / a resting status string,
+        so this normalizes every field it reads the same way
+        ``_order_matches_asset_class`` already does for ``asset_class``.
+        """
+        from alpaca.trading.enums import QueryOrderStatus
+        from alpaca.trading.requests import GetOrdersRequest
+
+        wanted = self._normalize_asset_class_filter(asset_class)
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)
+        rows: list[dict[str, Any]] = []
+        for order in self._require_client().get_orders(filter=request):
+            if not self._order_matches_asset_class(order, wanted):
+                continue
+            d = _order_to_dict(order)
+            d["status"] = _enum_value(getattr(order, "status", ""))
+            d["side"] = _enum_value(getattr(order, "side", "")).upper()
+            d["order_type"] = _enum_value(getattr(order, "order_type", ""))
+            d["time_in_force"] = _enum_value(getattr(order, "time_in_force", ""))
+            d["stop_price"] = float(getattr(order, "stop_price", 0.0) or 0.0)
+            d["limit_price"] = float(getattr(order, "limit_price", 0.0) or 0.0)
+            rows.append(d)
+        return rows
+
+    def check_crypto_stop_coverage(self) -> list[dict[str, Any]]:
+        """Tier-1 audit: every crypto position MUST have exactly ONE resting
+        GTC stop-limit SELL order covering at least its held quantity.
+
+        A "qualifying" protective stop (Codex review 2026-07-12 findings 1/2/5
+        — see :func:`_is_qualifying_protective_stop`) satisfies ALL of:
+        ``order_type == "stop_limit"``, ``side == "SELL"``,
+        ``time_in_force == "gtc"`` (case-insensitive), ``stop_price > 0``,
+        ``limit_price > 0``, and a genuinely RESTING broker status — NOT a
+        transitional ``pending_*`` sub-state that Alpaca's
+        ``QueryOrderStatus.OPEN`` filter still reports as "open" (see
+        :func:`_is_resting_order_status`).
+
+        Coverage is evaluated PER SYMBOL by *counting* qualifying stops,
+        never by summing quantities across multiple orders (finding 2: two
+        independently-executable stops can both fire — over-sell / race
+        risk with another exit):
+
+        - 0 qualifying stops -> violation, ``violation_kind="uncovered"``
+          (or ``"non_resting_ignored"`` if a stop-shaped order exists for the
+          symbol but only in a non-resting status right now, e.g. mid
+          cancel/replace).
+        - exactly 1 qualifying stop, qty >= held qty within the pair's own
+          ``min_trade_increment`` tolerance (finding 5 — never the equity
+          ``QTY_INTEGRAL_EPS``) -> covered, no violation.
+        - exactly 1 qualifying stop, qty short of that -> violation,
+          ``violation_kind="partial"``.
+        - 2+ qualifying stops for the same symbol -> violation,
+          ``violation_kind="duplicate"`` — FAILS CLOSED on ambiguity; the
+          summed quantity is NEVER treated as safe coverage.
+
+        Returns a list of violations (empty = all covered); public signature
+        is unchanged so the orchestrator scheduler (PR #497) needs no
+        coordinated change. Each violation dict adds a ``"violation_kind"``
+        field alongside the existing human-readable ``"reason"`` string, so
+        callers can distinguish severity/cause. A non-empty result is a
+        Tier-1 condition: the caller must not admit new crypto entries until
+        it is empty again.
+        """
+        positions = self.get_all_positions()
+        crypto_positions = {
+            p["symbol"]: float(p["qty"])
+            for p in positions
+            if is_crypto_pair(p["symbol"]) and float(p["qty"]) > 0
+        }
+        if not crypto_positions:
+            return []
+
+        open_orders = self.get_open_orders_detailed(asset_class=ASSET_CLASS_CRYPTO)
+        qualifying: dict[str, list[dict[str, Any]]] = {}
+        non_resting_shaped: dict[str, list[dict[str, Any]]] = {}
+        for order in open_orders:
+            sym = order.get("symbol", "")
+            if _is_qualifying_protective_stop(order):
+                qualifying.setdefault(sym, []).append(order)
+            elif _is_stop_shaped_protective_candidate(order):
+                non_resting_shaped.setdefault(sym, []).append(order)
+
+        violations: list[dict[str, Any]] = []
+        for symbol, held_qty in crypto_positions.items():
+            qual = qualifying.get(symbol, [])
+            if len(qual) >= 2:
+                violations.append({
+                    "symbol": symbol,
+                    "held_qty": held_qty,
+                    "covered_qty": sum(float(o["quantity"]) for o in qual),
+                    "violation_kind": "duplicate",
+                    "reason": (
+                        f"duplicate/competing protective stops for {symbol} "
+                        f"— {len(qual)} independently-executable GTC "
+                        "stop-limit SELL orders found; ambiguous coverage, "
+                        "more than one could fire (fail-closed, quantities "
+                        "not summed)"
+                    ),
+                })
+                continue
+            if len(qual) == 1:
+                try:
+                    spec = self._resolve_crypto_spec(symbol)
+                except _CryptoSpecLookupError as exc:
+                    violations.append({
+                        "symbol": symbol,
+                        "held_qty": held_qty,
+                        "covered_qty": float(qual[0]["quantity"]),
+                        "violation_kind": "spec_lookup_failed",
+                        "reason": (
+                            f"{symbol}: crypto order-grid spec lookup failed "
+                            f"({exc}); cannot verify stop coverage within the "
+                            "pair's own tolerance — failing closed rather "
+                            "than falling back to the equity epsilon"
+                        ),
+                    })
+                    continue
+                tol = spec.min_trade_increment
+                covered = float(qual[0]["quantity"])
+                if covered < held_qty - tol:
+                    violations.append({
+                        "symbol": symbol,
+                        "held_qty": held_qty,
+                        "covered_qty": covered,
+                        "violation_kind": "partial",
+                        "reason": (
+                            f"{symbol}: held {held_qty}, single qualifying "
+                            f"stop covers only {covered} (shortfall "
+                            f"{held_qty - covered:.9f}, tolerance {tol})"
+                        ),
+                    })
+                continue
+            # len(qual) == 0
+            if non_resting_shaped.get(symbol):
+                violations.append({
+                    "symbol": symbol,
+                    "held_qty": held_qty,
+                    "covered_qty": 0.0,
+                    "violation_kind": "non_resting_ignored",
+                    "reason": (
+                        f"{symbol}: a GTC stop-limit SELL order exists but "
+                        "is not in a genuinely resting status right now "
+                        "(e.g. mid cancel/replace) — not counted as coverage"
+                    ),
+                })
+            else:
+                violations.append({
+                    "symbol": symbol,
+                    "held_qty": held_qty,
+                    "covered_qty": 0.0,
+                    "violation_kind": "uncovered",
+                    "reason": (
+                        f"{symbol}: no resting GTC stop-limit found "
+                        f"(held {held_qty})"
+                    ),
+                })
+        return violations
+
     def cancel_order(self, order_id: str) -> bool:
         self._require_client().cancel_order_by_id(order_id)
         return True
@@ -905,3 +1270,83 @@ def _order_to_dict(order: Any) -> dict[str, Any]:
         "submitted_at": str(getattr(order, "submitted_at", "")),
         "filled_at": str(getattr(order, "filled_at", "")),
     }
+
+
+def _enum_value(raw: Any) -> str:
+    """Extract the lowercase wire value of an alpaca-py SDK enum field.
+
+    [VERIFIED alpaca-py 0.43.4] every ``Order`` enum field (``status``,
+    ``side``, ``order_type``, ``time_in_force``, ``asset_class``, ...) is a
+    ``(str, Enum)`` subclass whose plain ``str()`` produces
+    ``"ClassName.MEMBER"`` (``Enum.__str__``), NOT the lowercase wire value —
+    only ``.value`` gives that (e.g. ``str(OrderStatus.ACCEPTED) ==
+    "OrderStatus.ACCEPTED"`` but ``OrderStatus.ACCEPTED.value == "accepted"``).
+    Same extraction ``_order_matches_asset_class`` already uses for
+    ``asset_class``. A plain string (as used by every test double in this
+    module) has no ``.value`` attribute, so ``getattr(raw, "value", raw)``
+    returns it unchanged — safe for both real SDK enums and fakes.
+    """
+    return str(getattr(raw, "value", raw) or "").strip().lower()
+
+
+# Genuinely RESTING (live, triggerable) Alpaca order statuses. [VERIFIED
+# alpaca-py 0.43.4 OrderStatus] the full enum is: new, partially_filled,
+# filled, done_for_day, canceled, expired, replaced, pending_cancel,
+# pending_replace, pending_review, accepted, pending_new,
+# accepted_for_bidding, stopped, rejected, suspended, calculated, held.
+#
+# ``GetOrdersRequest(status=QueryOrderStatus.OPEN...)`` is a broker-side
+# "not yet terminal" filter — it does NOT mean "genuinely resting". A
+# stop-limit order mid cancel-then-replace reports pending_cancel /
+# pending_new / pending_replace while Alpaca's query semantics still call it
+# "open"; none of those sub-states is a stop the exchange will actually
+# trigger on right now (Codex review 2026-07-12 finding 1), so none may
+# count as protective coverage.
+_RESTING_ORDER_STATUSES = frozenset({"new", "accepted", "held"})
+_TERMINAL_CANCELED_STATUS = "canceled"
+_TERMINAL_NON_CANCEL_STATUSES = frozenset({
+    "filled", "partially_filled", "rejected", "expired", "replaced",
+    "done_for_day", "stopped", "suspended", "calculated",
+})
+
+
+def _is_resting_order_status(status: Any) -> bool:
+    """Whether ``status`` denotes a genuinely resting (live, triggerable)
+    order — not a transitional ``pending_*`` sub-state."""
+    normalized = _enum_value(status)
+    if "pending" in normalized:
+        return False
+    return normalized in _RESTING_ORDER_STATUSES
+
+
+def _is_stop_shaped_protective_candidate(order: dict[str, Any]) -> bool:
+    """Order-shape checks for a protective stop, MINUS the resting-status
+    requirement (Codex review 2026-07-12 finding 1: ``order_type``, ``side``,
+    ``time_in_force``, positive ``stop_price``/``limit_price``).
+
+    Used to detect the "non_resting_ignored" case in
+    :meth:`AlpacaBroker.check_crypto_stop_coverage` — a real
+    protective-stop-shaped order exists for the symbol, it just is not
+    resting right now (e.g. mid cancel/replace).
+    """
+    if str(order.get("order_type", "")).strip().lower() != "stop_limit":
+        return False
+    if str(order.get("side", "")).strip().upper() != "SELL":
+        return False
+    if str(order.get("time_in_force", "")).strip().lower() != "gtc":
+        return False
+    if float(order.get("stop_price", 0.0) or 0.0) <= 0.0:
+        return False
+    if float(order.get("limit_price", 0.0) or 0.0) <= 0.0:
+        return False
+    return True
+
+
+def _is_qualifying_protective_stop(order: dict[str, Any]) -> bool:
+    """Whether ``order`` (a :meth:`AlpacaBroker.get_open_orders_detailed`
+    row) qualifies as protective coverage: every
+    :func:`_is_stop_shaped_protective_candidate` shape check, PLUS a
+    genuinely resting broker status (Codex review 2026-07-12 finding 1)."""
+    if not _is_stop_shaped_protective_candidate(order):
+        return False
+    return _is_resting_order_status(order.get("status", ""))
