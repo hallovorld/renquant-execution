@@ -30,6 +30,8 @@ consumer.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -76,11 +78,18 @@ _CANARY_STOP_LIMIT_LIMIT_PRICE: float = 999_999_999.00
 DEFAULT_CANCEL_CONFIRM_TIMEOUT_SECONDS: float = 5.0
 DEFAULT_CANCEL_CONFIRM_POLL_INTERVAL_SECONDS: float = 0.25
 
+#: Report schema version — incremented when the report structure changes
+#: in a way that consumers need to know about (new fields, changed semantics).
+REPORT_SCHEMA_VERSION: str = "1.0.0"
+
 #: Broker order statuses that indicate the order was genuinely accepted and
-#: is resting (eligible for subsequent cancel).  Any status outside this set
-#: after a place call means the order was not cleanly accepted.
+#: is truly resting (eligible for subsequent cancel).  Only known resting
+#: statuses are accepted; ``held``, ``partially_filled``, ``pending_*``,
+#: and any unknown status are rejected.  For side-effecting probes, a
+#: narrow allowlist prevents treating an ambiguous state as proof of
+#: acceptance.
 _ACCEPTED_ORDER_STATUSES: frozenset[str] = frozenset({
-    "accepted", "new", "held", "partially_filled",
+    "accepted", "new",
 })
 
 #: Statuses that prove the order was rejected or already terminal at place
@@ -128,11 +137,17 @@ class BatteryReport:
     account_id: str
     environment: str
     dry_run: bool
+    report_schema_version: str = REPORT_SCHEMA_VERSION
+    base_url: str = ""
     steps: list[StepResult] = field(default_factory=list)
 
     @property
     def all_passed(self) -> bool:
         """True when every *required* step is PASS.
+
+        Requires a nonempty set of required steps — an empty battery (no
+        required gates) is never ``all_passed`` (vacuous truth is rejected
+        to prevent a misconfigured battery from silently passing).
 
         Optional steps (``required=False``) are excluded from the gate —
         a SKIP or FAIL on an optional step does not block the overall
@@ -140,11 +155,40 @@ class BatteryReport:
         ``check_data_parity``, which has no data source wired yet) from
         making a full battery PASS permanently impossible.
         """
-        return all(
-            s.status == StepStatus.PASS
-            for s in self.steps
-            if s.required
-        )
+        required_steps = [s for s in self.steps if s.required]
+        if not required_steps:
+            return False
+        return all(s.status == StepStatus.PASS for s in required_steps)
+
+    def content_hash(self) -> str:
+        """SHA-256 digest of the canonical report content.
+
+        Provides a tamper-evident fingerprint of the report — consumers
+        can record this hash alongside any decision that relied on the
+        battery result, creating an auditable chain from "battery said
+        PASS" to "here is the exact report that said PASS".
+        """
+        canonical = {
+            "schema_version": self.report_schema_version,
+            "timestamp": self.timestamp,
+            "account_id": self.account_id,
+            "environment": self.environment,
+            "base_url": self.base_url,
+            "dry_run": self.dry_run,
+            "steps": [
+                {
+                    "name": s.name,
+                    "status": s.status.value,
+                    "detail": s.detail,
+                    "required": s.required,
+                    "data": s.data,
+                }
+                for s in self.steps
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(canonical, sort_keys=True, default=str).encode()
+        ).hexdigest()
 
     @property
     def summary(self) -> str:
@@ -252,45 +296,91 @@ def _validate_order_acceptance(
     expected_side: str,
     expected_tif: str,
     pair: str,
+    expected_order_type: str | None = None,
+    expected_asset_class: str | None = None,
 ) -> str | None:
     """Validate that a placed order's returned fields match the probe request.
 
     Returns ``None`` if the order looks correctly accepted, or a human-readable
     failure reason if any field is wrong.  This prevents treating a nonempty
     ``order_id`` as proof of acceptance when the order was actually rejected,
-    filled, expired, or has mismatched side/TIF.
+    filled, expired, or has mismatched side/TIF/type/asset-class.
+
+    **Strict validation**: unknown statuses, absent required fields, and
+    mismatched values are all rejected.  For side-effecting probes, only
+    known truly resting statuses (``accepted``, ``new``) are accepted.
     """
     order_id = result.get("order_id", "")
     if not order_id:
         return f"{pair}: order accepted but no order_id returned"
 
+    # ── status: require a known, truly resting status ──────────────────
     status = str(result.get("status", "")).strip().lower()
     if status in _REJECTED_OR_TERMINAL_STATUSES:
         return (
             f"{pair}: order {order_id} returned with terminal/rejected "
             f"status={status!r} (expected an accepted/resting status)"
         )
-    if status and status not in _ACCEPTED_ORDER_STATUSES:
-        # Unknown/pending status -- not necessarily wrong, but flag it.
-        logger.warning(
-            "battery: %s order %s has unexpected status %r (not in "
-            "accepted set %r); proceeding cautiously",
-            pair, order_id, status, _ACCEPTED_ORDER_STATUSES,
+    if status not in _ACCEPTED_ORDER_STATUSES:
+        # Unknown, pending, partially_filled, held, or empty — reject.
+        return (
+            f"{pair}: order {order_id} has unknown/unacceptable status "
+            f"{status!r} (accepted statuses: {sorted(_ACCEPTED_ORDER_STATUSES)})"
         )
 
+    # ── side: require present and matching ─────────────────────────────
     side = str(result.get("side", "") or result.get("action", "")).strip().upper()
-    if side and side != expected_side.upper():
+    if not side:
+        return (
+            f"{pair}: order {order_id} missing side field "
+            f"(expected {expected_side!r})"
+        )
+    if side != expected_side.upper():
         return (
             f"{pair}: order {order_id} side={side!r} does not match "
             f"requested side={expected_side!r}"
         )
 
+    # ── time_in_force: require present and matching ────────────────────
     tif = str(result.get("time_in_force", "")).strip().lower()
-    if tif and tif != expected_tif.lower():
+    if not tif:
+        return (
+            f"{pair}: order {order_id} missing time_in_force field "
+            f"(expected {expected_tif!r})"
+        )
+    if tif != expected_tif.lower():
         return (
             f"{pair}: order {order_id} time_in_force={tif!r} does not match "
             f"requested tif={expected_tif!r}"
         )
+
+    # ── order_type: validate if expected ───────────────────────────────
+    if expected_order_type is not None:
+        order_type = str(result.get("order_type", "")).strip().lower()
+        if not order_type:
+            return (
+                f"{pair}: order {order_id} missing order_type field "
+                f"(expected {expected_order_type!r})"
+            )
+        if order_type != expected_order_type.lower():
+            return (
+                f"{pair}: order {order_id} order_type={order_type!r} does not "
+                f"match requested type={expected_order_type!r}"
+            )
+
+    # ── asset_class: validate if expected ──────────────────────────────
+    if expected_asset_class is not None:
+        asset_class = str(result.get("asset_class", "")).strip().lower()
+        if not asset_class:
+            return (
+                f"{pair}: order {order_id} missing asset_class field "
+                f"(expected {expected_asset_class!r})"
+            )
+        if asset_class != expected_asset_class.lower():
+            return (
+                f"{pair}: order {order_id} asset_class={asset_class!r} does not "
+                f"match expected={expected_asset_class!r}"
+            )
 
     return None
 
@@ -348,6 +438,76 @@ def _confirm_cancel_with_evidence(
         failure = (
             f"{pair}: order {order_id} cancellation NOT confirmed "
             f"({reason}) -- order may still be resting/filled"
+        )
+        return False, failure
+
+    return True, None
+
+
+def _check_residual_exposure(
+    broker: AlpacaBroker,
+    order_id: str,
+    pair: str,
+    *,
+    order_details: dict[str, Any],
+) -> tuple[bool, str | None]:
+    """Query order final state and position to detect residual exposure.
+
+    Cancellation confirmation alone does not undo a fill — if the probe
+    order partially or fully filled before the cancel took effect, the
+    account has unintended exposure.  This method queries:
+
+    1. The order's final state (``filled_qty``, ``status``) via
+       :meth:`AlpacaBroker.get_order_state`.
+    2. The relevant position for ``pair`` via
+       :meth:`AlpacaBroker.get_position`.
+
+    Returns ``(True, None)`` if no residual exposure is detected, or
+    ``(False, failure_reason)`` with durable evidence in ``order_details``
+    if any nonzero fill or position exists.  A nonzero residual is a
+    Tier-1 failure — the probe created unintended market exposure.
+    """
+    # ── query order final state ────────────────────────────────────────
+    try:
+        order_state = broker.get_order_state(order_id)
+    except Exception as exc:
+        failure = (
+            f"{pair}: cannot query final state of order {order_id}: {exc}"
+        )
+        order_details["residual_check_error"] = str(exc)
+        return False, failure
+
+    filled_qty = float(order_state.get("filled_qty", 0.0) or 0.0)
+    final_status = order_state.get("status", "")
+    order_details["final_order_state"] = {
+        "status": final_status,
+        "filled_qty": filled_qty,
+        "filled_avg_price": order_state.get("filled_avg_price", 0.0),
+    }
+
+    if filled_qty > 0:
+        failure = (
+            f"{pair}: order {order_id} has residual fill "
+            f"(filled_qty={filled_qty}, status={final_status!r}) -- "
+            f"Tier-1 failure: cancellation did not undo the fill"
+        )
+        return False, failure
+
+    # ── query position ─────────────────────────────────────────────────
+    try:
+        position_qty = broker.get_position(pair)
+    except Exception as exc:
+        # Position lookup failure with zero fills is not Tier-1, but record it.
+        order_details["position_check_error"] = str(exc)
+        position_qty = 0.0
+
+    order_details["residual_position_qty"] = position_qty
+
+    if abs(position_qty) > 0:
+        failure = (
+            f"{pair}: nonzero residual position after probe "
+            f"(qty={position_qty}) -- Tier-1 failure: "
+            f"probe order may have created unintended exposure"
         )
         return False, failure
 
@@ -419,11 +579,14 @@ def check_gtc_order_acceptance(
             }
 
             # Validate the returned order matches our request — a nonempty
-            # order_id alone is NOT proof of acceptance (fix: review item #2).
+            # order_id alone is NOT proof of acceptance.  Require exact
+            # side/TIF/type/asset-class matches against what was submitted.
             validation_failure = _validate_order_acceptance(
                 result,
                 expected_side="BUY",
                 expected_tif="gtc",
+                expected_order_type="limit",
+                expected_asset_class="crypto",
                 pair=pair,
             )
             if validation_failure is not None:
@@ -450,9 +613,20 @@ def check_gtc_order_acceptance(
                     cancel_confirm_poll_interval_seconds=cancel_confirm_poll_interval_seconds,
                     order_details=order_details.setdefault(pair, {}),
                 )
+                # Residual exposure audit: even a confirmed cancel does
+                # not undo a fill that happened before the cancel took
+                # effect.  Query final order state + position.
+                clean, residual_failure = _check_residual_exposure(
+                    broker,
+                    order_id,
+                    pair,
+                    order_details=order_details.setdefault(pair, {}),
+                )
                 if placed and not cancel_ok:
                     failures.append(cancel_failure)  # type: ignore[arg-type]
-                elif placed and cancel_ok:
+                if not clean:
+                    failures.append(residual_failure)  # type: ignore[arg-type]
+                if placed and cancel_ok and clean:
                     placed_and_cancelled.append(pair)
 
     if failures:
@@ -487,19 +661,26 @@ def check_stop_limit_acceptance(
 ) -> StepResult:
     """Place and immediately cancel small GTC stop-limit BUY orders.
 
-    **METADATA/CAPABILITY CHECK** — this step validates that the broker
-    accepts the GTC stop-limit ORDER TYPE for each canary pair.  The probe
-    prices ($999,999,999 stop/limit) are deliberately implausible and
-    outside broker price bands; they prove the broker recognises the order
-    type, NOT that any particular stop/limit price will trigger or fill.
+    **NON-GATING CAPABILITY DIAGNOSTIC** (``required=False``) — this step
+    validates that the broker accepts the GTC stop-limit ORDER TYPE for
+    each canary pair.  The probe prices ($999,999,999 stop/limit) are
+    deliberately implausible and outside broker price bands; they prove the
+    broker recognises the order type, NOT that any particular stop/limit
+    price will trigger or fill.  A broker price-band rejection is
+    classified as a diagnostic failure, not a false capability proof.
     Empirical stop-limit execution quality is tested elsewhere (the
     production protective-stop path and its liveness checker).
 
+    Marked ``required=False`` because the implausible static probe prices
+    can fail due to broker price-band rules unrelated to actual stop-limit
+    readiness.  The step contributes evidence to the report but does not
+    block the battery's ``all_passed`` verdict.
+
     For each canary pair, places a GTC stop-limit BUY order at unreachable
     prices (stop far above market, so the stop never triggers), validates
-    the returned order status/side/TIF match the request, and then cancels
-    it -- CONFIRMING the cancellation actually reached a terminal
-    ``canceled`` state via
+    the returned order status/side/TIF/type/asset-class match the request,
+    and then cancels it -- CONFIRMING the cancellation actually reached a
+    terminal ``canceled`` state via
     :meth:`AlpacaBroker.wait_for_order_terminal_cancel` (same "confirm, don't
     assume" discipline Codex required on PR #31's
     ``replace_crypto_stop_limit``). BUY-side stop-limits avoid the need for a
@@ -540,15 +721,17 @@ def check_stop_limit_acceptance(
                 "qty": result.get("quantity", 0.0),
                 "stop_price": result.get("stop_price", 0.0),
                 "limit_price": result.get("limit_price", 0.0),
-                "check_type": "metadata_capability",
+                "check_type": "diagnostic_capability",
             }
 
-            # Validate the returned order matches our request — a nonempty
-            # order_id alone is NOT proof of acceptance (fix: review item #2).
+            # Validate the returned order matches our request — require
+            # exact side/TIF/type/asset-class matches.
             validation_failure = _validate_order_acceptance(
                 result,
                 expected_side="BUY",
                 expected_tif="gtc",
+                expected_order_type="stop_limit",
+                expected_asset_class="crypto",
                 pair=pair,
             )
             if validation_failure is not None:
@@ -570,9 +753,18 @@ def check_stop_limit_acceptance(
                     cancel_confirm_poll_interval_seconds=cancel_confirm_poll_interval_seconds,
                     order_details=order_details.setdefault(pair, {}),
                 )
+                # Residual exposure audit (same as GTC limit step).
+                clean, residual_failure = _check_residual_exposure(
+                    broker,
+                    order_id,
+                    pair,
+                    order_details=order_details.setdefault(pair, {}),
+                )
                 if placed and not cancel_ok:
                     failures.append(cancel_failure)  # type: ignore[arg-type]
-                elif placed and cancel_ok:
+                if not clean:
+                    failures.append(residual_failure)  # type: ignore[arg-type]
+                if placed and cancel_ok and clean:
                     placed_and_cancelled.append(pair)
 
     if failures:
@@ -580,10 +772,11 @@ def check_stop_limit_acceptance(
             name=name,
             status=StepStatus.FAIL,
             detail=(
-                f"{len(failures)}/{len(pairs)} stop-limit orders failed: "
-                f"{'; '.join(failures)}"
+                f"{len(failures)}/{len(pairs)} stop-limit orders failed "
+                f"(DIAGNOSTIC, non-gating): {'; '.join(failures)}"
             ),
-            data={"orders": order_details, "check_type": "metadata_capability"},
+            data={"orders": order_details, "check_type": "diagnostic_capability"},
+            required=False,
         )
     return StepResult(
         name=name,
@@ -591,11 +784,12 @@ def check_stop_limit_acceptance(
         detail=(
             f"{len(placed_and_cancelled)} GTC stop-limit BUY orders "
             f"placed+cancelled (cancellation confirmed) -- "
-            f"METADATA/CAPABILITY check (implausible probe prices, "
+            f"DIAGNOSTIC capability check (implausible probe prices, "
             f"not empirical fill proof): "
             f"{', '.join(placed_and_cancelled)}"
         ),
-        data={"orders": order_details, "check_type": "metadata_capability"},
+        data={"orders": order_details, "check_type": "diagnostic_capability"},
+        required=False,
     )
 
 
@@ -739,6 +933,7 @@ def run_full_battery(
     try:
         info = broker.get_account_info()
         account_id = info.get("account_id", "unknown")
+        base_url = str(info.get("base_url", "") or "")
         paper_flag = info.get("paper")
         if paper_flag is True:
             environment = "paper"
@@ -770,6 +965,7 @@ def run_full_battery(
             timestamp=timestamp,
             account_id=account_id,
             environment=environment,
+            base_url=base_url,
             dry_run=dry_run,
             steps=[
                 StepResult(
@@ -780,6 +976,38 @@ def run_full_battery(
                         f"battery requires verified paper environment, "
                         f"refusing to proceed"
                     ),
+                    data={
+                        "base_url": base_url,
+                        "account_id": account_id,
+                        "paper_flag": paper_flag,
+                    },
+                )
+            ],
+        )
+
+    # Cross-check: if paper=True but endpoint is the production URL,
+    # the configuration is inconsistent — reject.
+    if base_url and "paper" not in base_url.lower():
+        return BatteryReport(
+            timestamp=timestamp,
+            account_id=account_id,
+            environment="inconsistent",
+            base_url=base_url,
+            dry_run=dry_run,
+            steps=[
+                StepResult(
+                    name="environment_verification",
+                    status=StepStatus.FAIL,
+                    detail=(
+                        f"configuration inconsistency: paper={paper_flag!r} "
+                        f"but base_url={base_url!r} does not contain 'paper'; "
+                        f"refusing to proceed — verify broker endpoint"
+                    ),
+                    data={
+                        "base_url": base_url,
+                        "account_id": account_id,
+                        "paper_flag": paper_flag,
+                    },
                 )
             ],
         )
@@ -828,6 +1056,7 @@ def run_full_battery(
         account_id=account_id,
         environment=environment,
         dry_run=dry_run,
+        base_url=base_url,
         steps=steps,
     )
     logger.info("battery complete: %s", report.summary)
@@ -839,6 +1068,7 @@ __all__ = [
     "DEFAULT_CANCEL_CONFIRM_POLL_INTERVAL_SECONDS",
     "DEFAULT_CANCEL_CONFIRM_TIMEOUT_SECONDS",
     "DEFAULT_TEST_NOTIONAL_USD",
+    "REPORT_SCHEMA_VERSION",
     "BatteryReport",
     "StepResult",
     "StepStatus",

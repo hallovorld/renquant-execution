@@ -1255,6 +1255,9 @@ class AlpacaBroker(BaseBroker):
             "cash": float(getattr(account, "cash", 0.0) or 0.0),
             "portfolio_value": float(getattr(account, "portfolio_value", 0.0) or 0.0),
             "paper": self.paper,
+            "base_url": str(
+                getattr(self._require_client(), "_base_url", "") or ""
+            ),
         }
 
     def get_crypto_asset_spec(self, symbol: str) -> CryptoAssetSpec:
@@ -1325,6 +1328,7 @@ class AlpacaBroker(BaseBroker):
         result = _order_to_dict(order)
         result.update({
             "action": action_u,
+            "order_type": "limit",
             "quantity": float(submit_qty),
             "requested_quantity": float(qty),
             "limit_price": float(submit_price),
@@ -1411,6 +1415,7 @@ class AlpacaBroker(BaseBroker):
         result = _order_to_dict(order)
         result.update({
             "action": action_u,
+            "order_type": "stop_limit",
             "quantity": float(submit_qty),
             "requested_quantity": float(qty),
             "stop_price": float(submit_stop),
@@ -1424,6 +1429,20 @@ class AlpacaBroker(BaseBroker):
     def cancel_order(self, order_id: str) -> bool:
         self._require_client().cancel_order_by_id(order_id)
         return True
+
+    def get_order_state(self, order_id: str) -> dict[str, Any]:
+        """Query the current state of an order by ID.
+
+        Thin wrapper for the SDK's ``get_order_by_id`` that surfaces order
+        status, filled_qty, and related fields without the battery module
+        importing alpaca-py directly.  Primary consumer: the Stage-0
+        battery's residual-exposure audit after probe-order cancellation
+        (a confirmed cancel does not undo a fill that happened before the
+        cancel took effect).
+        """
+        client = self._require_client()
+        order = client.get_order_by_id(order_id)
+        return _order_to_dict(order)
 
     def is_market_open(self, symbol: str | None = None) -> bool:
         """Whether the market for ``symbol`` is open.

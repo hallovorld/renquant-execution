@@ -15,9 +15,11 @@ from renquant_execution.alpaca_broker import AlpacaBroker
 from renquant_execution.crypto import CryptoAssetSpec
 from renquant_execution.crypto_stage0_checks import (
     DEFAULT_CANARY_PAIRS,
+    REPORT_SCHEMA_VERSION,
     BatteryReport,
     StepResult,
     StepStatus,
+    _check_residual_exposure,
     _validate_order_acceptance,
     check_buying_power_behavior,
     check_crypto_account_status,
@@ -86,6 +88,8 @@ class _FakeTradingClient:
         account: Any | None = None,
         assets: dict[str, Any] | None = None,
         order_status_sequence: dict[str, list[str]] | None = None,
+        positions: dict[str, SimpleNamespace] | None = None,
+        base_url: str = "https://paper-api.alpaca.markets",
     ) -> None:
         self._account = account or _FakeAccount()
         self._assets = assets or {}
@@ -93,6 +97,8 @@ class _FakeTradingClient:
         self._order_status_sequence = {
             k: list(v) for k, v in (order_status_sequence or {}).items()
         }
+        self._positions: dict[str, SimpleNamespace] = dict(positions or {})
+        self._base_url = base_url
         self.submitted: list[Any] = []
         self.cancelled: list[str] = []
         self.get_order_by_id_calls: list[str] = []
@@ -104,6 +110,11 @@ class _FakeTradingClient:
         if symbol not in self._assets:
             raise RuntimeError(f"unknown asset {symbol}")
         return self._assets[symbol]
+
+    def get_open_position(self, symbol: str):
+        if symbol in self._positions:
+            return self._positions[symbol]
+        raise RuntimeError(f"position does not exist for {symbol}")
 
     def submit_order(self, order_data):
         self.submitted.append(order_data)
@@ -340,9 +351,10 @@ def test_stop_limit_acceptance_pass() -> None:
     assert len(client.submitted) == 3
     assert len(client.cancelled) == 3
     assert "stop-limit BUY" in result.detail
-    # Review item #3: labelled as metadata/capability check.
-    assert "METADATA/CAPABILITY" in result.detail
-    assert result.data["check_type"] == "metadata_capability"
+    # Review item #3: labelled as diagnostic capability check (non-gating).
+    assert "DIAGNOSTIC" in result.detail
+    assert result.data["check_type"] == "diagnostic_capability"
+    assert result.required is False
 
 
 def test_stop_limit_acceptance_fail_on_spec_lookup() -> None:
@@ -937,27 +949,29 @@ class TestUnverifiedEnvironment:
         )
 
 
-class TestStopLimitMetadataCapabilityLabel:
-    """Review item #3: stop-limit check is explicitly labelled as
-    metadata/capability, not a claim of empirical fill proof.
+class TestStopLimitDiagnosticCapabilityLabel:
+    """Review item #3: stop-limit check is a non-gating diagnostic
+    (required=False), not a capability proof.
     """
 
-    def test_pass_result_has_metadata_label(self) -> None:
+    def test_pass_result_has_diagnostic_label(self) -> None:
         assets = {BTC: _crypto_asset()}
         client = _FakeTradingClient(assets=assets)
         broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
         result = check_stop_limit_acceptance(broker, (BTC,))
         assert result.status == StepStatus.PASS
-        assert "METADATA/CAPABILITY" in result.detail
+        assert "DIAGNOSTIC" in result.detail
         assert "not empirical fill proof" in result.detail
-        assert result.data["check_type"] == "metadata_capability"
+        assert result.data["check_type"] == "diagnostic_capability"
+        assert result.required is False
 
-    def test_fail_result_has_metadata_label(self) -> None:
+    def test_fail_result_has_diagnostic_label(self) -> None:
         client = _FakeTradingClient(assets={})
         broker = _broker(client)
         result = check_stop_limit_acceptance(broker, (BTC,))
         assert result.status == StepStatus.FAIL
-        assert result.data["check_type"] == "metadata_capability"
+        assert result.data["check_type"] == "diagnostic_capability"
+        assert result.required is False
 
 
 class TestOptionalStepGating:
@@ -1005,3 +1019,445 @@ class TestOptionalStepGating:
             dry_run=False, steps=steps,
         )
         assert report.all_passed is True
+
+
+# ── review item #1 hardening: unknown/missing order fields ───────────────
+
+
+class TestUnknownMissingOrderFields:
+    """Unknown or missing order fields must cause rejection."""
+
+    def test_unknown_status_rejected(self) -> None:
+        """An unknown/pending status is NOT accepted."""
+        result = {
+            "order_id": "ord-1",
+            "status": "pending_new",
+            "side": "BUY",
+            "time_in_force": "gtc",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "unknown/unacceptable" in failure
+
+    def test_partially_filled_rejected(self) -> None:
+        """partially_filled is not a truly resting status — reject it."""
+        result = {
+            "order_id": "ord-1",
+            "status": "partially_filled",
+            "side": "BUY",
+            "time_in_force": "gtc",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "unknown/unacceptable" in failure
+
+    def test_held_status_rejected(self) -> None:
+        """held is ambiguous — reject it."""
+        result = {
+            "order_id": "ord-1",
+            "status": "held",
+            "side": "BUY",
+            "time_in_force": "gtc",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "unknown/unacceptable" in failure
+
+    def test_empty_status_rejected(self) -> None:
+        """Empty/absent status is rejected."""
+        result = {
+            "order_id": "ord-1",
+            "status": "",
+            "side": "BUY",
+            "time_in_force": "gtc",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+
+    def test_missing_side_rejected(self) -> None:
+        """Absent side field is rejected (not silently accepted)."""
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "",
+            "time_in_force": "gtc",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "missing side" in failure
+
+    def test_missing_tif_rejected(self) -> None:
+        """Absent time_in_force field is rejected."""
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "time_in_force": "",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "missing time_in_force" in failure
+
+
+# ── review item #1 hardening: wrong order type/asset class ───────────────
+
+
+class TestWrongOrderTypeAssetClass:
+    """Mismatch in order_type or asset_class must cause rejection."""
+
+    def test_wrong_order_type_rejected(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "time_in_force": "gtc",
+            "order_type": "market",
+            "asset_class": "crypto",
+        }
+        failure = _validate_order_acceptance(
+            result,
+            expected_side="BUY",
+            expected_tif="gtc",
+            expected_order_type="limit",
+            expected_asset_class="crypto",
+            pair=BTC,
+        )
+        assert failure is not None
+        assert "order_type=" in failure
+        assert "market" in failure
+
+    def test_missing_order_type_rejected(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "time_in_force": "gtc",
+            "order_type": "",
+            "asset_class": "crypto",
+        }
+        failure = _validate_order_acceptance(
+            result,
+            expected_side="BUY",
+            expected_tif="gtc",
+            expected_order_type="limit",
+            expected_asset_class="crypto",
+            pair=BTC,
+        )
+        assert failure is not None
+        assert "missing order_type" in failure
+
+    def test_wrong_asset_class_rejected(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "time_in_force": "gtc",
+            "order_type": "limit",
+            "asset_class": "us_equity",
+        }
+        failure = _validate_order_acceptance(
+            result,
+            expected_side="BUY",
+            expected_tif="gtc",
+            expected_order_type="limit",
+            expected_asset_class="crypto",
+            pair=BTC,
+        )
+        assert failure is not None
+        assert "asset_class=" in failure
+        assert "us_equity" in failure
+
+    def test_missing_asset_class_rejected(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "time_in_force": "gtc",
+            "order_type": "limit",
+            "asset_class": "",
+        }
+        failure = _validate_order_acceptance(
+            result,
+            expected_side="BUY",
+            expected_tif="gtc",
+            expected_order_type="limit",
+            expected_asset_class="crypto",
+            pair=BTC,
+        )
+        assert failure is not None
+        assert "missing asset_class" in failure
+
+    def test_correct_type_and_class_pass(self) -> None:
+        """When all fields match including order_type and asset_class, pass."""
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "time_in_force": "gtc",
+            "order_type": "limit",
+            "asset_class": "crypto",
+        }
+        failure = _validate_order_acceptance(
+            result,
+            expected_side="BUY",
+            expected_tif="gtc",
+            expected_order_type="limit",
+            expected_asset_class="crypto",
+            pair=BTC,
+        )
+        assert failure is None
+
+
+# ── review item #2: residual position/order audit ────────────────────────
+
+
+class TestResidualExposureAudit:
+    """Partial fill + confirmed cancel with residual position is Tier-1."""
+
+    def test_clean_probe_no_residual(self) -> None:
+        """No fills, no position — residual check passes."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        order_details: dict[str, Any] = {}
+        clean, failure = _check_residual_exposure(
+            broker, "ord-1", BTC, order_details=order_details,
+        )
+        assert clean is True
+        assert failure is None
+        assert order_details["final_order_state"]["filled_qty"] == 0.0
+        assert order_details["residual_position_qty"] == 0.0
+
+    def test_partial_fill_detected(self) -> None:
+        """Order with filled_qty > 0 is a Tier-1 failure."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        # Simulate partial fill on the order
+        order = SimpleNamespace(
+            id="ord-1", status="canceled", qty=1.0,
+            filled_qty=0.05, filled_avg_price=65000.0,
+            side="BUY", symbol=BTC,
+            created_at="", submitted_at="", filled_at="",
+        )
+        client._orders_by_id["ord-1"] = order
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        order_details: dict[str, Any] = {}
+        clean, failure = _check_residual_exposure(
+            broker, "ord-1", BTC, order_details=order_details,
+        )
+        assert clean is False
+        assert failure is not None
+        assert "residual fill" in failure
+        assert "Tier-1" in failure
+        assert "filled_qty=0.05" in failure
+
+    def test_residual_position_detected(self) -> None:
+        """Nonzero position after probe is a Tier-1 failure."""
+        assets = {BTC: _crypto_asset()}
+        # Set up a position that exists for BTC/USD
+        positions = {BTC: SimpleNamespace(qty=0.001)}
+        client = _FakeTradingClient(assets=assets, positions=positions)
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        order_details: dict[str, Any] = {}
+        clean, failure = _check_residual_exposure(
+            broker, "ord-1", BTC, order_details=order_details,
+        )
+        assert clean is False
+        assert failure is not None
+        assert "residual position" in failure
+        assert "Tier-1" in failure
+
+    def test_partial_fill_with_cancel_is_step_fail(self) -> None:
+        """GTC acceptance step fails when cancel succeeds but order filled."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        # Override submit_order to produce an order that will show fills
+        original_submit = client.submit_order
+
+        def _submit_with_fill(order_data):
+            order = original_submit(order_data)
+            # After submission, set filled_qty on the order so
+            # get_order_by_id returns it with a fill.
+            order.filled_qty = 0.01
+            return order
+
+        client.submit_order = _submit_with_fill
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert "residual fill" in result.detail or "Tier-1" in result.detail
+
+
+# ── review item #3: price-band rejection as diagnostic ───────────────────
+
+
+class TestPriceBandRejectionDiagnostic:
+    """Price-band rejection on stop-limit is classified as diagnostic
+    (non-gating) rather than a false capability failure.
+    """
+
+    def test_price_band_rejection_does_not_block_battery(self) -> None:
+        """A stop-limit failure due to price bands doesn't block all_passed."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        # Make stop-limit submission raise (simulating broker price-band rejection)
+        original_submit = client.submit_order
+
+        def _reject_stop_limit(order_data):
+            raise RuntimeError("price outside allowed band")
+
+        client.submit_order = _reject_stop_limit
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_stop_limit_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert result.required is False  # non-gating diagnostic
+        # The battery should still pass if all required steps pass.
+        steps = [
+            StepResult(name="a", status=StepStatus.PASS, detail="ok", required=True),
+            result,  # FAIL but required=False
+        ]
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps,
+        )
+        assert report.all_passed is True
+
+
+# ── review item #4: environment / base_url verification ──────────────────
+
+
+class TestEnvironmentBaseUrlVerification:
+    """Base URL must be consistent with paper flag; exposed in report."""
+
+    def test_paper_url_passes(self) -> None:
+        """Paper flag + paper URL = consistent, passes."""
+        broker = _broker(crypto_asset_specs=SPECS)
+        report = run_full_battery(broker, dry_run=True)
+        assert report.base_url == "https://paper-api.alpaca.markets"
+        assert report.environment == "paper"
+
+    def test_production_url_with_paper_flag_fails(self) -> None:
+        """Paper flag + production URL = inconsistent, FAIL."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(
+            assets=assets,
+            base_url="https://api.alpaca.markets",
+        )
+        broker = _broker(client, crypto_asset_specs=SPECS)
+        report = run_full_battery(broker, dry_run=True)
+        assert report.environment == "inconsistent"
+        assert report.all_passed is False
+        assert any(
+            s.name == "environment_verification"
+            and s.status == StepStatus.FAIL
+            and "inconsistency" in s.detail
+            for s in report.steps
+        )
+
+    def test_base_url_in_report(self) -> None:
+        """base_url is an immutable report field."""
+        broker = _broker(crypto_asset_specs=SPECS)
+        report = run_full_battery(broker, dry_run=True)
+        assert hasattr(report, "base_url")
+        assert report.base_url == "https://paper-api.alpaca.markets"
+
+    def test_account_id_in_report(self) -> None:
+        """account_id is an immutable report field."""
+        broker = _broker(crypto_asset_specs=SPECS)
+        report = run_full_battery(broker, dry_run=True)
+        assert report.account_id == "PA-FAKE-001"
+
+
+# ── review item #5: nonempty required-gate set + schema/hash ─────────────
+
+
+class TestNonemptyRequiredGateSet:
+    """all_passed must require a nonempty required-gate set."""
+
+    def test_empty_steps_is_not_passed(self) -> None:
+        """No steps at all — all_passed is False (vacuous truth rejected)."""
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=[],
+        )
+        assert report.all_passed is False
+
+    def test_only_optional_steps_is_not_passed(self) -> None:
+        """Only optional steps (all PASS) — all_passed is False."""
+        steps = [
+            StepResult(
+                name="a", status=StepStatus.PASS, detail="ok", required=False,
+            ),
+            StepResult(
+                name="b", status=StepStatus.PASS, detail="ok", required=False,
+            ),
+        ]
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps,
+        )
+        assert report.all_passed is False
+
+
+class TestReportSchemaVersionAndHash:
+    """Report carries schema version and content hash."""
+
+    def test_report_schema_version_present(self) -> None:
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False,
+        )
+        assert report.report_schema_version == REPORT_SCHEMA_VERSION
+        assert report.report_schema_version == "1.0.0"
+
+    def test_content_hash_is_sha256(self) -> None:
+        """content_hash returns a 64-char hex SHA-256 digest."""
+        steps = [
+            StepResult(name="a", status=StepStatus.PASS, detail="ok"),
+        ]
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps,
+        )
+        h = report.content_hash()
+        assert isinstance(h, str)
+        assert len(h) == 64
+        # Must be valid hex.
+        int(h, 16)
+
+    def test_content_hash_deterministic(self) -> None:
+        """Same report produces the same hash."""
+        steps = [
+            StepResult(name="a", status=StepStatus.PASS, detail="ok"),
+        ]
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps,
+        )
+        assert report.content_hash() == report.content_hash()
+
+    def test_content_hash_changes_on_different_data(self) -> None:
+        """Different step data produces a different hash."""
+        steps1 = [StepResult(name="a", status=StepStatus.PASS, detail="ok")]
+        steps2 = [StepResult(name="a", status=StepStatus.FAIL, detail="bad")]
+        r1 = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps1,
+        )
+        r2 = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps2,
+        )
+        assert r1.content_hash() != r2.content_hash()
