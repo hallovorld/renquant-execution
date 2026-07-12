@@ -32,8 +32,15 @@ Ownership split (unchanged by this port):
 
 Cross-repo dependency direction: this module depends on
 ``renquant_pipeline.software_stops`` for registry parsing/staleness math.
-That import is DEFERRED (module-level import would drag in
-``renquant_pipeline``'s full package ``__init__`` — cvxpy,
+Schema validation specifically goes through pipeline's PUBLIC, versioned
+``validate_software_stop_snapshot()`` contract (software-stops-v1) — not
+the module's private ``_validate_snapshot`` — per the Codex review on
+this exact chain (renquant-execution#30, 2026-07-12T11:57:53Z): "The
+schema is pipeline-owned... orchestrator -> execution public CLI ->
+pipeline public schema API; no consumer reaches through a private
+boundary." See renquant-pipeline#192 (round 8) for the contract this
+module now consumes. That import is DEFERRED (module-level import would
+drag in ``renquant_pipeline``'s full package ``__init__`` — cvxpy,
 renquant-base-data, renquant-artifacts — the same lazy-import discipline
 this repo already applies to optional heavy deps like ``alpaca-py``, see
 ``igv_short_monitor.get_market()``). See ``_pipeline_stops_api()`` below.
@@ -127,17 +134,27 @@ class _PipelineStopsAPI(NamedTuple):
 
 def _pipeline_stops_api() -> _PipelineStopsAPI:
     """Deferred import of the pipeline's registry module (see module
-    docstring for why this is lazy, not top-level)."""
+    docstring for why this is lazy, not top-level).
+
+    Schema validation is bound to pipeline's PUBLIC
+    ``validate_software_stop_snapshot`` contract, not the private
+    ``_validate_snapshot`` — see the module docstring's cross-repo
+    dependency paragraph and renquant-pipeline#192 (round 8, Codex review
+    on renquant-execution#30, 2026-07-12T11:57:53Z). This deferred import
+    only succeeds once that pipeline PR has merged to the pinned
+    ``renquant_pipeline`` checkout; until then it raises ImportError,
+    which is the correct, expected state for an as-yet-unmerged public
+    contract dependency (not a bug to work around with a fallback)."""
     from renquant_pipeline.software_stops import (  # noqa: PLC0415
         DEFAULT_REGISTRY_PATH,
-        _validate_snapshot,
         compute_staleness,
         registry_path_for,
+        validate_software_stop_snapshot,
     )
 
     return _PipelineStopsAPI(
         default_registry_path=DEFAULT_REGISTRY_PATH,
-        validate_snapshot=_validate_snapshot,
+        validate_snapshot=validate_software_stop_snapshot,
         compute_staleness=compute_staleness,
         registry_path_for=registry_path_for,
     )

@@ -20,8 +20,9 @@ What is (and is not) covered hermetically:
     pipeline's OWN staleness arithmetic is unit-tested in ITS repo
     (``renquant-pipeline/tests/test_software_stops.py``); this suite does
     not re-test it, only the contract this module depends on
-    (``compute_staleness`` / ``_validate_snapshot`` / ``registry_path_for``
-    / ``DEFAULT_REGISTRY_PATH``).
+    (``compute_staleness`` / ``validate_software_stop_snapshot`` (public,
+    round 8 — see renquant-pipeline#192) / ``registry_path_for`` /
+    ``DEFAULT_REGISTRY_PATH``).
   * Market-session gating: covered against the REAL
     ``renquant_common.market_calendar`` (an existing, already-declared,
     cheap dependency of this repo) by monkeypatching its
