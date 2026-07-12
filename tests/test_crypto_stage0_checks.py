@@ -18,6 +18,7 @@ from renquant_execution.crypto_stage0_checks import (
     BatteryReport,
     StepResult,
     StepStatus,
+    _validate_order_acceptance,
     check_buying_power_behavior,
     check_crypto_account_status,
     check_data_parity,
@@ -339,6 +340,9 @@ def test_stop_limit_acceptance_pass() -> None:
     assert len(client.submitted) == 3
     assert len(client.cancelled) == 3
     assert "stop-limit BUY" in result.detail
+    # Review item #3: labelled as metadata/capability check.
+    assert "METADATA/CAPABILITY" in result.detail
+    assert result.data["check_type"] == "metadata_capability"
 
 
 def test_stop_limit_acceptance_fail_on_spec_lookup() -> None:
@@ -380,17 +384,26 @@ def test_stop_limit_acceptance_fails_when_cancellation_not_confirmed() -> None:
 def test_buying_power_pass() -> None:
     result = check_buying_power_behavior(_broker())
     assert result.status == StepStatus.PASS
+    assert "OBSERVATIONAL" in result.detail
     assert "non_marginable_buying_power=100000.0" in result.detail
+    assert result.data["check_type"] == "observational"
 
 
-def test_buying_power_fail_when_nmbp_zero() -> None:
+def test_buying_power_observational_reports_nmbp_zero() -> None:
+    """Buying-power check is OBSERVATIONAL — it always reports PASS with the
+    values for operator inspection, even when NMBP is zero.  It does not
+    gate on the crypto non-marginable invariant (review item #6).
+    """
     acct = _FakeAccount()
     acct.non_marginable_buying_power = 0.0
     acct.cash = 50_000.0
     client = _FakeTradingClient(account=acct)
     result = check_buying_power_behavior(_broker(client))
-    assert result.status == StepStatus.FAIL
-    assert "misconfigured" in result.detail
+    assert result.status == StepStatus.PASS
+    assert "OBSERVATIONAL" in result.detail
+    assert result.data["check_type"] == "observational"
+    assert result.data["non_marginable_buying_power"] == 0.0
+    assert result.data["cash"] == 50_000.0
 
 
 # ── check_data_parity ──────────────────────────────────────────────────────
@@ -401,6 +414,8 @@ def test_data_parity_skips_with_reason() -> None:
     assert result.status == StepStatus.SKIP
     assert "placeholder" in result.detail
     assert result.data["reason"] == "no_data_source"
+    # Review item #5: data_parity is optional so it doesn't block all_passed.
+    assert result.required is False
 
 
 # ── run_full_battery ────────────────────────────────────────────────────────
@@ -467,17 +482,26 @@ def test_full_battery_summary_format() -> None:
 
 
 def test_battery_report_all_passed_property() -> None:
+    """all_passed is True when all REQUIRED steps PASS.  data_parity is
+    optional (required=False), so its structural SKIP does not block
+    the overall battery verdict (review item #5).
+    """
     broker = _broker(crypto_asset_specs=SPECS)
     assets = {BTC: _crypto_asset(), ETH: _crypto_asset(), SOL: _crypto_asset()}
     client = _FakeTradingClient(assets=assets)
     broker._trading_client = client  # noqa: SLF001
     report = run_full_battery(broker, dry_run=False)
-    # data_parity is SKIP, so all_passed is False.
-    assert report.all_passed is False
+    # data_parity is SKIP but required=False, so all_passed is True.
+    assert report.all_passed is True
 
-    # If we filter to only non-SKIP steps, they should all be PASS.
-    non_skip = [s for s in report.steps if s.status != StepStatus.SKIP]
-    assert all(s.status == StepStatus.PASS for s in non_skip)
+    # Verify data_parity is optional and SKIP.
+    dp = next(s for s in report.steps if s.name == "data_parity")
+    assert dp.status == StepStatus.SKIP
+    assert dp.required is False
+
+    # All required steps should be PASS.
+    required = [s for s in report.steps if s.required]
+    assert all(s.status == StepStatus.PASS for s in required)
 
 
 # ── broker thin-wrapper unit tests ──────────────────────────────────────────
@@ -561,3 +585,423 @@ def test_place_crypto_stop_limit_order_rejects_equity() -> None:
     broker = _broker()
     with pytest.raises(ValueError, match="crypto-only"):
         broker.place_crypto_stop_limit_order("AAPL", "BUY", 1.0, 100.0, 101.0)
+
+
+# ── adversarial tests (review items #1-#6) ────────────────────────────────
+
+
+class TestCancelSucceedsButNeverReachesTerminal:
+    """Review item #1: cancel succeeds (no exception) but terminal state
+    never reaches ``canceled`` within the timeout — the step must FAIL,
+    not silently PASS.
+    """
+
+    def test_gtc_cancel_accepted_but_stays_resting(self) -> None:
+        """Cancel request is accepted but the order stays 'accepted' forever."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(
+            assets=assets,
+            order_status_sequence={"ord-1": ["accepted"]},
+        )
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(
+            broker, (BTC,),
+            cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+            cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+        )
+        assert result.status == StepStatus.FAIL
+        assert "NOT confirmed" in result.detail
+        assert result.data["orders"][BTC]["cancel_confirmed"] is False
+
+    def test_stop_limit_cancel_accepted_but_stays_resting(self) -> None:
+        """Same for stop-limit: order stays resting after cancel request."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(
+            assets=assets,
+            order_status_sequence={"ord-1": ["accepted"]},
+        )
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_stop_limit_acceptance(
+            broker, (BTC,),
+            cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+            cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+        )
+        assert result.status == StepStatus.FAIL
+        assert "NOT confirmed" in result.detail
+
+    def test_cancel_raises_but_poll_finds_canceled(self) -> None:
+        """Cancel raises but the order reaches canceled anyway — should PASS.
+
+        Review item #1 fix: always poll even after cancel_order raises.
+        """
+        assets = {BTC: _crypto_asset()}
+        # After cancel_order raises, polling finds the order canceled.
+        client = _FakeTradingClient(
+            assets=assets,
+            order_status_sequence={"ord-1": ["canceled"]},
+        )
+        # Make cancel_order raise.
+        original_cancel = client.cancel_order_by_id
+
+        def _raise_on_cancel(order_id: str) -> None:
+            original_cancel(order_id)
+            raise RuntimeError("cancel request failed (network)")
+
+        client.cancel_order_by_id = _raise_on_cancel
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(
+            broker, (BTC,),
+            cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+            cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+        )
+        # Despite cancel raising, the poll found canceled — PASS.
+        assert result.status == StepStatus.PASS
+        assert result.data["orders"][BTC]["cancel_confirmed"] is True
+        assert "cancel_exception" in result.data["orders"][BTC]
+
+
+class TestImmediateFillOnProbeOrder:
+    """Review item #2: if the probe order fills immediately (should never
+    happen at $0.01 limit, but adversarial), the step must FAIL because
+    a filled order is terminal-but-not-canceled.
+    """
+
+    def test_gtc_immediate_fill_is_fail(self) -> None:
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        # Override submit_order to return 'filled' status.
+        original_submit = client.submit_order
+
+        def _fill_immediately(order_data):
+            order = original_submit(order_data)
+            order.status = "filled"
+            order.filled_qty = float(getattr(order_data, "qty", 0.0) or 0.0)
+            return order
+
+        client.submit_order = _fill_immediately
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(
+            broker, (BTC,),
+            cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+            cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+        )
+        assert result.status == StepStatus.FAIL
+        # Should fail on the validation of the returned status.
+        assert "terminal/rejected" in result.detail or "NOT confirmed" in result.detail
+
+    def test_stop_limit_immediate_fill_is_fail(self) -> None:
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        original_submit = client.submit_order
+
+        def _fill_immediately(order_data):
+            order = original_submit(order_data)
+            order.status = "filled"
+            return order
+
+        client.submit_order = _fill_immediately
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_stop_limit_acceptance(
+            broker, (BTC,),
+            cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+            cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+        )
+        assert result.status == StepStatus.FAIL
+        assert "terminal/rejected" in result.detail or "NOT confirmed" in result.detail
+
+
+class TestReturnedRejectionOrNoOrder:
+    """Review item #2: if the broker returns a rejected status or missing
+    order_id, the step must FAIL.
+    """
+
+    def test_gtc_rejected_status_is_fail(self) -> None:
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        original_submit = client.submit_order
+
+        def _reject(order_data):
+            order = original_submit(order_data)
+            order.status = "rejected"
+            return order
+
+        client.submit_order = _reject
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert "terminal/rejected" in result.detail
+
+    def test_gtc_expired_status_is_fail(self) -> None:
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        original_submit = client.submit_order
+
+        def _expire(order_data):
+            order = original_submit(order_data)
+            order.status = "expired"
+            return order
+
+        client.submit_order = _expire
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert "terminal/rejected" in result.detail
+
+    def test_gtc_no_order_id_is_fail(self) -> None:
+        """submit_order returns an order with empty id."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        original_submit = client.submit_order
+
+        def _no_id(order_data):
+            order = original_submit(order_data)
+            order.id = ""
+            return order
+
+        client.submit_order = _no_id
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert "no order_id" in result.detail
+
+    def test_gtc_wrong_side_is_fail(self) -> None:
+        """Broker returns a SELL order when we requested BUY."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        original_submit = client.submit_order
+
+        def _wrong_side(order_data):
+            order = original_submit(order_data)
+            order.side = "SELL"
+            return order
+
+        client.submit_order = _wrong_side
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert "side=" in result.detail
+
+
+class TestValidateOrderAcceptance:
+    """Direct unit tests for _validate_order_acceptance (review item #2)."""
+
+    def test_accepted_order_passes(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "time_in_force": "gtc",
+        }
+        assert _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        ) is None
+
+    def test_new_status_passes(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "new",
+            "side": "BUY",
+            "time_in_force": "gtc",
+        }
+        assert _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        ) is None
+
+    def test_rejected_status_fails(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "rejected",
+            "side": "BUY",
+            "time_in_force": "gtc",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "terminal/rejected" in failure
+
+    def test_filled_status_fails(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "filled",
+            "side": "BUY",
+            "time_in_force": "gtc",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "terminal/rejected" in failure
+
+    def test_empty_order_id_fails(self) -> None:
+        result = {"order_id": "", "status": "accepted"}
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "no order_id" in failure
+
+    def test_wrong_side_fails(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "SELL",
+            "time_in_force": "gtc",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "side=" in failure
+
+    def test_wrong_tif_fails(self) -> None:
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "time_in_force": "day",
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "time_in_force=" in failure
+
+
+class TestUnverifiedEnvironment:
+    """Review item #4: failed or unknown environment must be FAIL, never
+    silently default to paper.
+    """
+
+    def test_failed_account_lookup_is_fail(self) -> None:
+        """get_account_info() raises — battery should FAIL, not default paper."""
+        broker = AlpacaBroker(paper=True, label="test-env-fail")
+        # Not connected, so get_account_info will raise.
+        # But _assert_paper_mode checks broker.paper attribute directly.
+        # We need a broker whose paper=True but get_account_info fails.
+        broker._trading_client = None  # noqa: SLF001
+        # _assert_paper_mode will pass (paper=True), but get_account_info
+        # will raise RuntimeError("AlpacaBroker is not connected").
+        report = run_full_battery(broker, dry_run=True)
+        assert report.environment == "unknown"
+        assert report.all_passed is False
+        assert any(
+            s.name == "environment_verification" and s.status == StepStatus.FAIL
+            for s in report.steps
+        )
+
+    def test_unknown_paper_flag_is_fail(self) -> None:
+        """Paper flag is None/missing — battery should FAIL, not default."""
+        acct = _FakeAccount()
+        client = _FakeTradingClient(account=acct)
+        broker = _broker(client, crypto_asset_specs=SPECS)
+        # Monkey-patch paper to a non-bool.
+        broker._paper = None  # noqa: SLF001
+
+        # Override get_account_info to return paper=None.
+        original_get = broker.get_account_info
+
+        def _no_paper_flag():
+            info = original_get()
+            info["paper"] = None
+            return info
+
+        broker.get_account_info = _no_paper_flag
+        report = run_full_battery(broker, dry_run=True)
+        assert report.environment == "unknown"
+        assert report.all_passed is False
+        assert any(
+            s.name == "environment_verification" and s.status == StepStatus.FAIL
+            for s in report.steps
+        )
+
+    def test_live_environment_reported_is_fail(self) -> None:
+        """Paper flag is False — battery should refuse to proceed."""
+        acct = _FakeAccount()
+        client = _FakeTradingClient(account=acct)
+        broker = _broker(client, crypto_asset_specs=SPECS)
+
+        original_get = broker.get_account_info
+
+        def _live_env():
+            info = original_get()
+            info["paper"] = False
+            return info
+
+        broker.get_account_info = _live_env
+        report = run_full_battery(broker, dry_run=True)
+        assert report.environment == "live"
+        assert report.all_passed is False
+        assert any(
+            s.name == "environment_verification" for s in report.steps
+        )
+
+
+class TestStopLimitMetadataCapabilityLabel:
+    """Review item #3: stop-limit check is explicitly labelled as
+    metadata/capability, not a claim of empirical fill proof.
+    """
+
+    def test_pass_result_has_metadata_label(self) -> None:
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_stop_limit_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.PASS
+        assert "METADATA/CAPABILITY" in result.detail
+        assert "not empirical fill proof" in result.detail
+        assert result.data["check_type"] == "metadata_capability"
+
+    def test_fail_result_has_metadata_label(self) -> None:
+        client = _FakeTradingClient(assets={})
+        broker = _broker(client)
+        result = check_stop_limit_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert result.data["check_type"] == "metadata_capability"
+
+
+class TestOptionalStepGating:
+    """Review item #5: optional steps (required=False) don't block
+    all_passed.
+    """
+
+    def test_all_passed_with_optional_skip(self) -> None:
+        """A report with all required=PASS and one optional=SKIP passes."""
+        steps = [
+            StepResult(name="a", status=StepStatus.PASS, detail="ok", required=True),
+            StepResult(name="b", status=StepStatus.PASS, detail="ok", required=True),
+            StepResult(
+                name="c", status=StepStatus.SKIP, detail="skip", required=False,
+            ),
+        ]
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps,
+        )
+        assert report.all_passed is True
+
+    def test_all_passed_fails_when_required_fails(self) -> None:
+        steps = [
+            StepResult(name="a", status=StepStatus.PASS, detail="ok", required=True),
+            StepResult(name="b", status=StepStatus.FAIL, detail="bad", required=True),
+            StepResult(
+                name="c", status=StepStatus.SKIP, detail="skip", required=False,
+            ),
+        ]
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps,
+        )
+        assert report.all_passed is False
+
+    def test_all_passed_ignores_optional_fail(self) -> None:
+        """An optional step that FAILs doesn't block the battery."""
+        steps = [
+            StepResult(name="a", status=StepStatus.PASS, detail="ok", required=True),
+            StepResult(name="b", status=StepStatus.FAIL, detail="bad", required=False),
+        ]
+        report = BatteryReport(
+            timestamp="t", account_id="x", environment="paper",
+            dry_run=False, steps=steps,
+        )
+        assert report.all_passed is True
