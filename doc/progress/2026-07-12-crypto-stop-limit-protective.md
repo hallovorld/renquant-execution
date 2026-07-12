@@ -29,3 +29,102 @@ check that verifies every crypto position has a resting protective stop.
 
 - 72 tests pass (7 new) `[VERIFIED]`
 - 379 total execution tests pass, 1 skipped `[VERIFIED]`
+
+## Revision note (2026-07-12, post-Codex CHANGES_REQUESTED)
+
+Codex (haorensjtu-dev) left a blocking review on this PR
+(2026-07-12T21:33:31Z) with 5 findings against the original
+`check_crypto_stop_coverage` / `replace_crypto_stop_limit`. Quoting/closely
+paraphrasing each, and the fix applied:
+
+1. **"lines 906-911 check only order_type and side. An IOC/DAY/non-GTC
+   stop-limit is counted as coverage. Require time_in_force == gtc, valid
+   positive stop and limit prices, and a broker status that is genuinely
+   resting."** — `check_crypto_stop_coverage` now requires a "qualifying"
+   stop to pass ALL of: `order_type == "stop_limit"`, `side == "SELL"`,
+   `time_in_force == "gtc"` (case-insensitive), `stop_price > 0`,
+   `limit_price > 0`, AND a genuinely resting broker status (new
+   `_is_resting_order_status`: excludes anything containing `"pending"`,
+   requires `"new"`/`"accepted"`/`"held"` — `QueryOrderStatus.OPEN` still
+   reports `pending_cancel`/`pending_replace`/`pending_new` as "open", none
+   of which is a live, triggerable stop). New `violation_kind` of
+   `"non_resting_ignored"` distinguishes "a stop order exists but isn't
+   resting right now" from a true `"uncovered"`.
+
+2. **"Summing all stop SELL quantities can declare a position covered by
+   multiple independently executable stops... Coverage must model
+   reservations explicitly: require one authoritative protective order per
+   position... fail closed on duplicate competing stops."** —
+   `check_crypto_stop_coverage` now COUNTS qualifying stops per symbol
+   instead of summing quantities: 0 → `"uncovered"`/`"non_resting_ignored"`,
+   exactly 1 with sufficient qty → covered, exactly 1 short → `"partial"`,
+   **2 or more → `"duplicate"`** (fail-closed; the summed quantity is never
+   treated as safe, even if it numerically exceeds the held quantity).
+
+3. **"replace_crypto_stop_limit cancels then immediately submits a
+   replacement without confirming cancellation... Poll/verify the terminal
+   cancellation state before replacement and return a structured, durable
+   Tier-1 unprotected result if cancellation or replacement cannot be
+   confirmed."** — new private `_wait_for_order_terminal_cancel(order_id, *,
+   timeout_seconds=5.0, poll_interval_seconds=0.25)` polls
+   `client.get_order_by_id` until a confirmed terminal `canceled` status or
+   timeout. `replace_crypto_stop_limit` now: cancels → confirms via the
+   poller → only then places the replacement. Judgment call: 5.0s
+   timeout / 0.25s poll interval, chosen as "ample margin for a sub-second
+   paper/live cancel ack without stalling the caller noticeably" — both are
+   overridable keyword args on `replace_crypto_stop_limit` itself, not
+   hardcoded.
+
+4. **"The cancel-then-replace gap is only described in a docstring. The
+   adapter must emit an auditable state/incident that upstream orchestration
+   can consume... A plain no-submit/exception is insufficient because
+   callers can forget to interpret it."** — `replace_crypto_stop_limit` now
+   returns a discriminated dict: `{"protected": bool, "status": "replaced" |
+   "cancel_unconfirmed" | "unprotected_after_cancel", "old_order_id",
+   "new_order_id", "unprotected_reason", "reason", ...}` (plus
+   `place_crypto_stop_limit`'s own fields on success). On both failure
+   statuses it ALSO emits a `RuntimeWarning` (this file's existing
+   fail-closed convention, matching `_no_submit_result`), so a caller
+   watching only warnings/logs still notices. Docstring states explicitly:
+   the real "upstream orchestration blocks new entries + pages the owner"
+   wiring is `check_crypto_stop_coverage()` — a failed replace leaves that
+   symbol uncovered, so the orchestrator scheduler's next
+   `check_crypto_stop_coverage()` call (PR #497, fixed in parallel)
+   independently re-discovers it — a second, independent layer beyond this
+   function's own return value.
+
+5. **"Use the pair's min_trade_increment, rather than a generic
+   equity-oriented epsilon, when comparing held and covered crypto
+   quantities."** — the covered-vs-held comparison now resolves
+   `self._resolve_crypto_spec(symbol)` and uses `spec.min_trade_increment`
+   as the tolerance instead of `QTY_INTEGRAL_EPS`. If the spec lookup fails
+   for a symbol, that symbol is a violation (new `violation_kind`
+   `"spec_lookup_failed"`) — never a silent fallback to the equity epsilon
+   or a skip.
+
+**Also found and fixed in the same pass (not one of the 5 numbered
+findings, but directly undermines them):** `get_open_orders_detailed`'s
+`order_type`/`time_in_force` fields (and `_order_to_dict`'s `side`/`status`
+fields it inherits) were extracted via a naive `str(getattr(order, ...))`
+cast. `[VERIFIED alpaca-py 0.43.4]`: a real SDK `Order`'s enum fields
+stringify via plain `str()` to `"ClassName.MEMBER"` (`Enum.__str__`), NOT the
+lowercase wire value (e.g. `str(OrderStatus.ACCEPTED) ==
+"OrderStatus.ACCEPTED"`, but `.value == "accepted"`) — only the test-double
+`SimpleNamespace` fixtures (plain strings) masked this. Left as-is, EVERY
+qualifying-stop check in this PR would have silently never matched a real
+broker response (permanent 100% false "uncovered", not a safety hazard in
+direction but a total functional no-op in production). Fixed by having
+`get_open_orders_detailed` re-derive `status`/`side`/`order_type`/
+`time_in_force` via the same safe `getattr(x, "value", x)` idiom
+`_order_matches_asset_class` already used for `asset_class` (new
+`_enum_value` helper). Covered by
+`test_get_open_orders_detailed_normalizes_sdk_enum_like_fields`.
+
+Tests added (`tests/test_crypto_order_semantics.py`): non-GTC rejection,
+duplicate-stops fail-closed, pending-status exclusion, increment-boundary
+just-inside/just-outside, spec-lookup-failure fail-closed, SDK-enum-like
+field normalization, cancel-unconfirmed (no replacement placed), and
+placement-fails-after-confirmed-cancel. 15 tests in the affected area, 387
+passed + 2 skipped (389 total) in the full suite `[VERIFIED]`.
+
+Not merged — left open for Codex re-review per the operating agreement.

@@ -185,14 +185,34 @@ class _FakeCryptoClient:
         assets: dict[str, object] | None = None,
         positions: dict[str, float] | None = None,
         orders: list[object] | None = None,
+        order_status_sequence: dict[str, list[str]] | None = None,
     ) -> None:
         self._assets = assets or {}
         self._positions = positions or {}
         self._orders = orders or []
+        # D-C5 replace/coverage tests: a registry of every order ever passed
+        # in (keyed by id), independent of the "open orders" list above, so
+        # get_order_by_id can still answer for an order that cancel_order_by_id
+        # has already removed from the open-orders view (mirrors the real
+        # Alpaca API: a canceled order still exists, it just stops being
+        # "open"). `order_status_sequence` lets a test script exactly what
+        # get_order_by_id reports on each successive poll for a given id — a
+        # single-element list repeats forever (e.g. to simulate a
+        # cancellation that never confirms within the timeout); omit an id
+        # entirely to get the default "cancel_order_by_id marks it canceled
+        # immediately" behavior.
+        self._all_orders_by_id = {
+            str(getattr(o, "id", "")): o for o in self._orders
+        }
+        self._order_status_sequence = {
+            k: list(v) for k, v in (order_status_sequence or {}).items()
+        }
         self.submitted: list[object] = []
         self.get_asset_calls: list[str] = []
         self.get_orders_requests: list[object] = []
         self.get_clock_calls = 0
+        self.get_order_by_id_calls: list[str] = []
+        self.cancel_order_calls: list[str] = []
 
     def get_account(self):
         return _FakeAccount()
@@ -230,10 +250,29 @@ class _FakeCryptoClient:
         ]
 
     def cancel_order_by_id(self, order_id: str) -> None:
+        self.cancel_order_calls.append(order_id)
         self._orders = [
             o for o in self._orders
             if str(getattr(o, "id", "")) != order_id
         ]
+        # Default (no explicit order_status_sequence for this id): the
+        # cancellation reaches a confirmed terminal CANCELED state right
+        # away — the common happy-path test shape.
+        if order_id not in self._order_status_sequence:
+            order = self._all_orders_by_id.get(order_id)
+            if order is not None:
+                order.status = "canceled"
+
+    def get_order_by_id(self, order_id: str):
+        self.get_order_by_id_calls.append(order_id)
+        sequence = self._order_status_sequence.get(order_id)
+        if sequence:
+            status = sequence.pop(0) if len(sequence) > 1 else sequence[0]
+            return SimpleNamespace(id=order_id, status=status)
+        order = self._all_orders_by_id.get(order_id)
+        if order is not None:
+            return order
+        return SimpleNamespace(id=order_id, status="canceled")
 
     def get_clock(self):
         self.get_clock_calls += 1
@@ -978,6 +1017,14 @@ def test_replace_crypto_stop_limit_cancels_then_places() -> None:
     assert result["limit_price"] == 57500.0
     assert result["asset_class"] == ASSET_CLASS_CRYPTO
     assert len(client.submitted) == 1
+    # Fix 3/4: cancellation is confirmed (client.get_order_by_id reports the
+    # order as canceled) before the replacement is placed, and the result is
+    # the new discriminated shape.
+    assert client.get_order_by_id_calls == ["old-stop-1"]
+    assert result["protected"] is True
+    assert result["status"] == "replaced"
+    assert result["old_order_id"] == "old-stop-1"
+    assert result["new_order_id"] == result["order_id"]
 
 
 def test_get_open_orders_detailed_returns_stop_prices() -> None:
@@ -1031,6 +1078,7 @@ def test_check_crypto_stop_coverage_detects_unprotected_position() -> None:
     assert violations[0]["symbol"] == BTC
     assert violations[0]["held_qty"] == 0.5
     assert violations[0]["covered_qty"] == 0.0
+    assert violations[0]["violation_kind"] == "uncovered"
 
 
 def test_check_crypto_stop_coverage_partial_shortfall() -> None:
@@ -1051,7 +1099,222 @@ def test_check_crypto_stop_coverage_partial_shortfall() -> None:
     violations = broker.check_crypto_stop_coverage()
     assert len(violations) == 1
     assert violations[0]["covered_qty"] == 0.3
+    assert violations[0]["violation_kind"] == "partial"
     assert "shortfall" in violations[0]["reason"]
+
+
+# ── Codex review 2026-07-12 fixes: strict coverage semantics ─────────────────
+
+
+def _stop_order(
+    order_id: str,
+    *,
+    qty: float,
+    stop_price: float = 59000.0,
+    limit_price: float = 58500.0,
+    time_in_force: str = "gtc",
+    status: str = "accepted",
+    order_type: str = "stop_limit",
+    side: str = "SELL",
+):
+    return SimpleNamespace(
+        id=order_id, status=status, symbol=BTC, side=side,
+        qty=qty, filled_qty=0.0, filled_avg_price=0.0,
+        order_type=order_type, time_in_force=time_in_force,
+        stop_price=stop_price, limit_price=limit_price,
+        created_at="", submitted_at="", filled_at=None,
+        asset_class="crypto",
+    )
+
+
+def test_check_crypto_stop_coverage_rejects_non_gtc_stop_as_coverage() -> None:
+    """Finding 1: an IOC/DAY stop-limit is NOT counted as coverage."""
+    for tif in ("day", "ioc"):
+        orders = [_stop_order("stop-1", qty=1.0, time_in_force=tif)]
+        client = _FakeCryptoClient(
+            assets={BTC: _crypto_asset()}, positions={BTC: 0.5}, orders=orders,
+        )
+        broker = _broker(client)
+        violations = broker.check_crypto_stop_coverage()
+        assert len(violations) == 1, tif
+        assert violations[0]["violation_kind"] == "uncovered"
+        assert violations[0]["covered_qty"] == 0.0
+
+
+def test_check_crypto_stop_coverage_duplicate_stops_fail_closed() -> None:
+    """Finding 2: two independently-executable GTC stop-limit SELL orders
+    for the same symbol are a "duplicate" violation, even though their
+    summed quantity would exceed the held quantity — never treated as safe
+    coverage by summing."""
+    orders = [
+        _stop_order("stop-1", qty=0.4),
+        _stop_order("stop-2", qty=0.4),
+    ]
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()}, positions={BTC: 0.5}, orders=orders,
+    )
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert len(violations) == 1
+    assert violations[0]["violation_kind"] == "duplicate"
+    assert violations[0]["covered_qty"] == pytest.approx(0.8)  # informational only
+    assert "duplicate" in violations[0]["reason"] or "ambiguous" in violations[0]["reason"]
+
+
+def test_check_crypto_stop_coverage_excludes_pending_status_order() -> None:
+    """A resting-looking order whose broker status is a transitional
+    pending_* sub-state (Alpaca still reports it under
+    QueryOrderStatus.OPEN) must be excluded from coverage, not counted."""
+    orders = [_stop_order("stop-1", qty=1.0, status="pending_cancel")]
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()}, positions={BTC: 0.5}, orders=orders,
+    )
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert len(violations) == 1
+    assert violations[0]["violation_kind"] == "non_resting_ignored"
+    assert violations[0]["covered_qty"] == 0.0
+
+
+def test_check_crypto_stop_coverage_increment_boundary_just_inside_is_covered() -> None:
+    """Finding 5: the tolerance is the pair's own min_trade_increment, not
+    the equity QTY_INTEGRAL_EPS. A shortfall strictly SMALLER than the
+    increment is still covered."""
+    increment = 0.0001
+    held = 0.5
+    covered_qty = held - (increment / 2)  # shortfall 0.00005 < 0.0001 tol
+    orders = [_stop_order("stop-1", qty=covered_qty)]
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset(min_order_size=increment, min_trade_increment=increment)},
+        positions={BTC: held},
+        orders=orders,
+    )
+    broker = _broker(client)
+    assert broker.check_crypto_stop_coverage() == []
+
+
+def test_check_crypto_stop_coverage_increment_boundary_just_outside_is_partial() -> None:
+    """Symmetric case: a shortfall strictly LARGER than the pair's
+    min_trade_increment is a partial-coverage violation."""
+    increment = 0.0001
+    held = 0.5
+    covered_qty = held - (increment * 1.5)  # shortfall 0.00015 > 0.0001 tol
+    orders = [_stop_order("stop-1", qty=covered_qty)]
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset(min_order_size=increment, min_trade_increment=increment)},
+        positions={BTC: held},
+        orders=orders,
+    )
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert len(violations) == 1
+    assert violations[0]["violation_kind"] == "partial"
+
+
+def test_check_crypto_stop_coverage_fails_closed_on_spec_lookup_failure() -> None:
+    """Finding 5 fail-closed clause: if the pair's spec lookup fails, the
+    symbol is a violation — never silently falls back to the equity epsilon
+    or gets skipped."""
+    orders = [_stop_order("stop-1", qty=0.5)]
+    client = _FakeCryptoClient(assets={}, positions={BTC: 0.5}, orders=orders)
+    broker = _broker(client)
+    violations = broker.check_crypto_stop_coverage()
+    assert len(violations) == 1
+    assert violations[0]["violation_kind"] == "spec_lookup_failed"
+
+
+def test_get_open_orders_detailed_normalizes_sdk_enum_like_fields() -> None:
+    """A real alpaca-py SDK Order's enum fields stringify to
+    "ClassName.MEMBER" via plain str() — only `.value` gives the wire value.
+    get_open_orders_detailed must extract via `.value` (see `_enum_value`),
+    not a naive str() cast, or every downstream qualifying-stop check would
+    silently never match against real (non-test-double) broker responses."""
+
+    class _FakeSdkEnum:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def __str__(self) -> str:  # pragma: no cover - mirrors alpaca-py Enum.__str__
+            return f"FakeEnum.{self.value.upper()}"
+
+    order = SimpleNamespace(
+        id="ord-1", status=_FakeSdkEnum("accepted"), symbol=BTC,
+        side=_FakeSdkEnum("sell"), qty=0.5, filled_qty=0.0, filled_avg_price=0.0,
+        order_type=_FakeSdkEnum("stop_limit"), time_in_force=_FakeSdkEnum("gtc"),
+        stop_price=59000.0, limit_price=58500.0,
+        created_at="", submitted_at="", filled_at=None, asset_class=_FakeSdkEnum("crypto"),
+    )
+    client = _FakeCryptoClient(orders=[order])
+    broker = _broker(client)
+    detailed = broker.get_open_orders_detailed(asset_class=ASSET_CLASS_CRYPTO)
+    assert len(detailed) == 1
+    d = detailed[0]
+    assert d["status"] == "accepted"
+    assert d["side"] == "SELL"
+    assert d["order_type"] == "stop_limit"
+    assert d["time_in_force"] == "gtc"
+
+    # And check_crypto_stop_coverage correctly counts it as qualifying
+    # coverage (it would NOT, pre-fix, since "fakeenum.stop_limit" !=
+    # "stop_limit").
+    client2 = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()}, positions={BTC: 0.5}, orders=[order],
+    )
+    broker2 = _broker(client2)
+    assert broker2.check_crypto_stop_coverage() == []
+
+
+def test_replace_crypto_stop_limit_cancel_unconfirmed_does_not_place_replacement() -> None:
+    """Finding 3: if cancellation never reaches a confirmed terminal
+    CANCELED state within the timeout, the replacement must NOT be placed
+    (that could create two overlapping resting stops)."""
+    old_order = _stop_order("old-stop-1", qty=0.5)
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.5},
+        orders=[old_order],
+        # A single-element sequence repeats forever: the cancellation is
+        # perpetually stuck pending, never reaching a terminal state.
+        order_status_sequence={"old-stop-1": ["pending_cancel"]},
+    )
+    broker = _broker(client)
+    with pytest.warns(RuntimeWarning, match="cancel_unconfirmed|did not reach"):
+        result = broker.replace_crypto_stop_limit(
+            "old-stop-1", BTC, 0.5, 58000.0, 57500.0,
+            timeout_seconds=0.05, poll_interval_seconds=0.01,
+        )
+    assert result["protected"] is False
+    assert result["status"] == "cancel_unconfirmed"
+    assert result["unprotected_reason"] == "cancel_unconfirmed"
+    assert result["new_order_id"] is None
+    assert result["old_order_id"] == "old-stop-1"
+    assert client.submitted == []  # replacement was never attempted
+
+
+def test_replace_crypto_stop_limit_unprotected_after_confirmed_cancel_when_placement_fails() -> None:
+    """Finding 3 (most severe case): cancellation IS confirmed, but the
+    replacement placement itself then fails — the position is genuinely
+    unprotected (no resting stop at all)."""
+    old_order = _stop_order("old-stop-2", qty=0.5)
+    client = _FakeCryptoClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.5},
+        orders=[old_order],
+    )
+    broker = _broker(client)
+    client.submit_order = MagicMock(side_effect=RuntimeError("submit boom"))
+    with pytest.warns(RuntimeWarning, match="unprotected_after_cancel|UNPROTECTED"):
+        result = broker.replace_crypto_stop_limit(
+            "old-stop-2", BTC, 0.5, 58000.0, 57500.0,
+        )
+    assert result["protected"] is False
+    assert result["status"] == "unprotected_after_cancel"
+    assert result["unprotected_reason"] == "replacement_failed_after_confirmed_cancel"
+    assert result["new_order_id"] is None
+    assert result["old_order_id"] == "old-stop-2"
+    # The cancellation itself DID happen and WAS confirmed.
+    assert client.cancel_order_calls == ["old-stop-2"]
+    assert client.get_order_by_id_calls == ["old-stop-2"]
 
 
 def test_check_crypto_stop_coverage_ignores_equity_positions() -> None:
