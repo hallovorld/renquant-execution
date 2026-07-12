@@ -23,5 +23,5 @@ preopen = [
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "../renquant-common/src"]
+pythonpath = ["src", "scripts", "../renquant-common/src"]
 testpaths = ["tests"]
