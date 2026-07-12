@@ -42,7 +42,7 @@ Hermetic tests inject a fake adapter instead of requiring the real
 ``tests/test_software_stops_liveness.py`` for what that trades off.
 
 Exit codes (nagios-ish, consumable by any wrapper — unchanged contract from
-the ported umbrella script):
+the ported umbrella script). This is the DEFAULT ("check") mode:
     0  OK        — no registry / no armed stops / heartbeat fresh /
                    market closed (nothing can be evaluated off-session)
     1  STALE     — armed stops exist and the heartbeat is missing or
@@ -50,6 +50,16 @@ the ported umbrella script):
     2  CORRUPT   — the registry file exists but cannot be read/validated:
                    registered stops are UNKNOWABLE and new fractional
                    entries are already fail-closed by the stage-0 gate
+
+``--validate-registry`` mode is a SEPARATE verdict space — structural
+registry validity only, never staleness or market session (see
+``validate_registry()`` below for why this exists as a public, versioned
+boundary):
+    0  REGISTRY_VALID    — file exists and is a well-formed, schema-valid
+                            software-stop registry
+    1  REGISTRY_MISSING  — no registry file at the resolved path
+    2  REGISTRY_CORRUPT  — file exists but is unreadable or fails schema
+                            validation
 
 RUNTIME CONTRACT (same discipline as orchestrator's shadow_ab_daily.sh,
 Codex r2 on orchestrator#460): no default here points at the deprecated
@@ -68,6 +78,16 @@ renquant-common checkouts' ``src/`` — see renquant-orchestrator
     python -m renquant_execution.software_stops_liveness \\
         --data-root /path/to/runtime/root --broker alpaca
 
+Or, to only answer "does a real, schema-valid registry exist here" without
+evaluating staleness/market session (the public boundary a caller in
+another repo — e.g. renquant-orchestrator's install-time arming guard —
+should use instead of reaching into this module's private
+``_pipeline_stops_api()``; see renquant-orchestrator#481, Codex,
+2026-07-12T11:33:56Z):
+
+    python -m renquant_execution.software_stops_liveness \\
+        --validate-registry --data-root /path/to/runtime/root --broker alpaca
+
 Optional ``--ntfy-topic`` posts the alarm to ntfy.sh directly (best-effort,
 kept for CLI parity with the ported script). The orchestrator wrapper does
 NOT use this flag: it owns paging itself (via ``curl -f``) so a delivery
@@ -84,6 +104,14 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 OK, STALE, CORRUPT = 0, 1, 2
+
+# Separate verdict space for ``--validate-registry`` mode (structural
+# validity only — never staleness or market session). Deliberately NOT
+# aliased to OK/STALE/CORRUPT above even though the integers coincide: the
+# two modes answer different questions and must be able to diverge in
+# meaning without becoming a silent renumbering hazard. See
+# ``validate_registry()`` for the rationale.
+REGISTRY_VALID, REGISTRY_MISSING, REGISTRY_CORRUPT = 0, 1, 2
 
 
 class _PipelineStopsAPI(NamedTuple):
@@ -206,6 +234,48 @@ def check(
     )
 
 
+def validate_registry(
+    registry_path: Path, *, _api: "_PipelineStopsAPI | None" = None,
+) -> "tuple[int, str]":
+    """Public, versioned, narrow validation boundary: "does a real,
+    schema-valid software-stop registry exist at this path?" — nothing
+    more (no staleness, no market-session evaluation; use ``check()`` for
+    that).
+
+    This exists specifically so callers OUTSIDE this repo (notably
+    renquant-orchestrator's install-time arming guard,
+    ``scripts/install_stops_pager.sh``) have a stable, documented surface
+    to depend on instead of importing this module's private
+    ``_pipeline_stops_api()`` (or any other private name) across the repo
+    boundary. Per the renquant-orchestrator#481 Codex review
+    (2026-07-12T11:33:56Z): a leading-underscore name is an
+    implementation detail that can be refactored without a compatibility
+    guarantee, so a cross-repo fail-closed safety guard must not depend on
+    it — it must go through a public CLI/API surface with a stable
+    verdict/exit-code contract instead. ``validate_registry()`` (and its
+    ``--validate-registry`` CLI mode below) IS that surface.
+
+    ``_api`` is test-only dependency injection for the pipeline registry
+    module, same pattern as ``check()``; production callers omit it and
+    get the real lazy import.
+    """
+    api = _api or _pipeline_stops_api()
+    if not registry_path.exists():
+        return REGISTRY_MISSING, (
+            f"MISSING: no software-stop registry file at {registry_path}"
+        )
+    try:
+        api.validate_snapshot(json.loads(registry_path.read_text()))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return REGISTRY_CORRUPT, (
+            f"CORRUPT: {registry_path} unreadable or fails schema "
+            f"validation ({type(exc).__name__}: {exc})"
+        )
+    return REGISTRY_VALID, (
+        f"VALID: {registry_path} is a well-formed software-stop registry"
+    )
+
+
 def _post_ntfy(topic: str, message: str) -> None:
     """Best-effort direct ntfy post — kept for CLI parity with the ported
     umbrella script. NOT used by the orchestrator wrapper, which owns
@@ -279,11 +349,24 @@ def main(argv: "list[str] | None" = None) -> int:
              "(best-effort; the orchestrator wrapper does not use this — "
              "it owns paging itself)",
     )
+    ap.add_argument(
+        "--validate-registry", action="store_true",
+        help="run the public structural-validity check only (VALID/MISSING"
+             "/CORRUPT; see validate_registry()) instead of the default "
+             "staleness/market-session liveness check — never gates on "
+             "time-of-day or market session",
+    )
     args = ap.parse_args(argv)
 
     path = resolve_registry_path(
         registry=args.registry, data_root=args.data_root, broker=args.broker,
     )
+
+    if args.validate_registry:
+        code, message = validate_registry(path)
+        print(message)
+        return code
+
     now = datetime.datetime.fromisoformat(args.now) if args.now else None
     code, message = check(path, now=now, force_session=args.force_session)
     print(message)
