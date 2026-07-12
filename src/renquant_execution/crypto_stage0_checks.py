@@ -259,13 +259,29 @@ def check_pair_snapshot(
     )
 
 
+def _query_residual_position(broker: AlpacaBroker, symbol: str) -> float | None:
+    """Best-effort residual-position query for the Tier-1 fill-evidence path.
+
+    Returns ``None`` (never raises) if the lookup itself fails -- the
+    fill/cleanup-failure condition must still be reported even if this
+    diagnostic extra can't be obtained, per Codex review 2026-07-12 round-2
+    finding 3.
+    """
+    try:
+        return broker.get_position(symbol)
+    except Exception:
+        return None
+
+
 def _place_probe_and_confirm_cleanup(
     broker: AlpacaBroker,
     *,
+    symbol: str,
     place_fn: Callable[[], dict[str, Any]],
     expected_order_type: str,
     expected_side: str,
     expected_time_in_force: str,
+    expected_qty: float,
     expected_price_fields: dict[str, float],
     cancel_confirm_timeout_seconds: float,
     cancel_confirm_poll_interval_seconds: float,
@@ -279,10 +295,11 @@ def _place_probe_and_confirm_cleanup(
     logic lives in exactly one place.
 
     Returns ``(ok, failure_reason, detail)``. ``ok`` is True only when the
-    order was genuinely accepted in a resting state, its type/side/TIF/price
-    match what was requested, AND the subsequent cancellation was confirmed
-    terminal -- never merely "the place/cancel calls didn't raise" (Codex
-    review 2026-07-12 findings 1 and 2 on execution#34).
+    order was genuinely accepted in a resting state, EVERY broker-confirmed
+    field (type/side/TIF/price(s)/quantity) matches what was requested, AND
+    the subsequent cancellation was confirmed terminal -- never merely "the
+    place/cancel calls didn't raise" (Codex review 2026-07-12 findings 1 and
+    2, and round-2 findings 1-3 on execution#34).
     """
     try:
         result = place_fn()
@@ -298,6 +315,7 @@ def _place_probe_and_confirm_cleanup(
         "side": result.get("side", ""),
         "confirmed_time_in_force": result.get("confirmed_time_in_force", ""),
         "qty": result.get("quantity", 0.0),
+        "confirmed_quantity": result.get("confirmed_quantity"),
     }
     for field_name in expected_price_fields:
         detail[field_name] = result.get(field_name)
@@ -307,13 +325,17 @@ def _place_probe_and_confirm_cleanup(
 
     # A FILLED probe order is a distinct, MORE severe Tier-1 condition than a
     # merely-rejected one: real (paper) inventory was acquired, not just "no
-    # resting order to clean up".
+    # resting order to clean up". Query and RECORD the residual position --
+    # a bare "FILLED" status is not durable evidence of how much inventory
+    # now exists (Codex review 2026-07-12 round-2 finding 3).
     if status in _FILLED_ORDER_STATUSES:
+        detail["residual_position_qty"] = _query_residual_position(broker, symbol)
         return (
             False,
             f"order {order_id} reports status={status!r} -- probe order "
             "FILLED instead of resting; real paper inventory acquired "
-            "(Tier-1 condition)",
+            f"(Tier-1 condition, residual_position_qty="
+            f"{detail['residual_position_qty']!r})",
             detail,
         )
 
@@ -332,12 +354,17 @@ def _place_probe_and_confirm_cleanup(
     # The order IS resting -- attempt cleanup and CONFIRM terminal
     # cancellation before doing anything else (Codex review 2026-07-12
     # finding 1: a cancel_order() call that doesn't raise is not proof the
-    # order is gone).
+    # order is gone). Codex round-2 finding 5: a cancel_order() call that
+    # DOES raise is likewise not proof the order is STILL there -- the
+    # request may have reached the broker despite a client-side/transport
+    # exception. Always poll for the actual terminal state regardless of
+    # whether cancel_order raised; record both the exception (if any) and
+    # the observed terminal state as durable evidence.
+    cancel_exception: str | None = None
     try:
         broker.cancel_order(order_id)
     except Exception as cancel_exc:
-        detail["cancel_confirmed"] = False
-        return False, f"cancel_order raised: {cancel_exc}", detail
+        cancel_exception = str(cancel_exc)
 
     cancel_confirmed = broker.wait_for_order_terminal_cancel(
         order_id,
@@ -345,35 +372,62 @@ def _place_probe_and_confirm_cleanup(
         poll_interval_seconds=cancel_confirm_poll_interval_seconds,
     )
     detail["cancel_confirmed"] = cancel_confirmed
+    detail["cancel_exception"] = cancel_exception
     if not cancel_confirmed:
-        return (
-            False,
-            f"cancellation of order {order_id} not confirmed terminally "
+        reason = (
+            f"cancel_order raised ({cancel_exception}) and cancellation of "
+            f"order {order_id} was not subsequently confirmed terminally "
             f"canceled within {cancel_confirm_timeout_seconds}s -- order may "
-            "still be resting/uncancelled",
-            detail,
+            "still be resting/uncancelled"
+            if cancel_exception is not None
+            else (
+                f"cancellation of order {order_id} not confirmed terminally "
+                f"canceled within {cancel_confirm_timeout_seconds}s -- order "
+                "may still be resting/uncancelled"
+            )
         )
+        return False, reason, detail
 
-    # Field validation (Codex review 2026-07-12 finding 2), checked AFTER
-    # cleanup so a mismatched-but-resting order is cleaned up regardless of
-    # whether the mismatch itself is reported as a failure.
+    # Field validation (Codex review 2026-07-12 finding 2, strengthened per
+    # round-2 finding 2), checked AFTER cleanup so a mismatched-but-resting
+    # order is cleaned up regardless of whether the mismatch itself is
+    # reported as a failure. A MISSING/empty broker-confirmed field must
+    # FAIL, never be silently skipped -- the original `if field and field
+    # != expected` pattern let an empty/unset field slip past validation
+    # entirely, which is exactly backwards: we cannot confirm a field
+    # matches if the broker didn't report it at all.
     field_failures: list[str] = []
     order_type = result.get("order_type", "")
-    if order_type and order_type != expected_order_type:
+    if not order_type or order_type != expected_order_type:
         field_failures.append(
             f"order_type {order_type!r} != expected {expected_order_type!r}"
         )
     side = result.get("side", "")
-    if side and side != expected_side:
+    if not side or side != expected_side:
         field_failures.append(f"side {side!r} != expected {expected_side!r}")
     tif = result.get("confirmed_time_in_force", "")
-    if tif and tif != expected_time_in_force:
+    if not tif or tif != expected_time_in_force:
         field_failures.append(
             f"time_in_force {tif!r} != expected {expected_time_in_force!r}"
         )
+    # confirmed_quantity reads the broker's own order.qty, NOT our
+    # submitted/snapped qty echoed back (Codex round-2 review finding 1/2:
+    # validating a value against itself proves nothing) -- see
+    # place_crypto_limit_order/place_crypto_stop_limit_order's identical
+    # confirmed_quantity population.
+    confirmed_qty = result.get("confirmed_quantity")
+    if confirmed_qty is None or confirmed_qty <= 0:
+        field_failures.append(f"confirmed_quantity {confirmed_qty!r} is missing or non-positive")
+    else:
+        qty_tolerance = max(1e-9, abs(expected_qty) * 1e-6)
+        if abs(float(confirmed_qty) - float(expected_qty)) > qty_tolerance:
+            field_failures.append(
+                f"confirmed_quantity {confirmed_qty!r} != requested {expected_qty!r}"
+            )
     for field_name, expected_value in expected_price_fields.items():
         actual = result.get(field_name)
         if actual is None or expected_value is None:
+            field_failures.append(f"{field_name} missing from broker response")
             continue
         tolerance = max(1e-6, abs(float(expected_value)) * 1e-6)
         if abs(float(actual) - float(expected_value)) > tolerance:
@@ -423,13 +477,13 @@ def _check_gtc_order_acceptance(
             failures.append(f"{pair}: spec lookup failed ({exc})")
             continue
         try:
-            reference_price = broker.get_crypto_reference_price(pair)
+            quote = broker.get_crypto_reference_quote(pair)
         except Exception as exc:
-            failures.append(f"{pair}: reference price lookup failed ({exc})")
+            failures.append(f"{pair}: reference quote lookup failed ({exc})")
             continue
 
         raw_limit_price = (
-            reference_price * DEFAULT_CANARY_LIMIT_BUY_FRACTION_OF_REFERENCE
+            quote.mid_price * DEFAULT_CANARY_LIMIT_BUY_FRACTION_OF_REFERENCE
         )
         limit_price = round_price_to_increment(raw_limit_price, spec.price_increment)
         raw_qty = test_notional_usd / limit_price
@@ -447,6 +501,7 @@ def _check_gtc_order_acceptance(
 
         ok, reason, detail = _place_probe_and_confirm_cleanup(
             broker,
+            symbol=pair,
             place_fn=lambda pair=pair, qty=qty, limit_price=limit_price: (
                 broker.place_crypto_limit_order(
                     symbol=pair,
@@ -459,10 +514,13 @@ def _check_gtc_order_acceptance(
             expected_order_type="limit",
             expected_side="BUY",
             expected_time_in_force="gtc",
+            expected_qty=qty,
             expected_price_fields={"confirmed_limit_price": limit_price},
             cancel_confirm_timeout_seconds=cancel_confirm_timeout_seconds,
             cancel_confirm_poll_interval_seconds=cancel_confirm_poll_interval_seconds,
         )
+        detail["quote_timestamp"] = quote.timestamp.isoformat()
+        detail["quote_age_seconds"] = quote.age_seconds
         order_details[pair] = detail
         if ok:
             placed_and_cancelled.append(pair)
@@ -525,12 +583,12 @@ def _check_stop_limit_acceptance(
             failures.append(f"{pair}: spec lookup failed ({exc})")
             continue
         try:
-            reference_price = broker.get_crypto_reference_price(pair)
+            quote = broker.get_crypto_reference_quote(pair)
         except Exception as exc:
-            failures.append(f"{pair}: reference price lookup failed ({exc})")
+            failures.append(f"{pair}: reference quote lookup failed ({exc})")
             continue
 
-        raw_stop_price = reference_price * DEFAULT_CANARY_STOP_MULTIPLE_OF_REFERENCE
+        raw_stop_price = quote.mid_price * DEFAULT_CANARY_STOP_MULTIPLE_OF_REFERENCE
         stop_price = round_price_to_increment(raw_stop_price, spec.price_increment)
         raw_limit_price = stop_price * DEFAULT_CANARY_STOP_LIMIT_BUFFER
         limit_price = round_price_to_increment(raw_limit_price, spec.price_increment)
@@ -538,6 +596,7 @@ def _check_stop_limit_acceptance(
 
         ok, reason, detail = _place_probe_and_confirm_cleanup(
             broker,
+            symbol=pair,
             place_fn=lambda pair=pair, qty=qty, stop_price=stop_price, limit_price=limit_price: (
                 broker.place_crypto_stop_limit_order(
                     symbol=pair,
@@ -551,6 +610,7 @@ def _check_stop_limit_acceptance(
             expected_order_type="stop_limit",
             expected_side="BUY",
             expected_time_in_force="gtc",
+            expected_qty=qty,
             expected_price_fields={
                 "confirmed_stop_price": stop_price,
                 "confirmed_limit_price": limit_price,
@@ -558,6 +618,8 @@ def _check_stop_limit_acceptance(
             cancel_confirm_timeout_seconds=cancel_confirm_timeout_seconds,
             cancel_confirm_poll_interval_seconds=cancel_confirm_poll_interval_seconds,
         )
+        detail["quote_timestamp"] = quote.timestamp.isoformat()
+        detail["quote_age_seconds"] = quote.age_seconds
         order_details[pair] = detail
         if ok:
             placed_and_cancelled.append(pair)

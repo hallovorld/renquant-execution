@@ -276,3 +276,105 @@ happy-path tests satisfy the new field-validation naturally, and a
 
 Full suite: 434 passed, 2 skipped (was 419 passed, 2 skipped before any of
 this revision's changes; +15 new tests net) `[VERIFIED]`.
+
+## Revision note (round 2, 2026-07-12T22:51:25Z, post-Codex live re-review of 9dd8964)
+
+Codex re-reviewed the round-1 fix (9dd8964) and found 5 further issues.
+Each was independently verified against the actual code before acting --
+one claim's literal premise didn't match the code, though the underlying
+concern it was pointing at turned out to be real elsewhere.
+
+### Finding 1 (as literally stated) -- NOT reproduced; pushed back
+
+Codex's review said: "the probe passes `expected_price_fields` keyed as
+`limit_price`" -- implying price validation compares the requested value to
+itself. Direct inspection of `_check_gtc_order_acceptance` /
+`_check_stop_limit_acceptance` shows both already pass
+`expected_price_fields={"confirmed_limit_price": limit_price}` (and
+`confirmed_stop_price` for the stop-limit probe) -- keyed on the
+`confirmed_*` field, not the plain one -- and `confirmed_limit_price` /
+`confirmed_stop_price` are populated in `alpaca_broker.py` by reading
+`order.limit_price` / `order.stop_price` directly off the SDK's
+`submit_order()` response object, genuinely independent of what
+`_check_gtc_order_acceptance` asked for. This specific claim does not match
+the code at 9dd8964; not changed.
+
+### Finding 1's underlying concern -- REAL, found for QUANTITY instead
+
+Re-examining the exact same class of bug Codex was describing (a
+"confirmed" field that's actually just an echo of our own request, not
+independently sourced) surfaced a genuine instance of it: `quantity` in the
+`place_crypto_limit_order`/`place_crypto_stop_limit_order` result dicts is
+set by `result.update({..., "quantity": float(submit_qty), ...})` -- our
+OWN submitted/snapped value, not `order.qty` from the broker's response.
+`_place_probe_and_confirm_cleanup` (round 1) never validated quantity at
+all (see Finding 2), so this wasn't yet exploitable, but adding quantity
+validation against the self-referential `quantity` field would have been
+exactly the vacuous check Codex is worried about. Fixed by adding a
+genuinely independent `confirmed_quantity` field (reads `order.qty`
+directly, mirroring `confirmed_limit_price`/`confirmed_stop_price`) to both
+order-placement methods, and validating THAT in
+`_place_probe_and_confirm_cleanup`, not the echoed `quantity` field.
+
+### Finding 2 -- field matching was fail-open; quantity unvalidated -- CONFIRMED, fixed
+
+`if order_type and order_type != expected_order_type` (and the same
+pattern for `side`/`confirmed_time_in_force`) skipped the check entirely
+when the field was empty/missing -- exactly backwards, since a missing
+broker-confirmed field means we CAN'T confirm a match, which must FAIL, not
+pass silently. Changed to `if not order_type or order_type != expected`.
+Quantity (via the new `confirmed_quantity` field, see above) is now
+validated with the same tolerance-based comparison already used for price
+fields.
+
+### Finding 3 -- filled/partially-filled recorded no residual-position evidence -- CONFIRMED, fixed
+
+A bare `status="filled"` is not durable evidence of how much paper
+inventory now exists. Added `_query_residual_position()` (best-effort,
+never raises -- the fill-failure condition must still be reported even if
+this diagnostic extra can't be obtained) calling `broker.get_position()`,
+recorded as `residual_position_qty` in the step detail whenever a probe
+order fills instead of resting.
+
+### Finding 4 -- quote-derived prices had no provenance/freshness check -- CONFIRMED, fixed
+
+`get_crypto_reference_price()` returned a bare `float` with no timestamp,
+source, or symbol identity, and could silently derive canary prices from
+stale market data. Added `CryptoQuoteSnapshot` (symbol, bid/ask/mid,
+timestamp, age_seconds) and `get_crypto_reference_quote()`, which rejects a
+missing timestamp, a stale quote (`age_seconds > max_staleness_seconds`,
+default 60s), or an implausible future timestamp (>5s ahead of now) before
+returning. `get_crypto_reference_price()` is now a thin wrapper over it for
+callers that only want the number. Both battery probes switched to the
+typed quote and record `quote_timestamp`/`quote_age_seconds` in their
+per-pair detail.
+
+### Finding 5 -- cancel_order() exception short-circuited without polling -- CONFIRMED, fixed
+
+Round 1 returned immediately on a `cancel_order()` exception without
+polling for the actual terminal state. A raised exception (e.g. a
+transport-level timeout) is not proof the cancel request never reached the
+broker -- exactly the inverse of the "no exception raised is not proof of
+success" discipline this same function already applies elsewhere. Now
+`cancel_order()`'s exception (if any) is caught and recorded, but
+`wait_for_order_terminal_cancel()` is ALWAYS called afterward regardless;
+the result is a PASS with the exception recorded as evidence if the poll
+independently confirms terminal cancellation, or a FAIL naming both the
+exception and the unconfirmed poll result if it doesn't. (Checked whether
+this was actually a regression from an earlier version, as Codex's review
+phrased it ("rather than polling as earlier code did") -- neither the
+immediately-prior commit (ed1fbe66) nor `replace_crypto_stop_limit`'s
+established PR #31 pattern actually polled after a raised cancel exception
+either, so there wasn't a prior behavior to regress from. The suggested
+improvement is correct and valuable on its own merits regardless.)
+
+### Tests and verification (round 2)
+
+Added 10 new tests: residual-position-query-on-fill, missing/blank
+`order_type` field forced-fail, quantity-mismatch forced-fail,
+`get_crypto_reference_quote`'s typed-snapshot return and its 3 fail-closed
+paths (missing timestamp, stale, implausible-future-timestamp) plus one
+accepts-within-bound case, and both halves of the cancel-exception-then-poll
+behavior (poll confirms cancellation despite the exception -> PASS with
+evidence; poll also fails to confirm -> FAIL naming both). Full suite: 444
+passed, 2 skipped (was 434/2 before this round; +10 net) `[VERIFIED]`.

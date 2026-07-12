@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +37,25 @@ from .crypto import (
     snap_qty_to_increment,
     validate_crypto_order,
 )
+
+
+@dataclass(frozen=True)
+class CryptoQuoteSnapshot:
+    """A latest-quote lookup result with provenance and freshness evidence.
+
+    Added (2026-07-12, Codex round-2 review finding 4 on execution#34):
+    replaces a bare ``float`` reference price -- a probe deriving canary
+    order prices from market data must be able to reason about whether that
+    data is fresh and which symbol it actually came from, not just trust an
+    unadorned number.
+    """
+
+    symbol: str
+    bid_price: float
+    ask_price: float
+    mid_price: float
+    timestamp: datetime
+    age_seconds: float
 
 
 class _FractionableLookupError(RuntimeError):
@@ -1338,6 +1358,15 @@ class AlpacaBroker(BaseBroker):
         result["confirmed_limit_price"] = float(
             getattr(order, "limit_price", 0.0) or 0.0
         )
+        # confirmed_quantity reads order.qty directly (same "genuinely
+        # broker-confirmed, not requested-value-echoed-back" discipline as
+        # confirmed_limit_price above) -- result.update() below overwrites
+        # the plain "quantity" key with our own submit_qty, so a caller
+        # validating against "quantity" alone would only ever be comparing
+        # our own request to itself (Codex round-2 review finding 1/2).
+        result["confirmed_quantity"] = float(
+            getattr(order, "qty", getattr(order, "quantity", 0.0)) or 0.0
+        )
         result.update({
             "action": action_u,
             "quantity": float(submit_qty),
@@ -1349,10 +1378,12 @@ class AlpacaBroker(BaseBroker):
         })
         return result
 
-    def get_crypto_reference_price(self, symbol: str) -> float:
-        """Latest reference price for a crypto pair (mid of bid/ask, falling
-        back to whichever side is available), via the market-data
-        ``CryptoHistoricalDataClient`` -- NOT the trading client.
+    def get_crypto_reference_quote(
+        self, symbol: str, *, max_staleness_seconds: float = 60.0
+    ) -> "CryptoQuoteSnapshot":
+        """Latest bid/ask quote for a crypto pair, with provenance and a
+        freshness check, via the market-data ``CryptoHistoricalDataClient``
+        -- NOT the trading client.
 
         Added (2026-07-12, Codex review finding 3 on execution#34) so the
         Stage-0 battery's transactional probes can derive canary prices from
@@ -1360,9 +1391,16 @@ class AlpacaBroker(BaseBroker):
         ($0.01 buy-limit / $999,999,999 stop) that say nothing about
         whether a given pair's actual price band/tick grid would even
         accept an order at all -- a rejection at an implausible fixed price
-        proves nothing about genuine GTC/stop-limit support. Deliberately
-        scoped: this is a single latest-quote lookup, not a versioned
-        price-band/quote-schema system.
+        proves nothing about genuine GTC/stop-limit support.
+
+        Strengthened (2026-07-12, Codex round-2 review finding 4): the
+        original version returned a bare ``float`` with no quote timestamp,
+        source, or symbol identity, so a probe could silently derive prices
+        from a stale or mismatched quote. Returns a typed
+        :class:`CryptoQuoteSnapshot` and raises if the quote's own
+        ``timestamp`` is missing or older than ``max_staleness_seconds`` --
+        deliberately scoped: this is a single latest-quote lookup with a
+        staleness gate, not a versioned price-band/quote-schema system.
         """
         from alpaca.data.historical.crypto import CryptoHistoricalDataClient
         from alpaca.data.requests import CryptoLatestQuoteRequest
@@ -1376,15 +1414,62 @@ class AlpacaBroker(BaseBroker):
             raise RuntimeError(
                 f"crypto latest-quote lookup for {symbol!r} failed: {exc}"
             ) from exc
+        quote_symbol = str(getattr(quote, "symbol", "") or symbol)
+        raw_timestamp = getattr(quote, "timestamp", None)
+        if raw_timestamp is None:
+            raise RuntimeError(
+                f"crypto latest-quote for {symbol!r} has no timestamp -- "
+                "cannot verify freshness before deriving a canary price"
+            )
+        timestamp = raw_timestamp if raw_timestamp.tzinfo else raw_timestamp.replace(
+            tzinfo=timezone.utc
+        )
+        age_seconds = (
+            datetime.now(timezone.utc) - timestamp
+        ).total_seconds()
+        if age_seconds > max_staleness_seconds:
+            raise RuntimeError(
+                f"crypto latest-quote for {symbol!r} is stale: "
+                f"{age_seconds:.1f}s old (max {max_staleness_seconds}s) -- "
+                f"quote timestamp={timestamp.isoformat()}"
+            )
+        if age_seconds < -5.0:
+            raise RuntimeError(
+                f"crypto latest-quote for {symbol!r} has an implausible "
+                f"future timestamp {timestamp.isoformat()} "
+                f"({-age_seconds:.1f}s ahead of now)"
+            )
         bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
         ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
         if bid > 0.0 and ask > 0.0:
-            return (bid + ask) / 2.0
-        if ask > 0.0:
-            return ask
-        if bid > 0.0:
-            return bid
-        raise RuntimeError(f"no usable bid/ask quote for {symbol!r}")
+            mid = (bid + ask) / 2.0
+        elif ask > 0.0:
+            mid = ask
+        elif bid > 0.0:
+            mid = bid
+        else:
+            raise RuntimeError(f"no usable bid/ask quote for {symbol!r}")
+        return CryptoQuoteSnapshot(
+            symbol=quote_symbol,
+            bid_price=bid,
+            ask_price=ask,
+            mid_price=mid,
+            timestamp=timestamp,
+            age_seconds=age_seconds,
+        )
+
+    def get_crypto_reference_price(
+        self, symbol: str, *, max_staleness_seconds: float = 60.0
+    ) -> float:
+        """Convenience wrapper: mid/bid/ask price only, no quote provenance.
+
+        Prefer :meth:`get_crypto_reference_quote` for anything that needs to
+        reason about quote freshness or identity -- this exists only for
+        callers that genuinely just want a number.
+        """
+        return self.get_crypto_reference_quote(
+            symbol, max_staleness_seconds=max_staleness_seconds
+        ).mid_price
 
     def place_crypto_stop_limit_order(
         self,
@@ -1475,6 +1560,12 @@ class AlpacaBroker(BaseBroker):
         )
         result["confirmed_limit_price"] = float(
             getattr(order, "limit_price", 0.0) or 0.0
+        )
+        # See place_crypto_limit_order's identical comment: confirmed_quantity
+        # reads order.qty directly, since result.update() below overwrites
+        # the plain "quantity" key with our own submit_qty.
+        result["confirmed_quantity"] = float(
+            getattr(order, "qty", getattr(order, "quantity", 0.0)) or 0.0
         )
         result.update({
             "action": action_u,

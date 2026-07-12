@@ -9,13 +9,14 @@ existing broker thin-wrapper tests below).
 """
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 
-from renquant_execution.alpaca_broker import AlpacaBroker
+from renquant_execution.alpaca_broker import AlpacaBroker, CryptoQuoteSnapshot
 from renquant_execution.crypto import CryptoAssetSpec
 from renquant_execution.crypto_stage0_checks import (
     DEFAULT_CANARY_PAIRS,
@@ -103,6 +104,7 @@ class _FakeTradingClient:
         account: Any | None = None,
         assets: dict[str, Any] | None = None,
         order_status_sequence: dict[str, list[str]] | None = None,
+        positions: dict[str, float] | None = None,
     ) -> None:
         self._account = account or _FakeAccount()
         self._assets = assets or {}
@@ -110,12 +112,18 @@ class _FakeTradingClient:
         self._order_status_sequence = {
             k: list(v) for k, v in (order_status_sequence or {}).items()
         }
+        self._positions = dict(positions or {})
         self.submitted: list[Any] = []
         self.cancelled: list[str] = []
         self.get_order_by_id_calls: list[str] = []
 
     def get_account(self):
         return self._account
+
+    def get_open_position(self, symbol: str):
+        if symbol not in self._positions:
+            raise RuntimeError(f"position does not exist for {symbol}")
+        return SimpleNamespace(qty=self._positions[symbol])
 
     def get_asset(self, symbol: str):
         if symbol not in self._assets:
@@ -192,11 +200,12 @@ def _broker(
 ) -> AlpacaBroker:
     """Build a battery-testable broker with injected fake client.
 
-    Also monkeypatches ``get_crypto_reference_price`` with a fake, hermetic
-    lookup (Codex review 2026-07-12 finding 3: canary prices are now derived
-    from a "real" reference price rather than universal fixed constants) --
-    no test hits a real market-data endpoint. Pass ``reference_prices={}``
-    to simulate every pair's reference-price lookup failing.
+    Also monkeypatches ``get_crypto_reference_quote`` with a fake, hermetic,
+    always-fresh lookup (Codex review 2026-07-12 finding 3: canary prices are
+    now derived from a "real" reference quote rather than universal fixed
+    constants) -- no test hits a real market-data endpoint. Pass
+    ``reference_prices={}`` to simulate every pair's reference-quote lookup
+    failing.
     """
     assets = {BTC: _crypto_asset(), ETH: _crypto_asset(), SOL: _crypto_asset()}
     if client is None:
@@ -207,12 +216,20 @@ def _broker(
 
     prices = DEFAULT_REFERENCE_PRICES if reference_prices is None else reference_prices
 
-    def _fake_reference_price(symbol: str) -> float:
+    def _fake_reference_quote(symbol: str) -> CryptoQuoteSnapshot:
         if symbol not in prices:
             raise RuntimeError(f"no fake reference price configured for {symbol!r}")
-        return prices[symbol]
+        mid = prices[symbol]
+        return CryptoQuoteSnapshot(
+            symbol=symbol,
+            bid_price=mid,
+            ask_price=mid,
+            mid_price=mid,
+            timestamp=dt.datetime.now(dt.timezone.utc),
+            age_seconds=0.1,
+        )
 
-    broker.get_crypto_reference_price = _fake_reference_price  # noqa: SLF001
+    broker.get_crypto_reference_quote = _fake_reference_quote  # noqa: SLF001
     return broker
 
 
@@ -410,6 +427,123 @@ def test_gtc_acceptance_fails_when_order_fills_instead_of_resting() -> None:
     assert client.cancelled == []
 
 
+def test_gtc_acceptance_records_residual_position_on_fill() -> None:
+    """Codex round-2 review finding 3: a bare FILLED status is not durable
+    evidence of how much inventory now exists -- the residual position must
+    be queried and recorded, not just the order's own status field."""
+    client = _FakeTradingClient(
+        assets={BTC: _crypto_asset()}, positions={BTC: 0.0001},
+    )
+    original_submit = client.submit_order
+
+    def _filled(order_data):
+        order = original_submit(order_data)
+        order.status = "filled"
+        return order
+
+    client.submit_order = _filled
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_gtc_order_acceptance(broker, (BTC,))
+    assert result.status == StepStatus.FAIL
+    assert "residual_position_qty" in result.detail
+    assert result.data["orders"][BTC]["residual_position_qty"] == pytest.approx(0.0001)
+
+
+def test_gtc_acceptance_fails_on_missing_order_type_field() -> None:
+    """Codex round-2 review finding 2: an EMPTY/missing broker-confirmed
+    field must FAIL, never be silently skipped -- the original `if field and
+    field != expected` pattern let a blank field slip past validation."""
+    client = _FakeTradingClient(assets={BTC: _crypto_asset()})
+    original_submit = client.submit_order
+
+    def _blank_order_type(order_data):
+        order = original_submit(order_data)
+        order.order_type = ""
+        return order
+
+    client.submit_order = _blank_order_type
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_gtc_order_acceptance(broker, (BTC,))
+    assert result.status == StepStatus.FAIL
+    assert "order_type" in result.detail
+    # Cleanup still happened despite the missing field.
+    assert client.cancelled == ["ord-1"]
+
+
+def test_gtc_acceptance_fails_on_quantity_mismatch() -> None:
+    """Codex round-2 review finding 2: quantity was not validated at all --
+    a broker-confirmed quantity that doesn't match the request must FAIL."""
+    client = _FakeTradingClient(assets={BTC: _crypto_asset()})
+    original_submit = client.submit_order
+
+    def _wrong_qty(order_data):
+        order = original_submit(order_data)
+        order.qty = order.qty * 2.0  # broker echoed a different quantity
+        return order
+
+    client.submit_order = _wrong_qty
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_gtc_order_acceptance(broker, (BTC,))
+    assert result.status == StepStatus.FAIL
+    assert "confirmed_quantity" in result.detail
+    assert client.cancelled == ["ord-1"]
+
+
+def test_gtc_acceptance_confirms_cancel_via_poll_despite_cancel_order_exception() -> None:
+    """Codex round-2 review finding 5: a cancel_order() call that RAISES is
+    not proof the order is still there -- the request may have reached the
+    broker despite a transport-level exception. Must still poll for the
+    actual terminal state and PASS if it's genuinely confirmed canceled."""
+    client = _FakeTradingClient(assets={BTC: _crypto_asset()})
+    original_cancel = client.cancel_order_by_id
+
+    def _raise_then_actually_cancel(order_id: str) -> None:
+        # The broker DID process the cancellation (order reaches "canceled"
+        # in the fake's internal state via the real cancel path) but the
+        # transport call back to us raises anyway.
+        original_cancel(order_id)
+        raise RuntimeError("simulated transport timeout after broker ack")
+
+    client.cancel_order_by_id = _raise_then_actually_cancel
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_gtc_order_acceptance(
+        broker,
+        (BTC,),
+        cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+        cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+    )
+    assert result.status == StepStatus.PASS
+    assert result.data["orders"][BTC]["cancel_confirmed"] is True
+    assert result.data["orders"][BTC]["cancel_exception"] is not None
+    assert "transport timeout" in result.data["orders"][BTC]["cancel_exception"]
+
+
+def test_gtc_acceptance_fails_when_cancel_raises_and_poll_never_confirms() -> None:
+    """The counterpart to the above: cancel_order() raises AND the poll
+    genuinely never observes a terminal canceled state -- must FAIL, with
+    both the exception and the unconfirmed poll result recorded."""
+    client = _FakeTradingClient(
+        assets={BTC: _crypto_asset()},
+        order_status_sequence={"ord-1": ["accepted"]},
+    )
+
+    def _raise_only(order_id: str) -> None:
+        raise RuntimeError("simulated hard transport failure")
+
+    client.cancel_order_by_id = _raise_only
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_gtc_order_acceptance(
+        broker,
+        (BTC,),
+        cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+        cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+    )
+    assert result.status == StepStatus.FAIL
+    assert "simulated hard transport failure" in result.detail
+    assert "not subsequently confirmed" in result.detail
+    assert result.data["orders"][BTC]["cancel_confirmed"] is False
+
+
 def test_gtc_acceptance_fails_on_side_mismatch() -> None:
     """Acceptance must be confirmed from genuinely matching order fields,
     not just a nonempty order_id (Codex review 2026-07-12 finding 2). The
@@ -440,7 +574,7 @@ def test_gtc_acceptance_fails_when_reference_price_lookup_fails() -> None:
     broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC}, reference_prices={})
     result = _check_gtc_order_acceptance(broker, (BTC,))
     assert result.status == StepStatus.FAIL
-    assert "reference price lookup failed" in result.detail
+    assert "reference quote lookup failed" in result.detail
     # Never even attempted to place an order without a reference price.
     assert client.submitted == []
 
@@ -788,12 +922,18 @@ def test_place_crypto_stop_limit_order_rejects_equity() -> None:
         broker.place_crypto_stop_limit_order("AAPL", "BUY", 1.0, 100.0, 101.0)
 
 
-# ── AlpacaBroker.get_crypto_reference_price (Codex review finding 3) ───────
+# ── AlpacaBroker.get_crypto_reference_price/_quote (Codex finding 3, round-2 finding 4) ──
+
+
+def _fresh_ts() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
 
 
 def test_get_crypto_reference_price_mid_of_bid_ask() -> None:
     broker = AlpacaBroker(paper=True)
-    fake_quote = SimpleNamespace(bid_price=59_900.0, ask_price=60_100.0)
+    fake_quote = SimpleNamespace(
+        bid_price=59_900.0, ask_price=60_100.0, timestamp=_fresh_ts(), symbol=BTC,
+    )
     with patch(
         "alpaca.data.historical.crypto.CryptoHistoricalDataClient"
     ) as mock_client_cls:
@@ -806,7 +946,9 @@ def test_get_crypto_reference_price_mid_of_bid_ask() -> None:
 
 def test_get_crypto_reference_price_falls_back_to_ask_only() -> None:
     broker = AlpacaBroker(paper=True)
-    fake_quote = SimpleNamespace(bid_price=0.0, ask_price=60_100.0)
+    fake_quote = SimpleNamespace(
+        bid_price=0.0, ask_price=60_100.0, timestamp=_fresh_ts(), symbol=BTC,
+    )
     with patch(
         "alpaca.data.historical.crypto.CryptoHistoricalDataClient"
     ) as mock_client_cls:
@@ -831,7 +973,9 @@ def test_get_crypto_reference_price_raises_on_lookup_failure() -> None:
 
 def test_get_crypto_reference_price_raises_when_no_usable_quote() -> None:
     broker = AlpacaBroker(paper=True)
-    fake_quote = SimpleNamespace(bid_price=0.0, ask_price=0.0)
+    fake_quote = SimpleNamespace(
+        bid_price=0.0, ask_price=0.0, timestamp=_fresh_ts(), symbol=BTC,
+    )
     with patch(
         "alpaca.data.historical.crypto.CryptoHistoricalDataClient"
     ) as mock_client_cls:
@@ -840,3 +984,89 @@ def test_get_crypto_reference_price_raises_when_no_usable_quote() -> None:
         }
         with pytest.raises(RuntimeError, match="no usable bid/ask quote"):
             broker.get_crypto_reference_price(BTC)
+
+
+def test_get_crypto_reference_quote_returns_typed_snapshot_with_provenance() -> None:
+    """Codex round-2 finding 4: a bare float drops quote timestamp/source/
+    symbol identity. get_crypto_reference_quote must return all of it."""
+    broker = AlpacaBroker(paper=True)
+    ts = _fresh_ts()
+    fake_quote = SimpleNamespace(
+        bid_price=59_900.0, ask_price=60_100.0, timestamp=ts, symbol=BTC,
+    )
+    with patch(
+        "alpaca.data.historical.crypto.CryptoHistoricalDataClient"
+    ) as mock_client_cls:
+        mock_client_cls.return_value.get_crypto_latest_quote.return_value = {
+            BTC: fake_quote,
+        }
+        snapshot = broker.get_crypto_reference_quote(BTC)
+    assert snapshot.symbol == BTC
+    assert snapshot.bid_price == pytest.approx(59_900.0)
+    assert snapshot.ask_price == pytest.approx(60_100.0)
+    assert snapshot.mid_price == pytest.approx(60_000.0)
+    assert snapshot.timestamp == ts
+    assert snapshot.age_seconds < 1.0
+
+
+def test_get_crypto_reference_quote_rejects_missing_timestamp() -> None:
+    broker = AlpacaBroker(paper=True)
+    fake_quote = SimpleNamespace(
+        bid_price=59_900.0, ask_price=60_100.0, timestamp=None, symbol=BTC,
+    )
+    with patch(
+        "alpaca.data.historical.crypto.CryptoHistoricalDataClient"
+    ) as mock_client_cls:
+        mock_client_cls.return_value.get_crypto_latest_quote.return_value = {
+            BTC: fake_quote,
+        }
+        with pytest.raises(RuntimeError, match="no timestamp"):
+            broker.get_crypto_reference_quote(BTC)
+
+
+def test_get_crypto_reference_quote_rejects_stale_quote() -> None:
+    broker = AlpacaBroker(paper=True)
+    stale_ts = _fresh_ts() - dt.timedelta(seconds=120)
+    fake_quote = SimpleNamespace(
+        bid_price=59_900.0, ask_price=60_100.0, timestamp=stale_ts, symbol=BTC,
+    )
+    with patch(
+        "alpaca.data.historical.crypto.CryptoHistoricalDataClient"
+    ) as mock_client_cls:
+        mock_client_cls.return_value.get_crypto_latest_quote.return_value = {
+            BTC: fake_quote,
+        }
+        with pytest.raises(RuntimeError, match="stale"):
+            broker.get_crypto_reference_quote(BTC, max_staleness_seconds=60.0)
+
+
+def test_get_crypto_reference_quote_rejects_implausible_future_timestamp() -> None:
+    broker = AlpacaBroker(paper=True)
+    future_ts = _fresh_ts() + dt.timedelta(seconds=30)
+    fake_quote = SimpleNamespace(
+        bid_price=59_900.0, ask_price=60_100.0, timestamp=future_ts, symbol=BTC,
+    )
+    with patch(
+        "alpaca.data.historical.crypto.CryptoHistoricalDataClient"
+    ) as mock_client_cls:
+        mock_client_cls.return_value.get_crypto_latest_quote.return_value = {
+            BTC: fake_quote,
+        }
+        with pytest.raises(RuntimeError, match="future timestamp"):
+            broker.get_crypto_reference_quote(BTC)
+
+
+def test_get_crypto_reference_quote_accepts_fresh_quote_within_staleness_bound() -> None:
+    broker = AlpacaBroker(paper=True)
+    almost_stale_ts = _fresh_ts() - dt.timedelta(seconds=59)
+    fake_quote = SimpleNamespace(
+        bid_price=59_900.0, ask_price=60_100.0, timestamp=almost_stale_ts, symbol=BTC,
+    )
+    with patch(
+        "alpaca.data.historical.crypto.CryptoHistoricalDataClient"
+    ) as mock_client_cls:
+        mock_client_cls.return_value.get_crypto_latest_quote.return_value = {
+            BTC: fake_quote,
+        }
+        snapshot = broker.get_crypto_reference_quote(BTC, max_staleness_seconds=60.0)
+    assert snapshot.mid_price == pytest.approx(60_000.0)
