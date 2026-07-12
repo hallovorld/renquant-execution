@@ -1,80 +1,21 @@
 """Crypto Stage-0 paper battery step checks (RFC D-C12).
 
-Ownership: these are broker-adapter checks — they construct Alpaca SDK
-request/enum objects (``LimitOrderRequest``, ``StopLimitOrderRequest``,
-``OrderSide``, ``TimeInForce``, ``GetAssetsRequest``, ``CryptoBarsRequest``,
-etc.) and drive the trading/data clients directly. That is broker-adapter
-work, which ``renquant-orchestrator``'s own ``CLAUDE.md`` hard-boundaries
-away from that repo ("Do not implement broker adapters here."). This
-module is a straight MOVE (not a rewrite) of the 7 step-check functions
-that originally lived in ``renquant-orchestrator``'s
-``scripts/crypto_stage0_battery.py`` (PR #498) — logic and PASS/FAIL/ERROR
-classification are unchanged; only the import boundary moved.
+Ownership: broker-adapter checks that construct Alpaca SDK request/enum
+objects and drive the trading/data clients directly.
 
-Two independent reasons this moved here, found and fixed proactively
-(before Codex's review of orchestrator#498):
-
-1. **CI was genuinely red.** Orchestrator's CI job
-   (``renquant-orchestrator/.github/workflows/ci.yml``) never installs
-   ``alpaca-py`` — its pip install line lists
-   ``pytest numpy pandas scipy xgboost pyarrow pydantic cvxpy
-   scikit-learn pandas_market_calendars`` only. The step functions'
-   deferred (in-function) ``from alpaca...`` imports raised
-   ``ModuleNotFoundError`` in that environment even with a
-   ``MagicMock()`` client passed in, because the SDK enum/request TYPES
-   themselves (not just the client) were unavailable — surfacing as
-   ``ERROR`` status instead of the expected ``PASS``/``FAIL`` in CI's
-   test run.
-2. **Architecture boundary.** Same anti-pattern Codex flagged repeatedly
-   this cycle (e.g. orchestrator#481's umbrella-script issue; the
-   architecture-violation-registry audit) — orchestrator directly
-   touching a broker SDK it should only consume through execution's
-   public API. This repo (``renquant-execution``) already owns all
-   Alpaca SDK interaction elsewhere (``alpaca_broker.py``,
-   ``alpaca_broker_port.py``) and already declares ``alpaca-py`` as a
-   real (optional-extra) dependency — see ``pyproject.toml``'s
-   ``[project.optional-dependencies] alpaca`` group, installed in this
-   repo's own CI job.
-
-This exactly mirrors the ``software_stops_liveness.py`` precedent
-(renquant-execution#29/#30, 2026-07-11/12): a broker/runtime-facing
-checker moved out of orchestrator into this repo, with orchestrator kept
-as a thin CLI/reporting consumer.
-
-Ownership split (this module vs. the orchestrator script):
-  * renquant-execution (HERE) — the 7 broker-facing STEP CHECKS
-    themselves (account/asset/order/data queries against the Alpaca SDK)
-    plus the client factories they need.
-  * renquant-orchestrator — CLI argument parsing (``--paper``,
-    ``--dry-run``), aggregating the 7 ``StepResult``s into a
-    ``BatteryReport``, JSON report writing, and exit-code handling. Does
-    not reimplement any broker-facing logic; imports the step functions
-    from here.
-
-Public surface (judgment call — flag for review): NOT re-exported from
-``renquant_execution/__init__.py``. Two conventions coexist in this
-package: (a) stable, semantically-specific names go through
-``__init__.py``'s ``__all__`` (e.g. ``execution_payload``,
-``normalize_order_intent``); (b) an "operational checker" module that
-owns its own generic-sounding vocabulary is imported directly by its
-submodule path instead — the precedent being ``software_stops_liveness``
-itself, which orchestrator consumes without ever appearing in
-``__all__``. This module's names (``StepResult``, ``CANARY_PAIRS``,
-``get_trading_client``, ...) are generic enough that re-exporting them
-bare from the flat package namespace risks a future collision with an
-unrelated checker; that plus following the closer structural precedent
-(another "battery of operational checks" module) is why direct-import
-was chosen here:
-
-    from renquant_execution.crypto_stage0_checks import (
-        StepResult, step_crypto_status, step_pair_snapshot, ...,
-        get_trading_client, get_crypto_data_client,
-    )
-
-If a reviewer prefers the ``__init__.py``-export convention instead
-(matching ``execution_payload`` et al.), that is an easy, low-risk
-follow-up — nothing about the module's internals depends on which
-surface orchestrator uses.
+Safety invariants (codex review round 2):
+  * ``run_battery()`` hard-rejects ``paper=False`` -- the battery NEVER
+    touches a live account.
+  * ``transactional=False`` (the default) runs only passive/read-only
+    checks (account status, pair snapshot, buying power, data parity).
+    Transactional paper probes (order acceptance, stop-limit acceptance,
+    fee-from-fill round-trip) require ``transactional=True``.
+  * Every order submission (limit, stop-limit, market) polls to terminal
+    state before returning -- no fire-and-forget.
+  * ``step_fee_from_fill`` executes a bounded-notional BUY, polls to
+    fill, submits a compensating SELL for the filled qty, polls that to
+    fill, and audits residual position.  Cleanup failure is surfaced as
+    a distinct Tier-1 result.
 """
 from __future__ import annotations
 
@@ -87,6 +28,10 @@ from typing import Any
 CANARY_PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD"]
 TEST_NOTIONAL_USD = 1.10
 
+_TERMINAL_STATUS_FRAGMENTS = ("fill", "cancel", "expire", "reject")
+_POLL_MAX_ATTEMPTS = 10
+_POLL_SLEEP_SEC = 0.5
+
 
 @dataclass
 class StepResult:
@@ -94,6 +39,28 @@ class StepResult:
     status: str  # PASS, FAIL, SKIP, ERROR
     detail: str = ""
     data: dict[str, Any] = field(default_factory=dict)
+
+
+def _poll_order_terminal(
+    client,
+    order_id,
+    *,
+    max_attempts: int = _POLL_MAX_ATTEMPTS,
+    sleep_sec: float = _POLL_SLEEP_SEC,
+) -> tuple[bool, Any]:
+    """Poll until an order reaches a terminal state.
+
+    Returns ``(reached_terminal, order_object)``.  Terminal means the
+    stringified status contains one of: fill, cancel, expire, reject.
+    """
+    order = None
+    for _ in range(max_attempts):
+        order = client.get_order_by_id(order_id)
+        status_str = str(order.status).lower()
+        if any(frag in status_str for frag in _TERMINAL_STATUS_FRAGMENTS):
+            return True, order
+        time.sleep(sleep_sec)
+    return False, order
 
 
 def get_trading_client(*, paper: bool = True):
@@ -194,7 +161,11 @@ def step_pair_snapshot(client) -> StepResult:
 
 
 def step_order_acceptance(client, *, dry_run: bool) -> StepResult:
-    """Test GTC limit order acceptance on canary pairs."""
+    """Test GTC limit order acceptance on canary pairs.
+
+    Submits a far-from-market limit BUY, cancels it, and polls until the
+    cancel reaches a terminal state before reporting success.
+    """
     if dry_run:
         return StepResult(
             "order_acceptance",
@@ -219,19 +190,33 @@ def step_order_acceptance(client, *, dry_run: bool) -> StepResult:
                     )
                 )
                 client.cancel_order_by_id(order.id)
+                terminal, final = _poll_order_terminal(client, order.id)
                 results_per_pair[pair] = {
                     "accepted": True,
+                    "cancel_confirmed": terminal,
                     "order_id": str(order.id),
+                    "final_status": str(final.status),
                     "tif": "GTC",
                 }
             except Exception as e:
                 results_per_pair[pair] = {"accepted": False, "error": str(e)}
 
-        all_ok = all(r.get("accepted") for r in results_per_pair.values())
+        all_accepted = all(r.get("accepted") for r in results_per_pair.values())
+        all_cancelled = all(
+            r.get("cancel_confirmed", True) for r in results_per_pair.values()
+        )
+        accepted_count = sum(
+            r.get("accepted", False) for r in results_per_pair.values()
+        )
+        detail = (
+            f"{accepted_count}/{len(results_per_pair)} pairs accepted GTC limit"
+        )
+        if not all_cancelled:
+            detail += "; some cancels not confirmed terminal"
         return StepResult(
             "order_acceptance",
-            "PASS" if all_ok else "FAIL",
-            f"{sum(r.get('accepted', False) for r in results_per_pair.values())}/{len(results_per_pair)} pairs accepted GTC limit",
+            "PASS" if (all_accepted and all_cancelled) else "FAIL",
+            detail,
             {"results": results_per_pair},
         )
     except Exception as e:
@@ -239,7 +224,11 @@ def step_order_acceptance(client, *, dry_run: bool) -> StepResult:
 
 
 def step_stop_limit_acceptance(client, *, dry_run: bool) -> StepResult:
-    """Test GTC stop-limit order acceptance on canary pairs."""
+    """Test GTC stop-limit order acceptance on canary pairs.
+
+    Submits a far-from-market stop-limit SELL, cancels it, and polls
+    until the cancel reaches a terminal state before reporting success.
+    """
     if dry_run:
         return StepResult(
             "stop_limit_acceptance",
@@ -265,18 +254,33 @@ def step_stop_limit_acceptance(client, *, dry_run: bool) -> StepResult:
                     )
                 )
                 client.cancel_order_by_id(order.id)
+                terminal, final = _poll_order_terminal(client, order.id)
                 results_per_pair[pair] = {
                     "accepted": True,
+                    "cancel_confirmed": terminal,
                     "order_id": str(order.id),
+                    "final_status": str(final.status),
                 }
             except Exception as e:
                 results_per_pair[pair] = {"accepted": False, "error": str(e)}
 
-        all_ok = all(r.get("accepted") for r in results_per_pair.values())
+        all_accepted = all(r.get("accepted") for r in results_per_pair.values())
+        all_cancelled = all(
+            r.get("cancel_confirmed", True) for r in results_per_pair.values()
+        )
+        accepted_count = sum(
+            r.get("accepted", False) for r in results_per_pair.values()
+        )
+        detail = (
+            f"{accepted_count}/{len(results_per_pair)} pairs accepted "
+            "GTC stop-limit"
+        )
+        if not all_cancelled:
+            detail += "; some cancels not confirmed terminal"
         return StepResult(
             "stop_limit_acceptance",
-            "PASS" if all_ok else "FAIL",
-            f"{sum(r.get('accepted', False) for r in results_per_pair.values())}/{len(results_per_pair)} pairs accepted GTC stop-limit",
+            "PASS" if (all_accepted and all_cancelled) else "FAIL",
+            detail,
             {"results": results_per_pair},
         )
     except Exception as e:
@@ -284,7 +288,14 @@ def step_stop_limit_acceptance(client, *, dry_run: bool) -> StepResult:
 
 
 def step_fee_from_fill(client, *, dry_run: bool) -> StepResult:
-    """Place a small market buy to capture fee data from the fill receipt."""
+    """Place a bounded-notional market BUY, poll to fill, submit a
+    compensating SELL for the filled qty, poll that to fill, and audit
+    the residual position.
+
+    A cleanup failure (compensating sell does not fill or residual
+    position remains) is surfaced as a Tier-1 FAIL with
+    ``cleanup_failure=True`` in the result data.
+    """
     if dry_run:
         return StepResult(
             "fee_from_fill",
@@ -296,7 +307,9 @@ def step_fee_from_fill(client, *, dry_run: bool) -> StepResult:
         from alpaca.trading.enums import OrderSide, TimeInForce
 
         symbol = CANARY_PAIRS[0].replace("/", "")
-        order = client.submit_order(
+
+        # -- 1. Submit bounded-notional BUY ------------------------------------
+        buy_order = client.submit_order(
             MarketOrderRequest(
                 symbol=symbol,
                 notional=TEST_NOTIONAL_USD,
@@ -304,28 +317,95 @@ def step_fee_from_fill(client, *, dry_run: bool) -> StepResult:
                 time_in_force=TimeInForce.GTC,
             )
         )
-        time.sleep(3)
-        filled = client.get_order_by_id(order.id)
-        fee_data = {
-            "order_id": str(filled.id),
-            "symbol": symbol,
-            "status": str(filled.status),
-            "filled_avg_price": str(getattr(filled, "filled_avg_price", "N/A")),
-            "filled_qty": str(getattr(filled, "filled_qty", "N/A")),
-            "notional": str(getattr(filled, "notional", "N/A")),
-        }
-        status_str = str(filled.status).lower()
-        if "fill" in status_str:
+
+        # -- 2. Poll until BUY fills ------------------------------------------
+        buy_terminal, buy_filled = _poll_order_terminal(client, buy_order.id)
+        buy_status_str = str(buy_filled.status).lower()
+
+        if not buy_terminal or "fill" not in buy_status_str:
             return StepResult(
                 "fee_from_fill",
-                "PASS",
-                f"Market buy filled; avg_price={fee_data['filled_avg_price']}",
+                "FAIL",
+                f"BUY did not fill; status={buy_filled.status}",
+                {
+                    "buy_order_id": str(buy_order.id),
+                    "buy_status": str(buy_filled.status),
+                },
+            )
+
+        fee_data: dict[str, Any] = {
+            "buy_order_id": str(buy_filled.id),
+            "symbol": symbol,
+            "buy_status": str(buy_filled.status),
+            "filled_avg_price": str(
+                getattr(buy_filled, "filled_avg_price", "N/A")
+            ),
+            "filled_qty": str(getattr(buy_filled, "filled_qty", "N/A")),
+            "notional": str(getattr(buy_filled, "notional", "N/A")),
+        }
+
+        # -- 3. Submit compensating SELL for the filled qty --------------------
+        filled_qty = getattr(buy_filled, "filled_qty", None)
+        if not filled_qty:
+            fee_data["cleanup_failure"] = True
+            return StepResult(
+                "fee_from_fill",
+                "FAIL",
+                "BUY filled but filled_qty unavailable for compensating sell",
                 fee_data,
             )
+
+        sell_order = client.submit_order(
+            MarketOrderRequest(
+                symbol=symbol,
+                qty=str(filled_qty),
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.GTC,
+            )
+        )
+
+        # -- 4. Poll until SELL fills ------------------------------------------
+        sell_terminal, sell_filled = _poll_order_terminal(client, sell_order.id)
+        sell_status_str = str(sell_filled.status).lower()
+        fee_data["sell_order_id"] = str(sell_filled.id)
+        fee_data["sell_status"] = str(sell_filled.status)
+
+        if not sell_terminal or "fill" not in sell_status_str:
+            fee_data["cleanup_failure"] = True
+            return StepResult(
+                "fee_from_fill",
+                "FAIL",
+                f"Compensating SELL did not fill; status={sell_filled.status}; "
+                "residual position may remain",
+                fee_data,
+            )
+
+        # -- 5. Residual-position audit ----------------------------------------
+        try:
+            positions = client.get_all_positions()
+            residual = [
+                p
+                for p in positions
+                if getattr(p, "symbol", "") == symbol
+            ]
+            if residual:
+                residual_qty = str(getattr(residual[0], "qty", "unknown"))
+                fee_data["residual_qty"] = residual_qty
+                fee_data["cleanup_failure"] = True
+                return StepResult(
+                    "fee_from_fill",
+                    "FAIL",
+                    f"Round-trip complete but residual position remains: "
+                    f"qty={residual_qty}",
+                    fee_data,
+                )
+        except Exception as e:
+            fee_data["residual_check_error"] = str(e)
+
         return StepResult(
             "fee_from_fill",
-            "FAIL",
-            f"Order status={filled.status}, expected filled",
+            "PASS",
+            f"Round-trip complete; avg_price={fee_data['filled_avg_price']}",
             fee_data,
         )
     except Exception as e:
@@ -442,3 +522,80 @@ def step_data_parity(*, dry_run: bool) -> StepResult:
         return StepResult("data_parity", "SKIP", "yfinance not installed")
     except Exception as e:
         return StepResult("data_parity", "ERROR", str(e))
+
+
+# ── High-level battery entry point ──────────────────────────────────────────
+
+
+def run_battery(
+    *,
+    paper: bool = True,
+    dry_run: bool = False,
+    transactional: bool = False,
+) -> list[StepResult]:
+    """Run the Stage-0 crypto battery.
+
+    Parameters
+    ----------
+    paper : bool
+        Must be ``True``.  Passing ``paper=False`` raises ``ValueError``
+        -- the battery NEVER touches a live account.
+    dry_run : bool
+        When ``True`` the transactional steps return SKIP instead of
+        placing orders (same as before).
+    transactional : bool
+        ``False`` (default) runs only passive/read-only checks.
+        ``True`` additionally runs the three paper-order probes
+        (order acceptance, stop-limit acceptance, fee-from-fill
+        round-trip).
+
+    Returns
+    -------
+    list[StepResult]
+        One result per step, in deterministic order.
+    """
+    if not paper:
+        raise ValueError(
+            "run_battery() only supports paper=True; "
+            "live trading is not permitted for battery checks"
+        )
+
+    client = get_trading_client(paper=True)
+
+    results: list[StepResult] = []
+
+    # -- Passive checks (always run) -------------------------------------------
+    results.append(step_crypto_status(client))
+    results.append(step_pair_snapshot(client))
+    results.append(step_buying_power(client))
+    results.append(step_data_parity(dry_run=dry_run))
+
+    # -- Transactional paper probes (opt-in) -----------------------------------
+    if transactional:
+        results.append(step_order_acceptance(client, dry_run=dry_run))
+        results.append(step_stop_limit_acceptance(client, dry_run=dry_run))
+        results.append(step_fee_from_fill(client, dry_run=dry_run))
+    else:
+        results.append(
+            StepResult(
+                "order_acceptance",
+                "SKIP",
+                "Skipped (transactional=False)",
+            )
+        )
+        results.append(
+            StepResult(
+                "stop_limit_acceptance",
+                "SKIP",
+                "Skipped (transactional=False)",
+            )
+        )
+        results.append(
+            StepResult(
+                "fee_from_fill",
+                "SKIP",
+                "Skipped (transactional=False)",
+            )
+        )
+
+    return results
