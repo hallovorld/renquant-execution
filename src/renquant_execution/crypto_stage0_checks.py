@@ -374,16 +374,30 @@ def _place_probe_and_confirm_cleanup(
     detail["cancel_confirmed"] = cancel_confirmed
     detail["cancel_exception"] = cancel_exception
     if not cancel_confirmed:
+        # An unconfirmed cancellation is ambiguous: the order may still be
+        # resting, or it may have filled during the cancel-confirm window
+        # (a genuinely different, more severe outcome --
+        # wait_for_order_terminal_cancel returns False for EITHER case, per
+        # its own docstring). Query residual position now for durable
+        # evidence rather than leaving the operator to guess which
+        # happened -- this is the same class of race a same-package
+        # concurrent fix (execution#36, closed in favor of this PR) flagged:
+        # a resting-at-acceptance-time order can still fill before/during
+        # cleanup, which the initial synchronous FILLED-status check above
+        # cannot see.
+        detail["residual_position_qty"] = _query_residual_position(broker, symbol)
         reason = (
             f"cancel_order raised ({cancel_exception}) and cancellation of "
             f"order {order_id} was not subsequently confirmed terminally "
             f"canceled within {cancel_confirm_timeout_seconds}s -- order may "
-            "still be resting/uncancelled"
+            f"still be resting/uncancelled or may have filled "
+            f"(residual_position_qty={detail['residual_position_qty']!r})"
             if cancel_exception is not None
             else (
                 f"cancellation of order {order_id} not confirmed terminally "
                 f"canceled within {cancel_confirm_timeout_seconds}s -- order "
-                "may still be resting/uncancelled"
+                f"may still be resting/uncancelled or may have filled "
+                f"(residual_position_qty={detail['residual_position_qty']!r})"
             )
         )
         return False, reason, detail

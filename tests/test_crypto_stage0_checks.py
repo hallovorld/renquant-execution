@@ -405,6 +405,28 @@ def test_gtc_acceptance_fails_when_cancellation_not_confirmed() -> None:
     assert result.data["orders"][BTC]["cancel_confirmed"] is False
 
 
+def test_gtc_acceptance_queries_residual_position_when_cancel_unconfirmed() -> None:
+    """An unconfirmed cancellation is ambiguous (still resting, or filled
+    during the cancel-confirm window) -- residual position must be queried
+    as durable evidence, same discipline as the initial-FILLED-status path
+    (the race a same-package concurrent fix flagged: execution#36)."""
+    client = _FakeTradingClient(
+        assets={BTC: _crypto_asset()},
+        order_status_sequence={"ord-1": ["accepted"]},
+        positions={BTC: 0.0001},
+    )
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_gtc_order_acceptance(
+        broker,
+        (BTC,),
+        cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+        cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+    )
+    assert result.status == StepStatus.FAIL
+    assert "residual_position_qty" in result.detail
+    assert result.data["orders"][BTC]["residual_position_qty"] == pytest.approx(0.0001)
+
+
 def test_gtc_acceptance_fails_when_order_fills_instead_of_resting() -> None:
     """A probe order that FILLS is a more severe Tier-1 condition than a
     merely-rejected one: real paper inventory was acquired. No cancel is

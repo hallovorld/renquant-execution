@@ -378,3 +378,34 @@ accepts-within-bound case, and both halves of the cancel-exception-then-poll
 behavior (poll confirms cancellation despite the exception -> PASS with
 evidence; poll also fails to confirm -> FAIL naming both). Full suite: 444
 passed, 2 skipped (was 434/2 before this round; +10 net) `[VERIFIED]`.
+
+## Revision note (round 3, 2026-07-12) -- residual-exposure race closed
+
+A concurrent session opened execution#35 then #36 in parallel with round 2
+above, independently re-implementing overlapping fixes on the same
+lineage. Compared both against this PR's round-2 head in detail rather than
+picking one blind: #35/#36's order-acceptance-strictness, environment
+(`base_url`) cross-check, and report-integrity (nonempty required-gate set,
+schema version, content hash) ideas were good, but its stop-limit fix
+relabeled the check `required=False`/non-gating instead of fixing the
+actual price-band false-negative risk -- the weaker of the two remediation
+paths Codex explicitly offered, whereas this PR's quote-derived canary
+pricing keeps the check meaningful. Closed #35 and #36 crediting their
+genuinely good ideas (`gh pr view 35`/`36 --repo hallovorld/renquant-execution`
+for the full comparison).
+
+One idea from #36 was worth adopting on its own merits: `_check_residual_exposure()`
+queried order state + position after EVERY probe, not just when the
+*initial* synchronous response already reported filled/partially_filled.
+This closes a real race this PR's round-2 fix didn't cover -- a probe order
+resting at acceptance time can still fill asynchronously during the
+cancel-confirm window, and the round-2 fix's residual-position query only
+fired on the initial-status branch. Added the same residual-position query
+to the `cancel_confirmed is False` branch (an unconfirmed cancellation is
+ambiguous: still resting, or filled during the window --
+`wait_for_order_terminal_cancel` returns `False` for either case per its
+own docstring, so this is exactly where the ambiguity needs resolving with
+evidence).
+
+1 new test (`test_gtc_acceptance_queries_residual_position_when_cancel_unconfirmed`).
+Full suite: 445 passed, 2 skipped (was 444/2; +1 net) `[VERIFIED]`.
