@@ -123,6 +123,14 @@ class _FakeTradingClient:
             getattr(getattr(order_data, "side", ""), "value", "") or ""
         ).upper()
         order_id = f"ord-{len(self.submitted)}"
+        # Extract broker-confirmed fields from the request so they
+        # appear on the returned order object (mirroring the real SDK
+        # Order model).  _order_to_dict reads these to populate the
+        # confirmed_* fields that _validate_order_acceptance checks.
+        tif_raw = getattr(order_data, "time_in_force", "")
+        tif_value = str(getattr(tif_raw, "value", tif_raw) or "")
+        otype_raw = getattr(order_data, "type", "")
+        otype_value = str(getattr(otype_raw, "value", otype_raw) or "")
         order = SimpleNamespace(
             id=order_id,
             status="accepted",
@@ -131,6 +139,15 @@ class _FakeTradingClient:
             qty=qty,
             filled_qty=0.0,
             filled_avg_price=0.0,
+            time_in_force=tif_value,
+            order_type=otype_value,
+            asset_class="crypto",
+            limit_price=float(
+                getattr(order_data, "limit_price", 0.0) or 0.0
+            ),
+            stop_price=float(
+                getattr(order_data, "stop_price", 0.0) or 0.0
+            ),
         )
         self._orders_by_id[order_id] = order
         return order
@@ -802,7 +819,8 @@ class TestValidateOrderAcceptance:
             "order_id": "ord-1",
             "status": "accepted",
             "side": "BUY",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_qty": 1.0,
         }
         assert _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -813,7 +831,8 @@ class TestValidateOrderAcceptance:
             "order_id": "ord-1",
             "status": "new",
             "side": "BUY",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_qty": 1.0,
         }
         assert _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -824,7 +843,7 @@ class TestValidateOrderAcceptance:
             "order_id": "ord-1",
             "status": "rejected",
             "side": "BUY",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -837,7 +856,7 @@ class TestValidateOrderAcceptance:
             "order_id": "ord-1",
             "status": "filled",
             "side": "BUY",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -858,7 +877,7 @@ class TestValidateOrderAcceptance:
             "order_id": "ord-1",
             "status": "accepted",
             "side": "SELL",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -871,13 +890,13 @@ class TestValidateOrderAcceptance:
             "order_id": "ord-1",
             "status": "accepted",
             "side": "BUY",
-            "time_in_force": "day",
+            "confirmed_time_in_force": "day",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
         )
         assert failure is not None
-        assert "time_in_force=" in failure
+        assert "confirmed_time_in_force=" in failure
 
 
 class TestUnverifiedEnvironment:
@@ -1033,7 +1052,7 @@ class TestUnknownMissingOrderFields:
             "order_id": "ord-1",
             "status": "pending_new",
             "side": "BUY",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -1047,7 +1066,7 @@ class TestUnknownMissingOrderFields:
             "order_id": "ord-1",
             "status": "partially_filled",
             "side": "BUY",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -1061,7 +1080,7 @@ class TestUnknownMissingOrderFields:
             "order_id": "ord-1",
             "status": "held",
             "side": "BUY",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -1075,7 +1094,7 @@ class TestUnknownMissingOrderFields:
             "order_id": "ord-1",
             "status": "",
             "side": "BUY",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -1088,7 +1107,7 @@ class TestUnknownMissingOrderFields:
             "order_id": "ord-1",
             "status": "accepted",
             "side": "",
-            "time_in_force": "gtc",
+            "confirmed_time_in_force": "gtc",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
@@ -1097,34 +1116,39 @@ class TestUnknownMissingOrderFields:
         assert "missing side" in failure
 
     def test_missing_tif_rejected(self) -> None:
-        """Absent time_in_force field is rejected."""
+        """Absent confirmed_time_in_force field is rejected."""
         result = {
             "order_id": "ord-1",
             "status": "accepted",
             "side": "BUY",
-            "time_in_force": "",
+            "confirmed_time_in_force": "",
         }
         failure = _validate_order_acceptance(
             result, expected_side="BUY", expected_tif="gtc", pair=BTC,
         )
         assert failure is not None
-        assert "missing time_in_force" in failure
+        assert "missing confirmed_time_in_force" in failure
 
 
 # ── review item #1 hardening: wrong order type/asset class ───────────────
 
 
 class TestWrongOrderTypeAssetClass:
-    """Mismatch in order_type or asset_class must cause rejection."""
+    """Mismatch in confirmed_order_type or confirmed_asset_class must cause
+    rejection.  These are broker-confirmed fields, not the wrapper's request
+    echo.
+    """
 
     def test_wrong_order_type_rejected(self) -> None:
         result = {
             "order_id": "ord-1",
             "status": "accepted",
             "side": "BUY",
-            "time_in_force": "gtc",
-            "order_type": "market",
-            "asset_class": "crypto",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_order_type": "market",
+            "confirmed_asset_class": "crypto",
+            "confirmed_qty": 1.0,
+            "confirmed_limit_price": 100.0,
         }
         failure = _validate_order_acceptance(
             result,
@@ -1135,7 +1159,7 @@ class TestWrongOrderTypeAssetClass:
             pair=BTC,
         )
         assert failure is not None
-        assert "order_type=" in failure
+        assert "confirmed_order_type=" in failure
         assert "market" in failure
 
     def test_missing_order_type_rejected(self) -> None:
@@ -1143,9 +1167,11 @@ class TestWrongOrderTypeAssetClass:
             "order_id": "ord-1",
             "status": "accepted",
             "side": "BUY",
-            "time_in_force": "gtc",
-            "order_type": "",
-            "asset_class": "crypto",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_order_type": "",
+            "confirmed_asset_class": "crypto",
+            "confirmed_qty": 1.0,
+            "confirmed_limit_price": 100.0,
         }
         failure = _validate_order_acceptance(
             result,
@@ -1156,16 +1182,18 @@ class TestWrongOrderTypeAssetClass:
             pair=BTC,
         )
         assert failure is not None
-        assert "missing order_type" in failure
+        assert "missing confirmed_order_type" in failure
 
     def test_wrong_asset_class_rejected(self) -> None:
         result = {
             "order_id": "ord-1",
             "status": "accepted",
             "side": "BUY",
-            "time_in_force": "gtc",
-            "order_type": "limit",
-            "asset_class": "us_equity",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_order_type": "limit",
+            "confirmed_asset_class": "us_equity",
+            "confirmed_qty": 1.0,
+            "confirmed_limit_price": 100.0,
         }
         failure = _validate_order_acceptance(
             result,
@@ -1176,7 +1204,7 @@ class TestWrongOrderTypeAssetClass:
             pair=BTC,
         )
         assert failure is not None
-        assert "asset_class=" in failure
+        assert "confirmed_asset_class=" in failure
         assert "us_equity" in failure
 
     def test_missing_asset_class_rejected(self) -> None:
@@ -1184,9 +1212,11 @@ class TestWrongOrderTypeAssetClass:
             "order_id": "ord-1",
             "status": "accepted",
             "side": "BUY",
-            "time_in_force": "gtc",
-            "order_type": "limit",
-            "asset_class": "",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_order_type": "limit",
+            "confirmed_asset_class": "",
+            "confirmed_qty": 1.0,
+            "confirmed_limit_price": 100.0,
         }
         failure = _validate_order_acceptance(
             result,
@@ -1197,17 +1227,19 @@ class TestWrongOrderTypeAssetClass:
             pair=BTC,
         )
         assert failure is not None
-        assert "missing asset_class" in failure
+        assert "missing confirmed_asset_class" in failure
 
     def test_correct_type_and_class_pass(self) -> None:
-        """When all fields match including order_type and asset_class, pass."""
+        """When all confirmed fields match, pass."""
         result = {
             "order_id": "ord-1",
             "status": "accepted",
             "side": "BUY",
-            "time_in_force": "gtc",
-            "order_type": "limit",
-            "asset_class": "crypto",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_order_type": "limit",
+            "confirmed_asset_class": "crypto",
+            "confirmed_qty": 1.0,
+            "confirmed_limit_price": 100.0,
         }
         failure = _validate_order_acceptance(
             result,
@@ -1461,3 +1493,221 @@ class TestReportSchemaVersionAndHash:
             dry_run=False, steps=steps2,
         )
         assert r1.content_hash() != r2.content_hash()
+
+
+# ── Item 1 fix: position lookup API errors are fail-closed ─────────────
+
+
+class TestPositionLookupFailClosed:
+    """Item 1: _check_residual_exposure must fail closed on API errors
+    that are NOT a recognized 'position not found' response.  get_position()
+    already returns 0.0 for 'position not found' without raising — any
+    exception that propagates is a real error (timeout, auth, 500).
+    """
+
+    def test_timeout_error_is_fail(self) -> None:
+        """Timeout on position lookup must fail, not silently pass as zero."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        order_details: dict[str, Any] = {}
+
+        def _timeout(symbol: str) -> float:
+            raise TimeoutError("connection timed out")
+
+        broker.get_position = _timeout  # type: ignore[assignment]
+        clean, failure = _check_residual_exposure(
+            broker, "ord-1", BTC, order_details=order_details,
+        )
+        assert clean is False
+        assert failure is not None
+        assert "position lookup failed" in failure
+        assert "Tier-1" in failure
+        assert order_details["position_check_error"] == "connection timed out"
+
+    def test_auth_error_is_fail(self) -> None:
+        """Authorization error on position lookup must fail closed."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        order_details: dict[str, Any] = {}
+
+        def _auth_fail(symbol: str) -> float:
+            raise PermissionError("403 Forbidden: invalid API key")
+
+        broker.get_position = _auth_fail  # type: ignore[assignment]
+        clean, failure = _check_residual_exposure(
+            broker, "ord-1", BTC, order_details=order_details,
+        )
+        assert clean is False
+        assert failure is not None
+        assert "position lookup failed" in failure
+        assert "Tier-1" in failure
+
+    def test_server_error_is_fail(self) -> None:
+        """500/server error on position lookup must fail closed."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        order_details: dict[str, Any] = {}
+
+        def _server_error(symbol: str) -> float:
+            raise RuntimeError("500 Internal Server Error")
+
+        broker.get_position = _server_error  # type: ignore[assignment]
+        clean, failure = _check_residual_exposure(
+            broker, "ord-1", BTC, order_details=order_details,
+        )
+        assert clean is False
+        assert failure is not None
+        assert "position lookup failed" in failure
+
+    def test_position_not_found_still_passes(self) -> None:
+        """A normal no-position (get_position returns 0.0) still passes."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        order_details: dict[str, Any] = {}
+        clean, failure = _check_residual_exposure(
+            broker, "ord-1", BTC, order_details=order_details,
+        )
+        assert clean is True
+        assert failure is None
+        assert order_details["residual_position_qty"] == 0.0
+
+
+# ── Item 2 fix: broker-confirmed fields divergence ─────────────────────
+
+
+class TestBrokerConfirmedFieldsDivergence:
+    """Item 2: _validate_order_acceptance must validate broker-confirmed
+    fields (confirmed_time_in_force, confirmed_asset_class, etc.), NOT
+    the wrapper's request-echo fields.  When the broker confirms different
+    values than the request, the check must FAIL even though the wrapper
+    fields look correct.
+    """
+
+    def test_broker_confirms_different_tif_is_fail(self) -> None:
+        """Broker returns IOC when GTC was requested — must FAIL."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        original_submit = client.submit_order
+
+        def _wrong_tif(order_data: Any) -> Any:
+            order = original_submit(order_data)
+            order.time_in_force = "ioc"  # Broker confirms IOC, not GTC
+            return order
+
+        client.submit_order = _wrong_tif
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert "confirmed_time_in_force=" in result.detail
+        # The wrapper-set "time_in_force" field would still say "gtc"
+        # (request echo), but the validator catches the broker divergence.
+
+    def test_broker_confirms_different_asset_class_is_fail(self) -> None:
+        """Broker returns us_equity when crypto was expected — must FAIL."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        original_submit = client.submit_order
+
+        def _wrong_class(order_data: Any) -> Any:
+            order = original_submit(order_data)
+            order.asset_class = "us_equity"  # Broker says equity, not crypto
+            return order
+
+        client.submit_order = _wrong_class
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert "confirmed_asset_class=" in result.detail
+
+    def test_broker_confirms_different_order_type_is_fail(self) -> None:
+        """Broker returns market when limit was expected — must FAIL."""
+        assets = {BTC: _crypto_asset()}
+        client = _FakeTradingClient(assets=assets)
+        original_submit = client.submit_order
+
+        def _wrong_type(order_data: Any) -> Any:
+            order = original_submit(order_data)
+            order.order_type = "market"  # Broker says market, not limit
+            return order
+
+        client.submit_order = _wrong_type
+        broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+        result = check_gtc_order_acceptance(broker, (BTC,))
+        assert result.status == StepStatus.FAIL
+        assert "confirmed_order_type=" in result.detail
+
+    def test_confirmed_qty_zero_is_fail(self) -> None:
+        """Broker confirms zero quantity — must FAIL."""
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_qty": 0.0,
+        }
+        failure = _validate_order_acceptance(
+            result, expected_side="BUY", expected_tif="gtc", pair=BTC,
+        )
+        assert failure is not None
+        assert "confirmed_qty" in failure
+
+    def test_confirmed_limit_price_zero_is_fail_for_limit_order(self) -> None:
+        """Broker confirms zero limit_price on a limit order — must FAIL."""
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            "confirmed_time_in_force": "gtc",
+            "confirmed_order_type": "limit",
+            "confirmed_asset_class": "crypto",
+            "confirmed_qty": 1.0,
+            "confirmed_limit_price": 0.0,
+        }
+        failure = _validate_order_acceptance(
+            result,
+            expected_side="BUY",
+            expected_tif="gtc",
+            expected_order_type="limit",
+            expected_asset_class="crypto",
+            pair=BTC,
+        )
+        assert failure is not None
+        assert "confirmed_limit_price" in failure
+
+    def test_wrapper_fields_correct_but_confirmed_wrong_is_fail(self) -> None:
+        """The wrapper's request-echo fields look correct, but the
+        broker-confirmed fields disagree — must FAIL.  This is the core
+        adversarial scenario: the old code would have PASSed by reading
+        only the wrapper fields.
+        """
+        result = {
+            "order_id": "ord-1",
+            "status": "accepted",
+            "side": "BUY",
+            # Wrapper echo (request values) — look correct:
+            "time_in_force": "gtc",
+            "asset_class": "crypto",
+            "order_type": "limit",
+            # Broker-confirmed values — disagree:
+            "confirmed_time_in_force": "ioc",
+            "confirmed_asset_class": "us_equity",
+            "confirmed_order_type": "market",
+            "confirmed_qty": 1.0,
+            "confirmed_limit_price": 100.0,
+        }
+        failure = _validate_order_acceptance(
+            result,
+            expected_side="BUY",
+            expected_tif="gtc",
+            expected_order_type="limit",
+            expected_asset_class="crypto",
+            pair=BTC,
+        )
+        assert failure is not None
+        # Should catch the TIF mismatch first.
+        assert "confirmed_time_in_force=" in failure
+        assert "ioc" in failure

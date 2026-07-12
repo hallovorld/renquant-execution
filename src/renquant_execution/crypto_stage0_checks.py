@@ -341,45 +341,81 @@ def _validate_order_acceptance(
             f"requested side={expected_side!r}"
         )
 
-    # ── time_in_force: require present and matching ────────────────────
-    tif = str(result.get("time_in_force", "")).strip().lower()
-    if not tif:
+    # ── time_in_force: validate broker-confirmed field ────────────────
+    # The wrapper-set "time_in_force" key is echoed from the request,
+    # NOT from the broker's response — use "confirmed_time_in_force"
+    # (extracted from the SDK Order object) to detect broker
+    # disagreement with the submitted request.
+    confirmed_tif = str(
+        result.get("confirmed_time_in_force", "")
+    ).strip().lower()
+    if not confirmed_tif:
         return (
-            f"{pair}: order {order_id} missing time_in_force field "
-            f"(expected {expected_tif!r})"
+            f"{pair}: order {order_id} missing confirmed_time_in_force "
+            f"(expected {expected_tif!r}; wrapper field is not "
+            f"broker-authoritative)"
         )
-    if tif != expected_tif.lower():
+    if confirmed_tif != expected_tif.lower():
         return (
-            f"{pair}: order {order_id} time_in_force={tif!r} does not match "
-            f"requested tif={expected_tif!r}"
+            f"{pair}: order {order_id} confirmed_time_in_force="
+            f"{confirmed_tif!r} does not match requested "
+            f"tif={expected_tif!r}"
         )
 
-    # ── order_type: validate if expected ───────────────────────────────
+    # ── order_type: validate broker-confirmed field if expected ────────
     if expected_order_type is not None:
-        order_type = str(result.get("order_type", "")).strip().lower()
-        if not order_type:
+        confirmed_type = str(
+            result.get("confirmed_order_type", "")
+        ).strip().lower()
+        if not confirmed_type:
             return (
-                f"{pair}: order {order_id} missing order_type field "
-                f"(expected {expected_order_type!r})"
+                f"{pair}: order {order_id} missing confirmed_order_type "
+                f"(expected {expected_order_type!r}; wrapper field is not "
+                f"broker-authoritative)"
             )
-        if order_type != expected_order_type.lower():
+        if confirmed_type != expected_order_type.lower():
             return (
-                f"{pair}: order {order_id} order_type={order_type!r} does not "
-                f"match requested type={expected_order_type!r}"
+                f"{pair}: order {order_id} confirmed_order_type="
+                f"{confirmed_type!r} does not match requested "
+                f"type={expected_order_type!r}"
             )
 
-    # ── asset_class: validate if expected ──────────────────────────────
+    # ── asset_class: validate broker-confirmed field if expected ───────
     if expected_asset_class is not None:
-        asset_class = str(result.get("asset_class", "")).strip().lower()
-        if not asset_class:
+        confirmed_class = str(
+            result.get("confirmed_asset_class", "")
+        ).strip().lower()
+        if not confirmed_class:
             return (
-                f"{pair}: order {order_id} missing asset_class field "
-                f"(expected {expected_asset_class!r})"
+                f"{pair}: order {order_id} missing confirmed_asset_class "
+                f"(expected {expected_asset_class!r}; wrapper field is not "
+                f"broker-authoritative)"
             )
-        if asset_class != expected_asset_class.lower():
+        if confirmed_class != expected_asset_class.lower():
             return (
-                f"{pair}: order {order_id} asset_class={asset_class!r} does not "
-                f"match expected={expected_asset_class!r}"
+                f"{pair}: order {order_id} confirmed_asset_class="
+                f"{confirmed_class!r} does not match expected="
+                f"{expected_asset_class!r}"
+            )
+
+    # ── confirmed_qty: broker must confirm a positive quantity ─────────
+    confirmed_qty = float(result.get("confirmed_qty", 0.0) or 0.0)
+    if confirmed_qty <= 0.0:
+        return (
+            f"{pair}: order {order_id} has no broker-confirmed quantity "
+            f"(confirmed_qty={confirmed_qty})"
+        )
+
+    # ── confirmed_limit_price: required for limit/stop_limit orders ───
+    if expected_order_type in ("limit", "stop_limit"):
+        confirmed_limit = float(
+            result.get("confirmed_limit_price", 0.0) or 0.0
+        )
+        if confirmed_limit <= 0.0:
+            return (
+                f"{pair}: order {order_id} has no broker-confirmed "
+                f"limit_price for {expected_order_type} order "
+                f"(confirmed_limit_price={confirmed_limit})"
             )
 
     return None
@@ -497,9 +533,18 @@ def _check_residual_exposure(
     try:
         position_qty = broker.get_position(pair)
     except Exception as exc:
-        # Position lookup failure with zero fills is not Tier-1, but record it.
+        # get_position() already returns 0.0 for a recognized "position
+        # not found" response without raising (AlpacaBroker._is_not_found_error).
+        # Any exception that propagates is a real API error (timeout,
+        # auth failure, 500, etc.) — cannot confirm zero position, fail
+        # closed as Tier-1 unknown failure.
+        failure = (
+            f"{pair}: position lookup failed during residual-exposure "
+            f"audit ({exc}) -- cannot confirm zero position; treating "
+            f"as unknown failure (Tier-1)"
+        )
         order_details["position_check_error"] = str(exc)
-        position_qty = 0.0
+        return False, failure
 
     order_details["residual_position_qty"] = position_qty
 
@@ -1075,8 +1120,6 @@ __all__ = [
     "check_buying_power_behavior",
     "check_crypto_account_status",
     "check_data_parity",
-    "check_gtc_order_acceptance",
     "check_pair_snapshot",
-    "check_stop_limit_acceptance",
     "run_full_battery",
 ]

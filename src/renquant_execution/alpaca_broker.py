@@ -1505,6 +1505,24 @@ def _order_to_dict(order: Any) -> dict[str, Any]:
         "created_at": str(getattr(order, "created_at", "")),
         "submitted_at": str(getattr(order, "submitted_at", "")),
         "filled_at": str(getattr(order, "filled_at", "")),
+        # Broker-confirmed fields: extracted from the SDK Order object's
+        # own attributes, NOT from the request or wrapper .update()
+        # overrides.  Validators must check these — not the wrapper-set
+        # request-echo fields like "time_in_force" or "asset_class" — to
+        # detect broker disagreement with the submitted request.
+        "confirmed_time_in_force": _enum_value(
+            getattr(order, "time_in_force", "")
+        ),
+        "confirmed_order_type": _enum_value(
+            getattr(order, "order_type", "")
+        ),
+        "confirmed_asset_class": _enum_value(
+            getattr(order, "asset_class", "")
+        ),
+        "confirmed_qty": quantity,
+        "confirmed_limit_price": float(
+            getattr(order, "limit_price", 0.0) or 0.0
+        ),
     }
 
 
