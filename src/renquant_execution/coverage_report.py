@@ -1,13 +1,20 @@
-"""Versioned coverage report — immutable evidence of stop-coverage state.
+"""Versioned coverage report — diagnostic snapshot of stop-coverage state.
 
 Public API consumed by renquant-orchestrator to verify that execution's
 stop-coverage checker has run, is fresh, and has not been tampered with.
 
+SCOPE: this module produces **diagnostic / shadow** reports only.  Every
+report carries ``trust_level = "unattested_diagnostic"`` (frozen at
+construction time, not overridable by callers).  A diagnostic report is
+useful for monitoring and alerting but is NOT authorization evidence for
+any entry gate — that would require cryptographic attestation (keyed MAC
+or signature), which is future work.
+
 Construction is EXECUTION-OWNED (Codex review 2026-07-13T00:16:11Z, PR #37):
-the fields that authorize a crypto entry (``violations``, ``positions_covered``,
+the observation fields (``violations``, ``positions_covered``,
 ``positions_total``, ``order_ids``) must originate from a real, bounded broker
 observation, never from a caller's own assertion. The only supported public
-path to a genuine report is :meth:`AlpacaBroker.publish_stop_coverage_report`
+path to a report is :meth:`AlpacaBroker.publish_stop_coverage_report`
 in ``alpaca_broker.py``.
 
 ``CoverageObservation`` (the raw observation dataclass) and
@@ -17,15 +24,16 @@ from this module's ``__all__`` -- neither is a keyed/secret-bearing MAC, so a
 caller who imports them directly (``from renquant_execution.coverage_report
 import CoverageObservation, build_coverage_report, compute_snapshot_hash``)
 could otherwise self-compute a matching ``integrity_hash`` for entirely
-fabricated position/order data and pass :func:`verify_coverage_report`. The
-hash only proves internal self-consistency (no post-construction tampering),
-never that the data came from a real broker query. Removing these two names
-from the public surface means there is no ready-made, discoverable, one-call
-function that does this for a caller; the only supported, broker-verified path
-remains :meth:`AlpacaBroker.publish_stop_coverage_report`.
+fabricated position/order data and pass
+:func:`verify_coverage_report_integrity`. The hash only proves internal
+self-consistency (no post-construction tampering), never that the data came
+from a real broker query. Removing these two names from the public surface
+means there is no ready-made, discoverable, one-call function that does
+this for a caller; the only supported, broker-verified path remains
+:meth:`AlpacaBroker.publish_stop_coverage_report`.
 
 Contract:
-    verify_coverage_report(r)                    -> bool
+    verify_coverage_report_integrity(r)          -> bool
     CoverageReport.is_fresh(now_utc, max_age_s)  -> bool
     CoverageReport.to_canonical_json()           -> str
     CoverageReport.to_json() / .from_json(s)     -> file-based hand-off
@@ -49,7 +57,7 @@ __all__ = [
     "compute_snapshot_hash",
     "default_execution_source_commit",
     "default_execution_version",
-    "verify_coverage_report",
+    "verify_coverage_report_integrity",
 ]
 
 _HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -85,7 +93,7 @@ def default_execution_version() -> str:
     Derived from installed package metadata.  Raises :class:`ValueError`
     when the version cannot be determined (e.g. a pythonpath-based dev/test
     tree with no ``pip install`` step) -- an unknown execution version must
-    never silently enter a coverage report that could authorize an entry.
+    never silently enter a coverage report.
     """
     try:
         from importlib.metadata import PackageNotFoundError, version
@@ -146,11 +154,12 @@ class CoverageObservation:
     SHA-256 digests of the raw position and order data, binding the report to
     the specific broker state that was observed.
 
-    The only accepted input to :func:`build_coverage_report`. While this
+    The only accepted input to the internal builder. While this
     dataclass is public (for testing and type annotations), the integrity-hash
     mechanism in :class:`CoverageReport` ensures that a hand-constructed
-    observation cannot produce a report that passes :func:`verify_coverage_report`
-    unless it faithfully reflects real broker state.
+    observation cannot produce a report that passes
+    :func:`verify_coverage_report_integrity` unless it faithfully reflects
+    real broker state.
     """
 
     account_id: str
@@ -249,13 +258,18 @@ def _compute_hash(report: CoverageReport) -> str:
 
 @dataclass(frozen=True)
 class CoverageReport:
-    """Immutable snapshot of stop-coverage state for one account.
+    """Immutable diagnostic snapshot of stop-coverage state for one account.
 
     All fields are validated in ``__post_init__``; construction with invalid
     values raises ``ValueError``.  Construction itself is execution-owned:
     the only supported public path is
     :meth:`AlpacaBroker.publish_stop_coverage_report`, which gathers a real
-    broker observation and feeds it through :func:`build_coverage_report`.
+    broker observation and feeds it through the internal builder.
+
+    ``trust_level`` is always ``"unattested_diagnostic"`` — the builder
+    forces this value and callers cannot override it.  A report at this
+    trust level is useful for monitoring/alerting but is NOT authorization
+    evidence for any entry gate.
     """
 
     report_id: str
@@ -273,6 +287,7 @@ class CoverageReport:
     report_schema_version: int
     position_snapshot_hash: str
     order_snapshot_hash: str
+    trust_level: str
     integrity_hash: str
 
     def __post_init__(self) -> None:
@@ -382,6 +397,13 @@ class CoverageReport:
                 "order_ids must be empty when positions_total is 0"
             )
 
+        # --- trust_level: must be the only allowed value ----------------------
+        if self.trust_level != "unattested_diagnostic":
+            raise ValueError(
+                "trust_level must be 'unattested_diagnostic', "
+                f"got {self.trust_level!r}"
+            )
+
         # --- hash formats ---------------------------------------------------
         for name in (
             "integrity_hash",
@@ -420,7 +442,7 @@ class CoverageReport:
     def to_dict(self) -> dict[str, Any]:
         """Schema-versioned dict form for file-based hand-off to a consumer
         (e.g. renquant-orchestrator's crypto session scheduler).  Round-trips
-        through :meth:`from_dict` / :func:`verify_coverage_report`.
+        through :meth:`from_dict` / :func:`verify_coverage_report_integrity`.
         """
         d: dict[str, Any] = {"schema_version": COVERAGE_REPORT_SCHEMA_VERSION}
         for f in fields(self):
@@ -477,7 +499,10 @@ def _build_coverage_report(
     ``violations`` is computed as ``positions_total - positions_covered``
     — there is no parameter to override it. ``report_id`` (UUID),
     ``timestamp_utc``, ``execution_version``, ``execution_source_commit``,
-    and ``report_schema_version`` are auto-generated.
+    ``report_schema_version``, and ``trust_level`` are auto-generated.
+
+    ``trust_level`` is always ``"unattested_diagnostic"`` — the builder
+    forces this value unconditionally.  Callers cannot override it.
     """
     report_id = str(uuid.uuid4())
     now_utc = datetime.now(timezone.utc)
@@ -502,12 +527,18 @@ def _build_coverage_report(
         report_schema_version=1,
         position_snapshot_hash=observation.position_snapshot_hash,
         order_snapshot_hash=observation.order_snapshot_hash,
+        trust_level="unattested_diagnostic",
     )
     tmp = CoverageReport(**shared, integrity_hash=placeholder_hash)
     real_hash = _compute_hash(tmp)
 
     return CoverageReport(**shared, integrity_hash=real_hash)
 
-def verify_coverage_report(report: CoverageReport) -> bool:
-    """Recompute *report*'s integrity hash and check it matches."""
+def verify_coverage_report_integrity(report: CoverageReport) -> bool:
+    """Recompute *report*'s integrity hash and check it matches.
+
+    This verifies internal self-consistency (no post-construction
+    tampering) only — NOT authenticity or authorization.  The report's
+    ``trust_level`` field communicates this distinction to consumers.
+    """
     return _compute_hash(report) == report.integrity_hash

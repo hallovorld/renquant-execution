@@ -1,10 +1,12 @@
-"""Tests for renquant_execution.coverage_report — versioned coverage report API.
+"""Tests for renquant_execution.coverage_report — diagnostic coverage report API.
 
 Coverage:
 - CoverageObservation construction + validation (module-private intermediate)
 - build + verify roundtrip (happy path) via the observation path
 - tampered field -> verify fails (each mutable-equivalent field)
 - freshness: fresh, stale, future timestamp
+- trust_level enforcement (always "unattested_diagnostic", not overridable)
+- authorization gate rejection (diagnostic reports rejected by any auth gate)
 - validation: every __post_init__ guard (CoverageReport and CoverageObservation),
   including the Codex review 2026-07-13T00:16:11Z findings (report_id UUID,
   timestamp tz-awareness x2, source_version format, execution_version
@@ -17,21 +19,20 @@ Coverage:
   execution-owned observation detects missing/uncovered stops, duplicate
   order ids rejected, inconsistent position counts rejected, and --
   crucially -- there is no PUBLIC one-call function a caller can use to
-  hand-pick field values and mint an authorized report.
+  hand-pick field values and mint a report that an authorization gate
+  would accept (trust_level prevents that).
 
 ``CoverageObservation`` and ``_build_coverage_report`` are module-private
 (renamed from an earlier public ``CoverageObservation``/``build_coverage_report``
 design that Codex's review -- and independent analysis -- flagged: a public
 one-call builder taking caller-supplied ``positions_covered``/``violations``/
-snapshot hashes is exactly the "authorization path" a bad-faith caller could
-use to fabricate a zero-violation report, since neither the hash nor the
-observation's own format checks prove the data came from a real broker
-query). The only supported way to obtain a genuine report is
+snapshot hashes could fabricate a zero-violation report, since neither the
+hash nor the observation's own format checks prove the data came from a real
+broker query). The only supported way to obtain a report is
 ``AlpacaBroker.publish_stop_coverage_report()`` in ``alpaca_broker.py`` --
 see ``tests/test_publish_stop_coverage_report.py`` for its integration tests.
 Tests here import the private names directly to exercise validation in
-isolation, which is a normal use of module internals from a test -- not the
-"authorization path" the review was concerned about.
+isolation, which is a normal use of module internals from a test.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ from renquant_execution.coverage_report import (
     compute_snapshot_hash,
     default_execution_source_commit,
     default_execution_version,
-    verify_coverage_report,
+    verify_coverage_report_integrity,
 )
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,7 @@ def _direct_report(**overrides) -> CoverageReport:
         report_schema_version=1,
         position_snapshot_hash=_HASH_A,
         order_snapshot_hash=_HASH_B,
+        trust_level="unattested_diagnostic",
         integrity_hash="a" * 64,
     )
     defaults.update(overrides)
@@ -209,7 +211,7 @@ class TestObservationValidation:
 class TestBuildVerifyRoundtrip:
     def test_happy_path(self):
         r = _sample_report()
-        assert verify_coverage_report(r)
+        assert verify_coverage_report_integrity(r)
         assert r.account_id == "ACCT-001"
         assert r.environment == "live"
         assert r.positions_covered == 8
@@ -226,7 +228,7 @@ class TestBuildVerifyRoundtrip:
 
     def test_paper_environment(self):
         r = _sample_report(environment="paper")
-        assert verify_coverage_report(r)
+        assert verify_coverage_report_integrity(r)
         assert r.environment == "paper"
 
     def test_zero_positions(self):
@@ -235,12 +237,12 @@ class TestBuildVerifyRoundtrip:
             positions_total=0,
             qualifying_order_ids=(),
         )
-        assert verify_coverage_report(r)
+        assert verify_coverage_report_integrity(r)
         assert r.violations == 0
 
     def test_empty_order_ids(self):
         r = _sample_report(qualifying_order_ids=())
-        assert verify_coverage_report(r)
+        assert verify_coverage_report_integrity(r)
 
     def test_violations_are_computed_not_supplied(self):
         """_build_coverage_report computes violations from the observation.
@@ -276,16 +278,17 @@ class TestTamperDetection:
             ("report_id", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
             ("position_snapshot_hash", "f" * 64),
             ("order_snapshot_hash", "f" * 64),
+            ("trust_level", "TAMPERED"),
         ],
     )
     def test_tampered_field_fails_verify(self, report, field, bad_value):
         # Bypass frozen to simulate a tampered wire-format reconstruction.
         object.__setattr__(report, field, bad_value)
-        assert not verify_coverage_report(report)
+        assert not verify_coverage_report_integrity(report)
 
     def test_tampered_order_ids_fails_verify(self, report):
         object.__setattr__(report, "order_ids", ("injected",))
-        assert not verify_coverage_report(report)
+        assert not verify_coverage_report_integrity(report)
 
     def test_tampered_timestamp_fails_verify(self, report):
         object.__setattr__(
@@ -293,7 +296,7 @@ class TestTamperDetection:
             "timestamp_utc",
             _NOW + timedelta(hours=1),
         )
-        assert not verify_coverage_report(report)
+        assert not verify_coverage_report_integrity(report)
 
     def test_tampered_observation_timestamp_fails_verify(self, report):
         object.__setattr__(
@@ -301,7 +304,7 @@ class TestTamperDetection:
             "observation_timestamp_utc",
             _NOW + timedelta(hours=1),
         )
-        assert not verify_coverage_report(report)
+        assert not verify_coverage_report_integrity(report)
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +336,81 @@ class TestFreshness:
         r = _sample_report()
         past = r.timestamp_utc - timedelta(seconds=10)
         assert not r.is_fresh(past)
+
+
+# ---------------------------------------------------------------------------
+# Trust level
+# ---------------------------------------------------------------------------
+
+
+class TestTrustLevel:
+    """trust_level is always 'unattested_diagnostic' — the builder forces
+    this value and callers cannot override it via the dataclass constructor
+    (validation rejects any other value)."""
+
+    def test_builder_sets_unattested_diagnostic(self):
+        r = _sample_report()
+        assert r.trust_level == "unattested_diagnostic"
+
+    def test_trust_level_in_hash_preimage(self):
+        """trust_level participates in the integrity hash — tampering
+        with it breaks verification."""
+        r = _sample_report()
+        assert verify_coverage_report_integrity(r)
+        object.__setattr__(r, "trust_level", "unattested_diagnostic")
+        # Same value, hash unchanged.
+        assert verify_coverage_report_integrity(r)
+
+    def test_trust_level_in_canonical_json(self):
+        r = _sample_report()
+        cj = r.to_canonical_json()
+        parsed = json.loads(cj)
+        assert parsed["trust_level"] == "unattested_diagnostic"
+
+    def test_trust_level_in_to_dict(self):
+        r = _sample_report()
+        d = r.to_dict()
+        assert d["trust_level"] == "unattested_diagnostic"
+
+    def test_trust_level_round_trips_through_json(self):
+        r = _sample_report()
+        raw = r.to_json()
+        r2 = CoverageReport.from_json(raw)
+        assert r2.trust_level == "unattested_diagnostic"
+        assert r2 == r
+
+    def test_attested_trust_level_rejected(self):
+        """Callers cannot construct a report with trust_level='attested'."""
+        with pytest.raises(ValueError, match="trust_level"):
+            _direct_report(trust_level="attested")
+
+    def test_arbitrary_trust_level_rejected(self):
+        with pytest.raises(ValueError, match="trust_level"):
+            _direct_report(trust_level="verified")
+
+    def test_empty_trust_level_rejected(self):
+        with pytest.raises(ValueError, match="trust_level"):
+            _direct_report(trust_level="")
+
+
+class TestReportRejectedByAuthorizationGate:
+    """A hash-valid, fresh report is still rejected by any authorization
+    gate because trust_level is 'unattested_diagnostic'."""
+
+    def test_report_rejected_by_authorization_gate(self):
+        report = _sample_report()
+        now_utc = report.timestamp_utc + timedelta(seconds=10)
+
+        # Integrity check passes.
+        assert verify_coverage_report_integrity(report)
+
+        # Report is fresh.
+        assert report.is_fresh(now_utc)
+
+        # But trust_level is "unattested_diagnostic" — an authorization
+        # gate that requires "attested" must reject it.
+        assert report.trust_level == "unattested_diagnostic"
+        assert report.trust_level != "attested"  # would need crypto signature
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +751,7 @@ class TestCanonicalSerialization:
         assert d["schema_version"] == COVERAGE_REPORT_SCHEMA_VERSION
         r2 = CoverageReport.from_dict(d)
         assert r2 == r
-        assert verify_coverage_report(r2)
+        assert verify_coverage_report_integrity(r2)
 
     def test_to_json_round_trips_through_from_json(self):
         r = _sample_report()
@@ -682,7 +760,7 @@ class TestCanonicalSerialization:
         assert parsed["account_id"] == "ACCT-001"
         r2 = CoverageReport.from_json(raw)
         assert r2 == r
-        assert verify_coverage_report(r2)
+        assert verify_coverage_report_integrity(r2)
 
     def test_to_dict_serializes_order_ids_as_list(self):
         r = _sample_report()
@@ -725,7 +803,7 @@ class TestCanonicalSerialization:
         d["violations"] = 10
         raw = json.dumps(d)
         r2 = CoverageReport.from_json(raw)
-        assert not verify_coverage_report(r2)
+        assert not verify_coverage_report_integrity(r2)
 
 
 # ---------------------------------------------------------------------------
@@ -792,7 +870,7 @@ class TestFakeBrokerIntegration:
         assert report.violations == 2
         assert report.positions_covered == 1
         assert report.positions_total == 3
-        assert verify_coverage_report(report)
+        assert verify_coverage_report_integrity(report)
 
     def test_all_covered_zero_violations(self):
         """When all positions have stops, violations = 0."""
@@ -808,7 +886,7 @@ class TestFakeBrokerIntegration:
         assert report.violations == 0
         assert report.positions_covered == 2
         assert report.positions_total == 2
-        assert verify_coverage_report(report)
+        assert verify_coverage_report_integrity(report)
 
     def test_no_positions_zero_everything(self):
         """Empty portfolio produces a valid zero-everything report."""
@@ -824,7 +902,7 @@ class TestFakeBrokerIntegration:
         assert report.violations == 0
         assert report.positions_total == 0
         assert report.order_ids == ()
-        assert verify_coverage_report(report)
+        assert verify_coverage_report_integrity(report)
 
     def test_cannot_override_computed_violations(self):
         """_build_coverage_report computes violations from the observation.
@@ -958,7 +1036,7 @@ class TestNoPublicAuthorizationPath:
 
         # The rest of the public surface is intact.
         assert "CoverageReport" in cr_module.__all__
-        assert "verify_coverage_report" in cr_module.__all__
+        assert "verify_coverage_report_integrity" in cr_module.__all__
 
     def test_hand_constructed_report_with_placeholder_hash_fails_verify(self):
         """A caller who hand-constructs a CoverageReport with a self-chosen
@@ -980,14 +1058,16 @@ class TestNoPublicAuthorizationPath:
             report_schema_version=1,
             position_snapshot_hash=fake_hash,
             order_snapshot_hash=fake_hash,
+            trust_level="unattested_diagnostic",
             integrity_hash=fake_hash,
         )
-        assert not verify_coverage_report(hand_built)
+        assert not verify_coverage_report_integrity(hand_built)
 
     def test_forged_self_consistent_report_passes_verify(self):
         """Demonstrates that hash-only verification cannot distinguish
-        execution-observed from caller-forged reports. Cryptographic
-        attestation required for entry authorization."""
+        execution-observed from caller-forged reports -- but the
+        trust_level field still prevents any authorization gate from
+        accepting the report."""
         # Step 1: hand-construct a CoverageReport with violations=0,
         # using a placeholder integrity_hash.
         placeholder_hash = "0" * 64
@@ -1007,6 +1087,7 @@ class TestNoPublicAuthorizationPath:
             report_schema_version=1,
             position_snapshot_hash="a" * 64,
             order_snapshot_hash="b" * 64,
+            trust_level="unattested_diagnostic",
         )
         tmp = CoverageReport(**forged_fields, integrity_hash=placeholder_hash)
 
@@ -1016,5 +1097,8 @@ class TestNoPublicAuthorizationPath:
         # Step 3: construct the forged report with the correctly computed hash.
         forged = CoverageReport(**forged_fields, integrity_hash=correct_hash)
 
-        # Step 4: the forged report PASSES verify -- this is the gap.
-        assert verify_coverage_report(forged)
+        # Step 4: the forged report PASSES integrity verify -- but the
+        # trust_level prevents authorization gates from accepting it.
+        assert verify_coverage_report_integrity(forged)
+        assert forged.trust_level == "unattested_diagnostic"
+        assert forged.trust_level != "attested"

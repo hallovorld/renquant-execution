@@ -139,7 +139,7 @@ from .coverage_report import (
     compute_snapshot_hash,
     default_execution_source_commit,
     default_execution_version,
-    verify_coverage_report,
+    verify_coverage_report_integrity,
 )
 from .readonly_broker import (
     DEFAULT_READONLY_BROKER_NAME,
@@ -271,6 +271,6 @@ __all__ = [
     "validate_readonly_broker_name",
     "worst_case_entry_debit",
     "write_execution_payload",
-    "verify_coverage_report",
+    "verify_coverage_report_integrity",
     "write_live_commit_plan",
 ]

@@ -1316,14 +1316,18 @@ class AlpacaBroker(BaseBroker):
     def publish_stop_coverage_report(
         self, account_id: str | None = None
     ) -> CoverageReport:
-        """The ONLY execution-owned path to a genuine
+        """The ONLY execution-owned path to a diagnostic
         :class:`~renquant_execution.coverage_report.CoverageReport` (Codex
         review 2026-07-13T00:16:11Z finding 1).
 
-        Every field that could authorize a crypto entry —
-        ``violations``, ``positions_covered``, ``positions_total``,
-        ``order_ids`` — is derived exclusively from one real, bounded broker
-        observation (:meth:`_observe_crypto_stop_coverage`, the SAME query
+        The returned report has ``trust_level = "unattested_diagnostic"``
+        — it is suitable for monitoring and alerting but is NOT
+        authorization evidence for any entry gate.
+
+        Every observation field — ``violations``, ``positions_covered``,
+        ``positions_total``, ``order_ids`` — is derived exclusively from
+        one real, bounded broker observation
+        (:meth:`_observe_crypto_stop_coverage`, the SAME query
         :meth:`check_crypto_stop_coverage` uses); none of it is accepted as a
         caller-supplied argument. ``account_id`` and ``environment`` are
         likewise resolved from the connected broker itself

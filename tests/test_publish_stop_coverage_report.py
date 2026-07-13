@@ -1,5 +1,5 @@
 """Integration-style tests for ``AlpacaBroker.publish_stop_coverage_report()``
-— the ONLY execution-owned path to a genuine ``CoverageReport`` (Codex review
+— the ONLY execution-owned path to a diagnostic ``CoverageReport`` (Codex review
 2026-07-13T00:16:11Z, PR #37).
 
 Uses a fake alpaca-py TradingClient (pattern mirrors
@@ -21,7 +21,7 @@ from renquant_execution.alpaca_broker import AlpacaBroker
 from renquant_execution.coverage_report import (
     CoverageReport,
     compute_snapshot_hash,
-    verify_coverage_report,
+    verify_coverage_report_integrity,
 )
 
 _MOCK_EXEC_VERSION = "0.1.0"
@@ -170,7 +170,7 @@ def test_all_covered_yields_zero_violations():
     report = broker.publish_stop_coverage_report()
 
     assert isinstance(report, CoverageReport)
-    assert verify_coverage_report(report)
+    assert verify_coverage_report_integrity(report)
     assert report.violations == 0
     assert report.positions_total == 2
     assert report.positions_covered == 2
@@ -179,6 +179,7 @@ def test_all_covered_yields_zero_violations():
     assert report.environment == "paper"
     assert report.execution_version  # auto-derived, non-empty
     assert report.observation_timestamp_utc is not None
+    assert report.trust_level == "unattested_diagnostic"
 
 
 def test_covered_report_hashes_bind_to_the_real_observation():
@@ -224,7 +225,7 @@ def test_uncovered_position_yields_real_violation():
     broker = _broker(client)
     report = broker.publish_stop_coverage_report()
 
-    assert verify_coverage_report(report)
+    assert verify_coverage_report_integrity(report)
     assert report.violations == 1
     assert report.positions_total == 1
     assert report.positions_covered == 0
@@ -240,7 +241,7 @@ def test_partial_coverage_shortfall_counts_as_one_violation():
     broker = _broker(client)
     report = broker.publish_stop_coverage_report()
 
-    assert verify_coverage_report(report)
+    assert verify_coverage_report_integrity(report)
     assert report.violations == 1
     assert report.positions_covered == 0
     # The partial (insufficient) stop IS still a "qualifying" order shape,
@@ -265,7 +266,7 @@ def test_duplicate_competing_stops_count_as_one_violation_not_two():
     broker = _broker(client)
     report = broker.publish_stop_coverage_report()
 
-    assert verify_coverage_report(report)
+    assert verify_coverage_report_integrity(report)
     # ONE symbol with a "duplicate" violation, not two violations — the
     # violations == positions_total - positions_covered invariant
     # (CoverageReport.__post_init__) forces this to be counted per-SYMBOL.
@@ -287,7 +288,7 @@ def test_zero_crypto_positions_yields_empty_report():
     broker = _broker(client)
     report = broker.publish_stop_coverage_report()
 
-    assert verify_coverage_report(report)
+    assert verify_coverage_report_integrity(report)
     assert report.positions_total == 0
     assert report.positions_covered == 0
     assert report.violations == 0
@@ -381,10 +382,10 @@ def test_build_coverage_report_removed_from_public_api():
     assert not hasattr(cr_module, "build_coverage_report")
     assert "build_coverage_report" not in cr_module.__all__
     assert "CoverageObservation" not in cr_module.__all__
-    # verify_coverage_report/CoverageReport remain the legitimate public
+    # verify_coverage_report_integrity/CoverageReport remain the legitimate public
     # surface for a consumer that loads a serialized report.
     assert "CoverageReport" in cr_module.__all__
-    assert "verify_coverage_report" in cr_module.__all__
+    assert "verify_coverage_report_integrity" in cr_module.__all__
 
     with pytest.raises(ImportError):
         from renquant_execution.coverage_report import (  # noqa: F401
@@ -451,9 +452,10 @@ def test_caller_cannot_authorize_zero_violations_when_broker_state_is_uncovered(
         report_schema_version=report.report_schema_version,
         position_snapshot_hash=compute_snapshot_hash({BTC: 0.5}),
         order_snapshot_hash=compute_snapshot_hash({}),
+        trust_level="unattested_diagnostic",
         integrity_hash="0" * 64,  # caller has no way to derive the real hash
     )
-    assert not verify_coverage_report(forged)
+    assert not verify_coverage_report_integrity(forged)
     # Even if a caller went further and correctly recomputed the hash
     # themselves, that would still never be what
     # publish_stop_coverage_report() -- the only broker-owned path --
