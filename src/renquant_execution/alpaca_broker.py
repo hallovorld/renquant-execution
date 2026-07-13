@@ -26,6 +26,14 @@ from .broker import (
     is_whole_share,
     validate_fractional_order,
 )
+from .coverage_report import (
+    CoverageObservation,
+    CoverageReport,
+    _build_coverage_report,
+    compute_snapshot_hash,
+    default_execution_source_commit,
+    default_execution_version,
+)
 from .crypto import (
     CRYPTO_MARKET_DEFAULT_TIF,
     CRYPTO_STOP_LIMIT_TIF,
@@ -73,6 +81,26 @@ class _CryptoSpecLookupError(RuntimeError):
     lookup failure is never cached as an authoritative spec, and the order is
     refused (no-submit) rather than submitted on a guessed grid.
     """
+
+
+@dataclass
+class _CryptoStopCoverageObservation:
+    """One bounded broker observation: crypto positions, the qualifying
+    protective-stop orders found per symbol, stop-shaped-but-not-resting
+    orders per symbol, and the coverage violations computed from them.
+
+    This backs BOTH :meth:`AlpacaBroker.check_crypto_stop_coverage`
+    (violations only, public signature unchanged) and
+    :meth:`AlpacaBroker.publish_stop_coverage_report` (the full
+    :class:`~renquant_execution.coverage_report.CoverageReport`) from the
+    exact SAME broker query — never two independent round-trips that could
+    observe different states (Codex review 2026-07-13T00:16:11Z finding 2).
+    """
+
+    positions: dict[str, float]
+    qualifying_orders: dict[str, list[dict[str, Any]]]
+    non_resting_shaped: dict[str, list[dict[str, Any]]]
+    violations: list[dict[str, Any]]
 
 
 class AlpacaBroker(BaseBroker):
@@ -1119,44 +1147,17 @@ class AlpacaBroker(BaseBroker):
             rows.append(d)
         return rows
 
-    def check_crypto_stop_coverage(self) -> list[dict[str, Any]]:
-        """Tier-1 audit: every crypto position MUST have exactly ONE resting
-        GTC stop-limit SELL order covering at least its held quantity.
+    def _observe_crypto_stop_coverage(self) -> _CryptoStopCoverageObservation:
+        """Single bounded broker observation: query positions once, query
+        open orders once, and compute violations from that one snapshot.
 
-        A "qualifying" protective stop (Codex review 2026-07-12 findings 1/2/5
-        — see :func:`_is_qualifying_protective_stop`) satisfies ALL of:
-        ``order_type == "stop_limit"``, ``side == "SELL"``,
-        ``time_in_force == "gtc"`` (case-insensitive), ``stop_price > 0``,
-        ``limit_price > 0``, and a genuinely RESTING broker status — NOT a
-        transitional ``pending_*`` sub-state that Alpaca's
-        ``QueryOrderStatus.OPEN`` filter still reports as "open" (see
-        :func:`_is_resting_order_status`).
-
-        Coverage is evaluated PER SYMBOL by *counting* qualifying stops,
-        never by summing quantities across multiple orders (finding 2: two
-        independently-executable stops can both fire — over-sell / race
-        risk with another exit):
-
-        - 0 qualifying stops -> violation, ``violation_kind="uncovered"``
-          (or ``"non_resting_ignored"`` if a stop-shaped order exists for the
-          symbol but only in a non-resting status right now, e.g. mid
-          cancel/replace).
-        - exactly 1 qualifying stop, qty >= held qty within the pair's own
-          ``min_trade_increment`` tolerance (finding 5 — never the equity
-          ``QTY_INTEGRAL_EPS``) -> covered, no violation.
-        - exactly 1 qualifying stop, qty short of that -> violation,
-          ``violation_kind="partial"``.
-        - 2+ qualifying stops for the same symbol -> violation,
-          ``violation_kind="duplicate"`` — FAILS CLOSED on ambiguity; the
-          summed quantity is NEVER treated as safe coverage.
-
-        Returns a list of violations (empty = all covered); public signature
-        is unchanged so the orchestrator scheduler (PR #497) needs no
-        coordinated change. Each violation dict adds a ``"violation_kind"``
-        field alongside the existing human-readable ``"reason"`` string, so
-        callers can distinguish severity/cause. A non-empty result is a
-        Tier-1 condition: the caller must not admit new crypto entries until
-        it is empty again.
+        This is the exact same logic :meth:`check_crypto_stop_coverage` has
+        always run (extracted unchanged, not rewritten — see that method's
+        docstring for the full violation-semantics writeup); it is factored
+        out here so :meth:`publish_stop_coverage_report` can derive a
+        :class:`~renquant_execution.coverage_report.CoverageReport` from the
+        SAME observation the violation list came from, instead of issuing a
+        second, independent (and possibly racy) broker query.
         """
         positions = self.get_all_positions()
         crypto_positions = {
@@ -1165,7 +1166,12 @@ class AlpacaBroker(BaseBroker):
             if is_crypto_pair(p["symbol"]) and float(p["qty"]) > 0
         }
         if not crypto_positions:
-            return []
+            return _CryptoStopCoverageObservation(
+                positions={},
+                qualifying_orders={},
+                non_resting_shaped={},
+                violations=[],
+            )
 
         open_orders = self.get_open_orders_detailed(asset_class=ASSET_CLASS_CRYPTO)
         qualifying: dict[str, list[dict[str, Any]]] = {}
@@ -1251,7 +1257,146 @@ class AlpacaBroker(BaseBroker):
                         f"(held {held_qty})"
                     ),
                 })
-        return violations
+        return _CryptoStopCoverageObservation(
+            positions=crypto_positions,
+            qualifying_orders=qualifying,
+            non_resting_shaped=non_resting_shaped,
+            violations=violations,
+        )
+
+    def check_crypto_stop_coverage(self) -> list[dict[str, Any]]:
+        """Tier-1 audit: every crypto position MUST have exactly ONE resting
+        GTC stop-limit SELL order covering at least its held quantity.
+
+        A "qualifying" protective stop (Codex review 2026-07-12 findings 1/2/5
+        — see :func:`_is_qualifying_protective_stop`) satisfies ALL of:
+        ``order_type == "stop_limit"``, ``side == "SELL"``,
+        ``time_in_force == "gtc"`` (case-insensitive), ``stop_price > 0``,
+        ``limit_price > 0``, and a genuinely RESTING broker status — NOT a
+        transitional ``pending_*`` sub-state that Alpaca's
+        ``QueryOrderStatus.OPEN`` filter still reports as "open" (see
+        :func:`_is_resting_order_status`).
+
+        Coverage is evaluated PER SYMBOL by *counting* qualifying stops,
+        never by summing quantities across multiple orders (finding 2: two
+        independently-executable stops can both fire — over-sell / race
+        risk with another exit):
+
+        - 0 qualifying stops -> violation, ``violation_kind="uncovered"``
+          (or ``"non_resting_ignored"`` if a stop-shaped order exists for the
+          symbol but only in a non-resting status right now, e.g. mid
+          cancel/replace).
+        - exactly 1 qualifying stop, qty >= held qty within the pair's own
+          ``min_trade_increment`` tolerance (finding 5 — never the equity
+          ``QTY_INTEGRAL_EPS``) -> covered, no violation.
+        - exactly 1 qualifying stop, qty short of that -> violation,
+          ``violation_kind="partial"``.
+        - 2+ qualifying stops for the same symbol -> violation,
+          ``violation_kind="duplicate"`` — FAILS CLOSED on ambiguity; the
+          summed quantity is NEVER treated as safe coverage.
+
+        Returns a list of violations (empty = all covered); public signature
+        is unchanged so the orchestrator scheduler (PR #497) needs no
+        coordinated change. Each violation dict adds a ``"violation_kind"``
+        field alongside the existing human-readable ``"reason"`` string, so
+        callers can distinguish severity/cause. A non-empty result is a
+        Tier-1 condition: the caller must not admit new crypto entries until
+        it is empty again.
+
+        Note: each crypto symbol contributes AT MOST one violation record to
+        the returned list (never one per order — e.g. duplicate/competing
+        stops for one symbol is still a single "duplicate" violation for
+        that symbol), which is why ``len(violations) == positions_total -
+        positions_covered`` holds exactly in
+        :meth:`publish_stop_coverage_report`'s
+        :class:`~renquant_execution.coverage_report.CoverageReport`.
+        """
+        return self._observe_crypto_stop_coverage().violations
+
+    def publish_stop_coverage_report(
+        self, account_id: str | None = None
+    ) -> CoverageReport:
+        """The ONLY execution-owned path to a diagnostic
+        :class:`~renquant_execution.coverage_report.CoverageReport` (Codex
+        review 2026-07-13T00:16:11Z finding 1).
+
+        The returned report has ``trust_level = "unattested_diagnostic"``
+        — it is suitable for monitoring and alerting but is NOT
+        authorization evidence for any entry gate.
+
+        Every observation field — ``violations``, ``positions_covered``,
+        ``positions_total``, ``order_ids`` — is derived exclusively from
+        one real, bounded broker observation
+        (:meth:`_observe_crypto_stop_coverage`, the SAME query
+        :meth:`check_crypto_stop_coverage` uses); none of it is accepted as a
+        caller-supplied argument. ``account_id`` and ``environment`` are
+        likewise resolved from the connected broker itself
+        (:meth:`get_account_id`, ``self.paper``), never from the caller.
+
+        ``account_id``, if passed, is treated as a consistency ASSERTION —
+        not an override: it must equal the connected broker's own
+        :meth:`get_account_id`, or this raises. This lets a caller fail loud
+        if it thinks it's talking to a different account than it actually
+        is, without ever letting a caller stamp an arbitrary identity onto
+        a report.
+
+        The two ``*_snapshot_hash`` fields on the returned report bind it to
+        the exact position / qualifying-order observation used to compute
+        it (Codex finding 2); ``violations == positions_total -
+        positions_covered`` is enforced by
+        :class:`~renquant_execution.coverage_report.CoverageReport`'s own
+        validation (finding 3), and ``source_version`` is derived from this
+        package's own installed metadata rather than supplied by the
+        caller.
+        """
+        real_account_id = self.get_account_id()
+        if account_id is not None and account_id != real_account_id:
+            raise ValueError(
+                f"account_id mismatch: caller passed {account_id!r} but the "
+                f"connected broker's account is {real_account_id!r} — "
+                "publish_stop_coverage_report() always uses the broker's "
+                "own verified account identity, never a caller override "
+                "(pass None, or the broker's own get_account_id() value, "
+                "as a no-op consistency assertion)"
+            )
+
+        raw_obs = self._observe_crypto_stop_coverage()
+        environment = "paper" if self.paper else "live"
+
+        positions_total = len(raw_obs.positions)
+        violations_count = len(raw_obs.violations)
+        positions_covered = positions_total - violations_count
+
+        order_ids = tuple(sorted({
+            str(order.get("order_id", ""))
+            for orders in raw_obs.qualifying_orders.values()
+            for order in orders
+            if str(order.get("order_id", ""))
+        }))
+
+        position_snapshot_hash = compute_snapshot_hash(
+            {symbol: qty for symbol, qty in sorted(raw_obs.positions.items())}
+        )
+        order_snapshot_hash = compute_snapshot_hash({
+            symbol: sorted(orders, key=lambda o: str(o.get("order_id", "")))
+            for symbol, orders in sorted(raw_obs.qualifying_orders.items())
+        })
+
+        observation = CoverageObservation(
+            account_id=real_account_id,
+            environment=environment,
+            observed_at_utc=datetime.now(timezone.utc),
+            positions_covered=positions_covered,
+            positions_total=positions_total,
+            qualifying_order_ids=order_ids,
+            position_snapshot_hash=position_snapshot_hash,
+            order_snapshot_hash=order_snapshot_hash,
+        )
+
+        return _build_coverage_report(
+            observation,
+            source_version=default_execution_version(),
+        )
 
     # ── thin wrappers for crypto Stage-0 battery (2026-07-12) ──────────────
 
