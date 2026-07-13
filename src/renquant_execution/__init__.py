@@ -133,6 +133,11 @@ from .order_state_machine import (
 )
 from .paper_broker import PaperBroker
 from .paper_broker_port import PaperBrokerPort
+from .coverage_report import (
+    CoverageReport,
+    build_coverage_report,
+    verify_coverage_report,
+)
 from .readonly_broker import (
     DEFAULT_READONLY_BROKER_NAME,
     ReadOnlyBrokerWrapper,
@@ -157,6 +162,7 @@ __all__ = [
     "BrokerPortContractError",
     "BrokerRegimeSnapshot",
     "CashLedgerPort",
+    "CoverageReport",
     "CostContractUnavailableError",
     "DEFAULT_RESERVATION_TTL_SECONDS",
     "HALT_REASON_RECHECK_MISMATCH",
@@ -217,6 +223,7 @@ __all__ = [
     "account_cash_ledger_db_path",
     "account_cash_ledger_enabled",
     "assert_crypto_no_short",
+    "build_coverage_report",
     "broker_submitter",
     "build_shared_account_cash_ledger_for_broker",
     "build_live_persistence_alert_event",
@@ -258,5 +265,6 @@ __all__ = [
     "validate_readonly_broker_name",
     "worst_case_entry_debit",
     "write_execution_payload",
+    "verify_coverage_report",
     "write_live_commit_plan",
 ]
