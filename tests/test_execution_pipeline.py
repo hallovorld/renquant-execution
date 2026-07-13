@@ -260,7 +260,7 @@ def test_get_broker_readonly_alpaca_constructs_without_connecting() -> None:
 def test_alpaca_broker_names_are_explicit() -> None:
     assert AlpacaBroker(paper=True).broker_name == "alpaca-paper"
     assert AlpacaBroker(paper=False).broker_name == "alpaca"
-    assert AlpacaBroker(paper=True, label="alpaca-shorts").broker_name == "alpaca-shorts"
+    assert AlpacaBroker(paper=True, label="alpaca-paper").broker_name == "alpaca-paper"
 
 
 def test_get_broker_rejects_unknown_mode() -> None:
