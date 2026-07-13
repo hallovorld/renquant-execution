@@ -66,9 +66,9 @@ logger = logging.getLogger(__name__)
 #: Default canary pairs for the battery.
 DEFAULT_CANARY_PAIRS: tuple[str, ...] = ("BTC/USD", "ETH/USD", "SOL/USD")
 
-#: Test notional for battery canary orders ($1.10 — above the $1 minimum,
-#: small enough to be immaterial on paper).
-DEFAULT_TEST_NOTIONAL_USD: float = 1.10
+#: Test notional for battery canary orders ($11 — above the $10 minimum
+#: cost-basis requirement, small enough to be immaterial on paper).
+DEFAULT_TEST_NOTIONAL_USD: float = 11.0
 
 #: GTC limit-BUY canary probe price, as a fraction of the pair's REAL current
 #: reference price (Codex review 2026-07-12 finding 3 on #34: a universal
@@ -405,11 +405,35 @@ def _place_probe_and_confirm_cleanup(
             detail,
         )
 
-    # Acceptance must be a genuinely resting/accepted status, not merely a
-    # nonempty order_id (Codex review 2026-07-12 finding 2). Reuses the same
-    # canonical helper PR #31 established for exactly this "genuinely
-    # resting, not a transitional pending_* sub-state" distinction.
+    # Alpaca crypto orders often start as pending_new and transition to
+    # new/accepted within ~1s. Poll briefly before rejecting.
+    if not _is_resting_order_status(status) and "pending" in status.lower():
+        import time as _time
+
+        deadline = _time.monotonic() + cancel_confirm_timeout_seconds
+        while _time.monotonic() < deadline:
+            _time.sleep(cancel_confirm_poll_interval_seconds)
+            try:
+                refreshed = broker.get_order_state(order_id)
+                status = refreshed.get("status", status)
+                detail["status"] = status
+            except Exception:
+                break
+            if _is_resting_order_status(status):
+                break
+            if status in _FILLED_ORDER_STATUSES:
+                break
+
     if not _is_resting_order_status(status):
+        if status in _FILLED_ORDER_STATUSES:
+            _check_residual_exposure(broker, order_id, symbol, detail=detail)
+            return (
+                False,
+                f"order {order_id} reports status={status!r} -- probe order "
+                "FILLED instead of resting; real paper inventory acquired "
+                f"(Tier-1 condition)",
+                detail,
+            )
         return (
             False,
             f"order {order_id} status {status!r} rejected the probe "
@@ -680,7 +704,10 @@ def _check_stop_limit_acceptance(
         stop_price = round_price_to_increment(raw_stop_price, spec.price_increment)
         raw_limit_price = stop_price * DEFAULT_CANARY_STOP_LIMIT_BUFFER
         limit_price = round_price_to_increment(raw_limit_price, spec.price_increment)
-        qty = spec.min_order_size
+        raw_qty = DEFAULT_TEST_NOTIONAL_USD / limit_price
+        qty = snap_qty_to_increment(
+            max(raw_qty, spec.min_order_size), spec.min_trade_increment
+        )
 
         ok, reason, detail = _place_probe_and_confirm_cleanup(
             broker,

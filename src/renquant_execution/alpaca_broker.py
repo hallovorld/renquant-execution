@@ -167,8 +167,8 @@ class AlpacaBroker(BaseBroker):
                     f"Live Alpaca account mismatch: expected {expected_account}, got {actual_account}"
                 )
 
-        status = str(getattr(self._account, "status", "")).upper()
-        if status and status != "ACTIVE":
+        status = _enum_value(getattr(self._account, "status", ""))
+        if status and status != "active":
             warnings.warn(f"Alpaca account status is {status}", RuntimeWarning, stacklevel=2)
 
     def disconnect(self) -> None:
@@ -297,7 +297,7 @@ class AlpacaBroker(BaseBroker):
         for order in self._require_client().get_orders(filter=request):
             if not self._order_matches_asset_class(order, wanted):
                 continue
-            if str(getattr(order, "status", "")).lower() in {"filled", "partially_filled"}:
+            if _enum_value(getattr(order, "status", "")) in {"filled", "partially_filled"}:
                 rows.append(_order_to_dict(order))
         return rows
 
@@ -1411,8 +1411,8 @@ class AlpacaBroker(BaseBroker):
         account = self._refresh_account()
         return {
             "account_id": str(getattr(account, "account_number", "") or ""),
-            "status": str(getattr(account, "status", "") or "").upper(),
-            "crypto_status": str(getattr(account, "crypto_status", "") or "").upper(),
+            "status": _enum_value(getattr(account, "status", "")).upper(),
+            "crypto_status": _enum_value(getattr(account, "crypto_status", "")).upper(),
             "buying_power": float(getattr(account, "buying_power", 0.0) or 0.0),
             "non_marginable_buying_power": float(
                 getattr(account, "non_marginable_buying_power", 0.0) or 0.0
@@ -1717,8 +1717,8 @@ class AlpacaBroker(BaseBroker):
 
     def _assert_account_active(self) -> None:
         account = self._refresh_account()
-        status = str(getattr(account, "status", "")).upper()
-        if status and status != "ACTIVE":
+        status = _enum_value(getattr(account, "status", ""))
+        if status and status != "active":
             raise RuntimeError(f"Alpaca account is not active: {status}")
 
     def _require_client(self) -> Any:
@@ -1741,13 +1741,13 @@ def _parse_datetime(value: str) -> datetime:
 
 
 def _order_to_dict(order: Any) -> dict[str, Any]:
-    side = str(getattr(order, "side", "") or "").upper()
+    side = _enum_value(getattr(order, "side", "")).upper()
     quantity = float(getattr(order, "qty", getattr(order, "quantity", 0.0)) or 0.0)
     filled_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
     filled_avg_price = float(getattr(order, "filled_avg_price", 0.0) or 0.0)
     return {
         "order_id": str(getattr(order, "id", "")),
-        "status": str(getattr(order, "status", "")),
+        "status": _enum_value(getattr(order, "status", "")),
         "symbol": str(getattr(order, "symbol", "")),
         "side": side,
         "action": side,

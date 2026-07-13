@@ -25,6 +25,7 @@ from renquant_execution.crypto_stage0_checks import (
     StepStatus,
     _check_gtc_order_acceptance,
     _check_stop_limit_acceptance,
+    _place_probe_and_confirm_cleanup,
     check_buying_power_behavior,
     check_crypto_account_status,
     check_data_parity,
@@ -603,6 +604,139 @@ def test_gtc_acceptance_fails_when_reference_price_lookup_fails() -> None:
     assert client.submitted == []
 
 
+# ── _place_probe_and_confirm_cleanup pending->resting polling ──────────────
+#
+# Alpaca crypto orders often start as pending_new and transition to
+# new/accepted within ~1s -- _place_probe_and_confirm_cleanup polls briefly
+# before rejecting rather than rejecting on the initial pending_new snapshot.
+# These tests drive that poll loop directly with a minimal broker double
+# exposing only get_order_state/cancel_order/wait_for_order_terminal_cancel/
+# get_position, rather than going through _FakeTradingClient's
+# order_status_sequence (which is shared across three different poll sites
+# -- acceptance, cancel-confirm, residual-exposure -- and isn't suited to
+# pinning down just the acceptance poll in isolation).
+
+
+def _pending_place_result(**overrides: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "order_id": "ord-1",
+        "status": "pending_new",
+        "confirmed_order_type": "limit",
+        "confirmed_asset_class": "crypto",
+        "side": "buy",
+        "confirmed_time_in_force": "gtc",
+        "quantity": 0.0001,
+        "confirmed_qty": 0.0001,
+        "confirmed_limit_price": 30_000.0,
+    }
+    result.update(overrides)
+    return result
+
+
+class _FakePollingBroker:
+    """Minimal broker double exposing only the methods
+    ``_place_probe_and_confirm_cleanup`` calls after ``place_fn`` returns."""
+
+    def __init__(
+        self,
+        order_state_sequence: list[dict[str, Any]] | None = None,
+        *,
+        raise_on_poll: bool = False,
+        cancel_confirmed: bool = True,
+        position_qty: float = 0.0,
+    ) -> None:
+        self._sequence = list(order_state_sequence or [])
+        self._raise_on_poll = raise_on_poll
+        self._cancel_confirmed = cancel_confirmed
+        self._position_qty = position_qty
+        self.get_order_state_calls = 0
+        self.cancel_called = False
+
+    def get_order_state(self, order_id: str) -> dict[str, Any]:
+        self.get_order_state_calls += 1
+        if self._raise_on_poll:
+            raise RuntimeError("network error during poll")
+        if len(self._sequence) > 1:
+            return self._sequence.pop(0)
+        return self._sequence[0]
+
+    def cancel_order(self, order_id: str) -> bool:
+        self.cancel_called = True
+        return True
+
+    def wait_for_order_terminal_cancel(
+        self, order_id: str, *, timeout_seconds: float, poll_interval_seconds: float
+    ) -> bool:
+        return self._cancel_confirmed
+
+    def get_position(self, symbol: str) -> float:
+        return self._position_qty
+
+
+def _run_probe_cleanup(broker: Any, **place_overrides: Any):
+    return _place_probe_and_confirm_cleanup(
+        broker,
+        symbol=BTC,
+        place_fn=lambda: _pending_place_result(**place_overrides),
+        expected_order_type="limit",
+        expected_side="buy",
+        expected_time_in_force="gtc",
+        expected_qty=0.0001,
+        expected_price_fields={"confirmed_limit_price": 30_000.0},
+        cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+        cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+    )
+
+
+def test_probe_cleanup_accepts_pending_new_that_resolves_to_new() -> None:
+    """get_order_state returns pending_new initially, then new on a
+    subsequent poll -- the probe must be accepted, not rejected on the
+    stale initial snapshot."""
+    broker = _FakePollingBroker(
+        order_state_sequence=[
+            {"status": "new", "filled_qty": 0.0, "filled_avg_price": 0.0},
+        ],
+    )
+    ok, reason, detail = _run_probe_cleanup(broker)
+    assert ok is True
+    assert reason is None
+    assert detail["status"] == "new"
+    assert broker.get_order_state_calls >= 1
+    assert broker.cancel_called is True
+
+
+def test_probe_cleanup_rejects_pending_new_that_never_resolves() -> None:
+    """get_order_state keeps returning pending_new on every poll until the
+    cancel-confirm timeout elapses -- the probe must be rejected, and no
+    cancel should be attempted against a never-resting order."""
+    broker = _FakePollingBroker(
+        order_state_sequence=[
+            {"status": "pending_new", "filled_qty": 0.0, "filled_avg_price": 0.0},
+        ],
+    )
+    ok, reason, detail = _run_probe_cleanup(broker)
+    assert ok is False
+    assert reason is not None
+    assert "rejected the probe" in reason
+    assert detail["status"] == "pending_new"
+    assert broker.get_order_state_calls >= 1
+    assert broker.cancel_called is False
+
+
+def test_probe_cleanup_rejects_using_stale_status_when_polling_raises() -> None:
+    """get_order_state raises during polling -- the poll loop must break
+    (not crash) and reject using the last known (stale, pre-exception)
+    status, never treat an API error as a resting/accepted order."""
+    broker = _FakePollingBroker(raise_on_poll=True)
+    ok, reason, detail = _run_probe_cleanup(broker)
+    assert ok is False
+    assert reason is not None
+    assert "rejected the probe" in reason
+    # Stale pre-exception status is preserved, not corrupted by the failure.
+    assert detail["status"] == "pending_new"
+    assert broker.cancel_called is False
+
+
 # ── _check_stop_limit_acceptance ────────────────────────────────────────────
 
 
@@ -626,6 +760,45 @@ def test_stop_limit_acceptance_prices_are_quote_derived() -> None:
     # Reference price is 60_000.0; the stop probe should be ~3x that
     # (180_000.0), not the old fixed $999,999,999 constant.
     assert 150_000.0 < stop_price < 210_000.0
+
+
+def test_stop_limit_acceptance_qty_matches_notional_and_increment_math() -> None:
+    """The submitted qty must be the ACTUAL notional/price/increment
+    computation for a real crypto spec, not merely "didn't crash" (Codex
+    review 2026-07-13 on execution#38: assert notional, price increment,
+    and quantity increment explicitly).
+
+    SOL: reference price 150.0 -> stop_price = 150*3.0 = 450.00,
+    limit_price = 450*1.01 = 454.5 (already on the 0.01 grid).
+    raw_qty = 11.0 (DEFAULT_TEST_NOTIONAL_USD) / 454.5 = 0.024203...,
+    which is ABOVE SOL's min_order_size (0.01) -- so the floor onto the
+    0.01 min_trade_increment grid (not the min_order_size clamp) is what
+    actually determines qty: floor(0.024203..., 0.01) = 0.02.
+    """
+    client = _FakeTradingClient(assets={SOL: _crypto_asset()})
+    broker = _broker(client, crypto_asset_specs={SOL: SOL_SPEC})
+    result = _check_stop_limit_acceptance(broker, (SOL,))
+    assert result.status == StepStatus.PASS
+    order = result.data["orders"][SOL]
+    assert order["confirmed_stop_price"] == pytest.approx(450.00)
+    assert order["confirmed_limit_price"] == pytest.approx(454.5)
+    assert order["confirmed_qty"] == pytest.approx(0.02)
+
+
+def test_stop_limit_acceptance_qty_floors_to_min_order_size_when_notional_too_small() -> None:
+    """For a high-priced pair (BTC), the notional-derived raw qty is
+    smaller than min_order_size -- the probe must floor UP to
+    min_order_size (never submit a qty below the exchange's own minimum),
+    then snap that to the trade increment grid."""
+    client = _FakeTradingClient(assets={BTC: _crypto_asset()})
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_stop_limit_acceptance(broker, (BTC,))
+    assert result.status == StepStatus.PASS
+    order = result.data["orders"][BTC]
+    # raw_qty = 11.0 / 181_800.0 ~= 6.05e-5, well below BTC_SPEC.min_order_size
+    # (0.0001) -- the probe must clamp up to the minimum, not submit a
+    # sub-minimum quantity the exchange would reject.
+    assert order["confirmed_qty"] == pytest.approx(BTC_SPEC.min_order_size)
 
 
 def test_stop_limit_acceptance_fail_on_spec_lookup() -> None:

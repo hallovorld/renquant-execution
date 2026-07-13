@@ -268,6 +268,24 @@ def test_get_broker_rejects_unknown_mode() -> None:
         get_broker("mystery")
 
 
+def test_get_broker_modes_have_distinct_env_prefixes() -> None:
+    """Every broker_type string in get_broker() must map to exactly one
+    reachable branch with its own env_prefix/label. A prior regression
+    (execution#38 review) renamed "alpaca-shorts" to "alpaca-paper" without
+    noticing that key already matched an earlier branch -- the renamed
+    branch became unreachable dead code and the "alpaca-shorts" mode
+    silently disappeared. Asserting through get_broker() itself (not by
+    constructing AlpacaBroker directly) is what catches this: a test that
+    bypasses the factory can't see which branch actually executed."""
+    default_paper = get_broker("alpaca-paper")
+    shorts = get_broker("alpaca-shorts")
+
+    assert default_paper.env_prefix == "ALPACA"
+    assert shorts.env_prefix == "ALPACA_SHORTS"
+    assert shorts.broker_name == "alpaca-shorts"
+    assert shorts.env_prefix != default_paper.env_prefix
+
+
 # ── Fractional-share fractionable guard (renquant-pipeline #35) ─────────────
 #
 # These exercise the live broker boundary directly; the end-to-end paths
