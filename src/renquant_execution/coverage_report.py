@@ -42,8 +42,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 __all__ = [
+    "CoverageObservation",
     "CoverageReport",
     "COVERAGE_REPORT_SCHEMA_VERSION",
+    "build_coverage_report",
     "compute_snapshot_hash",
     "default_execution_version",
     "verify_coverage_report",
@@ -450,6 +452,21 @@ def _build_coverage_report(
     real_hash = _compute_hash(tmp)
 
     return CoverageReport(**shared, integrity_hash=real_hash)
+
+
+def build_coverage_report(
+    observation: CoverageObservation,
+    *,
+    source_version: str,
+) -> CoverageReport:
+    """Construct a :class:`CoverageReport` from a :class:`CoverageObservation`.
+
+    This is the public builder (Codex review 2026-07-13, Item 1).
+    ``violations`` is computed as ``positions_total - positions_covered``
+    --- there is no parameter to override it.  ``report_id`` (UUID),
+    ``timestamp_utc``, and ``execution_version`` are auto-generated.
+    """
+    return _build_coverage_report(observation, source_version=source_version)
 
 
 def verify_coverage_report(report: CoverageReport) -> bool:

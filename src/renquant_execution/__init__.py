@@ -135,7 +135,9 @@ from .paper_broker import PaperBroker
 from .paper_broker_port import PaperBrokerPort
 from .coverage_report import (
     COVERAGE_REPORT_SCHEMA_VERSION,
+    CoverageObservation,
     CoverageReport,
+    build_coverage_report,
     compute_snapshot_hash,
     default_execution_version,
     verify_coverage_report,
@@ -165,6 +167,7 @@ __all__ = [
     "BrokerRegimeSnapshot",
     "CashLedgerPort",
     "COVERAGE_REPORT_SCHEMA_VERSION",
+    "CoverageObservation",
     "CoverageReport",
     "CostContractUnavailableError",
     "DEFAULT_RESERVATION_TTL_SECONDS",
@@ -239,6 +242,7 @@ __all__ = [
     "classify_terminal_status",
     "commit_live_persistence",
     "compute_parent_intent_id",
+    "build_coverage_report",
     "compute_snapshot_hash",
     "crypto_no_short_violation",
     "default_execution_version",

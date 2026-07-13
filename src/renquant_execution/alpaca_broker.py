@@ -29,7 +29,7 @@ from .broker import (
 from .coverage_report import (
     CoverageObservation,
     CoverageReport,
-    _build_coverage_report,
+    build_coverage_report,
     compute_snapshot_hash,
     default_execution_version,
 )
@@ -1388,7 +1388,7 @@ class AlpacaBroker(BaseBroker):
             order_snapshot_hash=order_snapshot_hash,
         )
 
-        return _build_coverage_report(
+        return build_coverage_report(
             observation,
             source_version=default_execution_version(),
         )

@@ -345,10 +345,9 @@ def test_build_coverage_report_removed_from_public_api():
     """``build_coverage_report`` -- the general caller-populated builder
     Codex's review flagged as the fabrication vector -- does not exist
     anywhere, at the package level or the module level; only the private
-    ``_build_coverage_report`` does. ``CoverageObservation`` (a plain
-    validated input struct) is likewise excluded from
-    ``renquant_execution``'s package exports and from this module's
-    ``__all__``, so neither name appears in the documented public surface."""
+    ``_build_coverage_report`` does. ``CoverageObservation`` is likewise
+    excluded from ``renquant_execution``'s package exports and from this
+    module's ``__all__``."""
     import renquant_execution
 
     assert not hasattr(renquant_execution, "build_coverage_report")
@@ -368,7 +367,6 @@ def test_build_coverage_report_removed_from_public_api():
         from renquant_execution.coverage_report import (  # noqa: F401
             build_coverage_report,
         )
-    # The private builder DOES exist (used internally by AlpacaBroker).
     assert hasattr(cr_module, "_build_coverage_report")
 
 
