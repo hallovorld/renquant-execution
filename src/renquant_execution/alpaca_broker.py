@@ -1408,11 +1408,14 @@ class AlpacaBroker(BaseBroker):
         on the correct environment -- without the battery importing alpaca-py
         or reaching into private broker state.
         """
+        def _enum_name(val: object) -> str:
+            return (val.name if hasattr(val, "name") else str(val or "")).upper()
+
         account = self._refresh_account()
         return {
             "account_id": str(getattr(account, "account_number", "") or ""),
-            "status": str(getattr(account, "status", "") or "").upper(),
-            "crypto_status": str(getattr(account, "crypto_status", "") or "").upper(),
+            "status": _enum_name(getattr(account, "status", "")),
+            "crypto_status": _enum_name(getattr(account, "crypto_status", "")),
             "buying_power": float(getattr(account, "buying_power", 0.0) or 0.0),
             "non_marginable_buying_power": float(
                 getattr(account, "non_marginable_buying_power", 0.0) or 0.0
