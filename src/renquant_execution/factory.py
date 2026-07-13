@@ -37,8 +37,8 @@ def get_broker(
         return AlpacaBroker(paper=True)
     if broker == "alpaca":
         return AlpacaBroker(paper=False)
-    if broker == "alpaca-paper":
-        return AlpacaBroker(paper=True, env_prefix="ALPACA_PAPER", label="alpaca-paper")
+    if broker == "alpaca-shorts":
+        return AlpacaBroker(paper=True, env_prefix="ALPACA_SHORTS", label="alpaca-shorts")
     if broker in _READONLY_MODES:
         return ReadOnlyBrokerWrapper(
             AlpacaBroker(paper=False),
