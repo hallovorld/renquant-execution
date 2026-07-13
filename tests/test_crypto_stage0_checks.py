@@ -473,6 +473,82 @@ def test_gtc_acceptance_records_residual_position_on_fill() -> None:
     assert result.data["orders"][BTC]["residual_position_qty"] == pytest.approx(0.0001)
 
 
+def test_gtc_acceptance_detects_residual_fill_on_confirmed_cancel() -> None:
+    """Tier-1 race: broker partially fills the probe order, then cancels the
+    unfilled remainder.  Final status is 'canceled' (confirmed) but
+    filled_qty > 0 -- a residual position exists.  The residual-exposure
+    audit after confirmed cancellation must detect this and FAIL.
+    """
+    client = _FakeTradingClient(
+        assets={BTC: _crypto_asset()},
+        positions={BTC: 0.0001},
+    )
+    original_cancel = client.cancel_order_by_id
+
+    def _cancel_with_partial_fill(order_id: str) -> None:
+        original_cancel(order_id)
+        # Simulate: broker partially filled before honoring the cancel.
+        order = client._orders_by_id.get(order_id)
+        if order is not None:
+            order.filled_qty = 0.0001
+
+    client.cancel_order_by_id = _cancel_with_partial_fill
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_gtc_order_acceptance(broker, (BTC,))
+    assert result.status == StepStatus.FAIL
+    detail = result.data["orders"][BTC]
+    # Cancel was confirmed terminal -- the race is that the fill happened
+    # before the cancel took effect.
+    assert detail["cancel_confirmed"] is True
+    # The residual-exposure audit detected the partial fill via order state.
+    assert detail["final_order_state"]["filled_qty"] == pytest.approx(0.0001)
+    assert detail["final_order_state"]["status"] == "canceled"
+    assert "residual fill" in result.detail
+    assert "Tier-1" in result.detail
+
+
+def test_gtc_acceptance_fails_closed_on_position_lookup_error_after_cancel() -> None:
+    """Position-query API error after confirmed cancel must leave the probe
+    in failure state (not silently PASS).  Cannot confirm zero position when
+    the position API is unreachable -- fail closed as Tier-1 unknown failure.
+    """
+    client = _FakeTradingClient(assets={BTC: _crypto_asset()})
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+
+    # Monkey-patch get_position to raise a non-"not found" error that
+    # propagates through the broker's own not-found filter.
+    def _position_api_error(symbol: str) -> float:
+        raise RuntimeError("API timeout during position lookup")
+
+    broker.get_position = _position_api_error
+    result = _check_gtc_order_acceptance(broker, (BTC,))
+    assert result.status == StepStatus.FAIL
+    detail = result.data["orders"][BTC]
+    assert detail["cancel_confirmed"] is True
+    # Order state itself was clean (filled_qty=0), but position lookup failed.
+    assert detail["final_order_state"]["filled_qty"] == pytest.approx(0.0)
+    assert "position_check_error" in detail
+    assert "position lookup failed" in result.detail
+    assert "cannot confirm zero position" in result.detail
+
+
+def test_gtc_acceptance_clean_cancel_passes_residual_audit() -> None:
+    """A confirmed cancel with zero filled_qty and no residual position
+    must PASS the residual-exposure audit -- verifying the audit runs and
+    records its findings without false-positive failure.
+    """
+    client = _FakeTradingClient(assets={BTC: _crypto_asset()})
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_gtc_order_acceptance(broker, (BTC,))
+    assert result.status == StepStatus.PASS
+    detail = result.data["orders"][BTC]
+    assert detail["cancel_confirmed"] is True
+    # Residual-exposure audit ran and found nothing.
+    assert detail["final_order_state"]["filled_qty"] == pytest.approx(0.0)
+    assert detail["final_order_state"]["status"] == "canceled"
+    assert detail["residual_position_qty"] == pytest.approx(0.0)
+
+
 def test_gtc_acceptance_fails_on_missing_order_type_field() -> None:
     """Codex round-2 review finding 2: an EMPTY/missing broker-confirmed
     field must FAIL, never be silently skipped -- the original `if field and
