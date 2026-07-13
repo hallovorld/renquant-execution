@@ -762,6 +762,45 @@ def test_stop_limit_acceptance_prices_are_quote_derived() -> None:
     assert 150_000.0 < stop_price < 210_000.0
 
 
+def test_stop_limit_acceptance_qty_matches_notional_and_increment_math() -> None:
+    """The submitted qty must be the ACTUAL notional/price/increment
+    computation for a real crypto spec, not merely "didn't crash" (Codex
+    review 2026-07-13 on execution#38: assert notional, price increment,
+    and quantity increment explicitly).
+
+    SOL: reference price 150.0 -> stop_price = 150*3.0 = 450.00,
+    limit_price = 450*1.01 = 454.5 (already on the 0.01 grid).
+    raw_qty = 11.0 (DEFAULT_TEST_NOTIONAL_USD) / 454.5 = 0.024203...,
+    which is ABOVE SOL's min_order_size (0.01) -- so the floor onto the
+    0.01 min_trade_increment grid (not the min_order_size clamp) is what
+    actually determines qty: floor(0.024203..., 0.01) = 0.02.
+    """
+    client = _FakeTradingClient(assets={SOL: _crypto_asset()})
+    broker = _broker(client, crypto_asset_specs={SOL: SOL_SPEC})
+    result = _check_stop_limit_acceptance(broker, (SOL,))
+    assert result.status == StepStatus.PASS
+    order = result.data["orders"][SOL]
+    assert order["confirmed_stop_price"] == pytest.approx(450.00)
+    assert order["confirmed_limit_price"] == pytest.approx(454.5)
+    assert order["confirmed_qty"] == pytest.approx(0.02)
+
+
+def test_stop_limit_acceptance_qty_floors_to_min_order_size_when_notional_too_small() -> None:
+    """For a high-priced pair (BTC), the notional-derived raw qty is
+    smaller than min_order_size -- the probe must floor UP to
+    min_order_size (never submit a qty below the exchange's own minimum),
+    then snap that to the trade increment grid."""
+    client = _FakeTradingClient(assets={BTC: _crypto_asset()})
+    broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
+    result = _check_stop_limit_acceptance(broker, (BTC,))
+    assert result.status == StepStatus.PASS
+    order = result.data["orders"][BTC]
+    # raw_qty = 11.0 / 181_800.0 ~= 6.05e-5, well below BTC_SPEC.min_order_size
+    # (0.0001) -- the probe must clamp up to the minimum, not submit a
+    # sub-minimum quantity the exchange would reject.
+    assert order["confirmed_qty"] == pytest.approx(BTC_SPEC.min_order_size)
+
+
 def test_stop_limit_acceptance_fail_on_spec_lookup() -> None:
     """If a pair's spec can't be resolved, the step fails."""
     client = _FakeTradingClient(assets={})
