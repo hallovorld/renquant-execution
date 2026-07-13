@@ -167,7 +167,8 @@ class AlpacaBroker(BaseBroker):
                     f"Live Alpaca account mismatch: expected {expected_account}, got {actual_account}"
                 )
 
-        status = str(getattr(self._account, "status", "")).upper()
+        raw_status = getattr(self._account, "status", "")
+        status = (raw_status.name if hasattr(raw_status, "name") else str(raw_status or "")).upper()
         if status and status != "ACTIVE":
             warnings.warn(f"Alpaca account status is {status}", RuntimeWarning, stacklevel=2)
 
