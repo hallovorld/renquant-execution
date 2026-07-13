@@ -830,25 +830,25 @@ class TestFakeBrokerIntegration:
 # ---------------------------------------------------------------------------
 
 
-class TestPublicAPISurface:
-    """Codex review Item 1: CoverageObservation and build_coverage_report
-    are public, importable, and listed in __all__."""
+class TestNoPublicAuthorizationPath:
+    """Codex review 2026-07-13T00:16:11Z finding 1: build_coverage_report
+    was a general caller-populated builder -- exactly the "authorization
+    path" that let a caller mint a fabricated report. It (and its
+    CoverageObservation input) must NOT be part of the public API; the only
+    supported path to a genuine report is
+    AlpacaBroker.publish_stop_coverage_report()."""
 
-    def test_coverage_observation_and_builder_are_public(self):
+    def test_builder_not_exported_at_package_or_module_all_level(self):
         import renquant_execution
         import renquant_execution.coverage_report as cr_module
 
-        for name in ("CoverageObservation", "build_coverage_report"):
-            assert hasattr(renquant_execution, name), (
-                f"{name} must be importable from renquant_execution"
-            )
-            assert hasattr(cr_module, name), (
-                f"{name} must be importable from renquant_execution.coverage_report"
-            )
-            assert name in cr_module.__all__, (
-                f"{name} must be in coverage_report.__all__"
-            )
+        assert not hasattr(renquant_execution, "build_coverage_report")
+        assert not hasattr(renquant_execution, "CoverageObservation")
+        assert not hasattr(cr_module, "build_coverage_report")
+        assert "build_coverage_report" not in cr_module.__all__
+        assert "CoverageObservation" not in cr_module.__all__
 
+        # The rest of the public surface is intact.
         assert "CoverageReport" in cr_module.__all__
         assert "verify_coverage_report" in cr_module.__all__
 

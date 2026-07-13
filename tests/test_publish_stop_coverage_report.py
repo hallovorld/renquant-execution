@@ -338,21 +338,34 @@ def test_environment_reflects_broker_paper_flag():
 # ---------------------------------------------------------------------------
 
 
-def test_build_coverage_report_is_public_api():
-    """Codex review Item 1: ``build_coverage_report`` and
-    ``CoverageObservation`` are public, importable names."""
+def test_build_coverage_report_removed_from_public_api():
+    """``build_coverage_report`` -- the general caller-populated builder
+    Codex's review flagged as the fabrication vector -- does not exist
+    anywhere, at the package level or the module level; only the private
+    ``_build_coverage_report`` does. ``CoverageObservation`` is likewise
+    excluded from ``renquant_execution``'s package exports and from this
+    module's ``__all__``."""
     import renquant_execution
 
-    assert hasattr(renquant_execution, "build_coverage_report")
-    assert hasattr(renquant_execution, "CoverageObservation")
+    assert not hasattr(renquant_execution, "build_coverage_report")
+    assert not hasattr(renquant_execution, "CoverageObservation")
 
     import renquant_execution.coverage_report as cr_module
 
-    assert hasattr(cr_module, "build_coverage_report")
-    assert "build_coverage_report" in cr_module.__all__
-    assert "CoverageObservation" in cr_module.__all__
+    assert not hasattr(cr_module, "build_coverage_report")
+    assert "build_coverage_report" not in cr_module.__all__
+    assert "CoverageObservation" not in cr_module.__all__
+    # verify_coverage_report/CoverageReport remain the legitimate public
+    # surface for a consumer that loads a serialized report.
     assert "CoverageReport" in cr_module.__all__
     assert "verify_coverage_report" in cr_module.__all__
+
+    with pytest.raises(ImportError):
+        from renquant_execution.coverage_report import (  # noqa: F401
+            build_coverage_report,
+        )
+    assert hasattr(cr_module, "_build_coverage_report")
+
 
 
 def test_publish_stop_coverage_report_signature_has_no_field_overrides():
