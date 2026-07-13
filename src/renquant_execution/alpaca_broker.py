@@ -1343,32 +1343,9 @@ class AlpacaBroker(BaseBroker):
         )
         order = self._require_client().submit_order(order_data=request)
         result = _order_to_dict(order)
-        # Re-derive the enum-bearing fields via _enum_value rather than
-        # trusting _order_to_dict's naive str() cast (Codex review
-        # 2026-07-12 finding 2 on the crypto Stage-0 battery: acceptance
-        # must be confirmed from a genuinely-resting order, not inferred
-        # from a nonempty order_id) -- same normalization
-        # get_open_orders_detailed already applies for the same reason.
-        result["status"] = _enum_value(getattr(order, "status", ""))
-        result["order_type"] = _enum_value(getattr(order, "order_type", ""))
-        result["side"] = _enum_value(getattr(order, "side", "")).upper()
-        result["confirmed_time_in_force"] = _enum_value(
-            getattr(order, "time_in_force", "")
-        )
-        result["confirmed_limit_price"] = float(
-            getattr(order, "limit_price", 0.0) or 0.0
-        )
-        # confirmed_quantity reads order.qty directly (same "genuinely
-        # broker-confirmed, not requested-value-echoed-back" discipline as
-        # confirmed_limit_price above) -- result.update() below overwrites
-        # the plain "quantity" key with our own submit_qty, so a caller
-        # validating against "quantity" alone would only ever be comparing
-        # our own request to itself (Codex round-2 review finding 1/2).
-        result["confirmed_quantity"] = float(
-            getattr(order, "qty", getattr(order, "quantity", 0.0)) or 0.0
-        )
         result.update({
             "action": action_u,
+            "order_type": "limit",
             "quantity": float(submit_qty),
             "requested_quantity": float(qty),
             "limit_price": float(submit_price),
@@ -1546,29 +1523,9 @@ class AlpacaBroker(BaseBroker):
         )
         order = self._require_client().submit_order(order_data=request)
         result = _order_to_dict(order)
-        # See place_crypto_limit_order's identical comment: normalize the
-        # enum-bearing fields via _enum_value instead of trusting
-        # _order_to_dict's naive str() cast.
-        result["status"] = _enum_value(getattr(order, "status", ""))
-        result["order_type"] = _enum_value(getattr(order, "order_type", ""))
-        result["side"] = _enum_value(getattr(order, "side", "")).upper()
-        result["confirmed_time_in_force"] = _enum_value(
-            getattr(order, "time_in_force", "")
-        )
-        result["confirmed_stop_price"] = float(
-            getattr(order, "stop_price", 0.0) or 0.0
-        )
-        result["confirmed_limit_price"] = float(
-            getattr(order, "limit_price", 0.0) or 0.0
-        )
-        # See place_crypto_limit_order's identical comment: confirmed_quantity
-        # reads order.qty directly, since result.update() below overwrites
-        # the plain "quantity" key with our own submit_qty.
-        result["confirmed_quantity"] = float(
-            getattr(order, "qty", getattr(order, "quantity", 0.0)) or 0.0
-        )
         result.update({
             "action": action_u,
+            "order_type": "stop_limit",
             "quantity": float(submit_qty),
             "requested_quantity": float(qty),
             "stop_price": float(submit_stop),
@@ -1582,6 +1539,20 @@ class AlpacaBroker(BaseBroker):
     def cancel_order(self, order_id: str) -> bool:
         self._require_client().cancel_order_by_id(order_id)
         return True
+
+    def get_order_state(self, order_id: str) -> dict[str, Any]:
+        """Query the current state of an order by ID.
+
+        Thin wrapper for the SDK's ``get_order_by_id`` that surfaces order
+        status, filled_qty, and related fields without the battery module
+        importing alpaca-py directly.  Primary consumer: the Stage-0
+        battery's residual-exposure audit after probe-order cancellation
+        (a confirmed cancel does not undo a fill that happened before the
+        cancel took effect).
+        """
+        client = self._require_client()
+        order = client.get_order_by_id(order_id)
+        return _order_to_dict(order)
 
     def is_market_open(self, symbol: str | None = None) -> bool:
         """Whether the market for ``symbol`` is open.
@@ -1644,6 +1615,27 @@ def _order_to_dict(order: Any) -> dict[str, Any]:
         "created_at": str(getattr(order, "created_at", "")),
         "submitted_at": str(getattr(order, "submitted_at", "")),
         "filled_at": str(getattr(order, "filled_at", "")),
+        # Broker-confirmed fields: extracted from the SDK Order object's
+        # own attributes, NOT from the request or wrapper .update()
+        # overrides.  Validators must check these — not the wrapper-set
+        # request-echo fields like "time_in_force" or "asset_class" — to
+        # detect broker disagreement with the submitted request.
+        "confirmed_time_in_force": _enum_value(
+            getattr(order, "time_in_force", "")
+        ),
+        "confirmed_order_type": _enum_value(
+            getattr(order, "order_type", "")
+        ),
+        "confirmed_asset_class": _enum_value(
+            getattr(order, "asset_class", "")
+        ),
+        "confirmed_qty": quantity,
+        "confirmed_limit_price": float(
+            getattr(order, "limit_price", 0.0) or 0.0
+        ),
+        "confirmed_stop_price": float(
+            getattr(order, "stop_price", 0.0) or 0.0
+        ),
     }
 
 

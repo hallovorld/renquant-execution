@@ -423,7 +423,8 @@ def test_gtc_acceptance_queries_residual_position_when_cancel_unconfirmed() -> N
         cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
     )
     assert result.status == StepStatus.FAIL
-    assert "residual_position_qty" in result.detail
+    # Residual position is now tracked in the order detail data, not
+    # the human-readable detail string (fail-closed refactor from PR #36).
     assert result.data["orders"][BTC]["residual_position_qty"] == pytest.approx(0.0001)
 
 
@@ -467,7 +468,8 @@ def test_gtc_acceptance_records_residual_position_on_fill() -> None:
     broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
     result = _check_gtc_order_acceptance(broker, (BTC,))
     assert result.status == StepStatus.FAIL
-    assert "residual_position_qty" in result.detail
+    # Residual position is now tracked in the order detail data, not
+    # the human-readable detail string (fail-closed refactor from PR #36).
     assert result.data["orders"][BTC]["residual_position_qty"] == pytest.approx(0.0001)
 
 
@@ -507,7 +509,7 @@ def test_gtc_acceptance_fails_on_quantity_mismatch() -> None:
     broker = _broker(client, crypto_asset_specs={BTC: BTC_SPEC})
     result = _check_gtc_order_acceptance(broker, (BTC,))
     assert result.status == StepStatus.FAIL
-    assert "confirmed_quantity" in result.detail
+    assert "confirmed_qty" in result.detail
     assert client.cancelled == ["ord-1"]
 
 

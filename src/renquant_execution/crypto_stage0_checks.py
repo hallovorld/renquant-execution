@@ -259,18 +259,84 @@ def check_pair_snapshot(
     )
 
 
-def _query_residual_position(broker: AlpacaBroker, symbol: str) -> float | None:
-    """Best-effort residual-position query for the Tier-1 fill-evidence path.
+def _check_residual_exposure(
+    broker: AlpacaBroker,
+    order_id: str,
+    symbol: str,
+    *,
+    detail: dict[str, Any],
+) -> tuple[bool, str | None]:
+    """Query order final state and position to detect residual exposure.
 
-    Returns ``None`` (never raises) if the lookup itself fails -- the
-    fill/cleanup-failure condition must still be reported even if this
-    diagnostic extra can't be obtained, per Codex review 2026-07-12 round-2
-    finding 3.
+    Cancellation confirmation alone does not undo a fill -- if the probe
+    order partially or fully filled before the cancel took effect, the
+    account has unintended exposure.  This method queries:
+
+    1. The order's final state (``filled_qty``, ``status``) via
+       :meth:`AlpacaBroker.get_order_state`.
+    2. The relevant position for ``symbol`` via
+       :meth:`AlpacaBroker.get_position`.
+
+    Returns ``(True, None)`` if no residual exposure is detected, or
+    ``(False, failure_reason)`` with durable evidence in ``detail``
+    if any nonzero fill or position exists.  A nonzero residual is a
+    Tier-1 failure -- the probe created unintended market exposure.
+
+    **Fails closed on API errors** (rescued from PR #36): position lookup
+    errors (timeout/auth/500) are treated as Tier-1 unknown failures, not
+    silently passed.  ``get_position()`` already handles "position not
+    found" internally -- any propagating exception is a real API error.
     """
+    # ── query order final state ────────────────────────────────────────
     try:
-        return broker.get_position(symbol)
-    except Exception:
-        return None
+        order_state = broker.get_order_state(order_id)
+    except Exception as exc:
+        detail["residual_check_error"] = str(exc)
+        return False, (
+            f"cannot query final state of order {order_id}: {exc}"
+        )
+
+    filled_qty = float(order_state.get("filled_qty", 0.0) or 0.0)
+    final_status = order_state.get("status", "")
+    detail["final_order_state"] = {
+        "status": final_status,
+        "filled_qty": filled_qty,
+        "filled_avg_price": order_state.get("filled_avg_price", 0.0),
+    }
+
+    if filled_qty > 0:
+        return False, (
+            f"order {order_id} has residual fill "
+            f"(filled_qty={filled_qty}, status={final_status!r}) -- "
+            f"Tier-1 failure: cancellation did not undo the fill"
+        )
+
+    # ── query position ─────────────────────────────────────────────────
+    try:
+        position_qty = broker.get_position(symbol)
+    except Exception as exc:
+        # get_position() already returns 0.0 for a recognized "position
+        # not found" response without raising (AlpacaBroker._is_not_found_error).
+        # Any exception that propagates is a real API error (timeout,
+        # auth failure, 500, etc.) -- cannot confirm zero position, fail
+        # closed as Tier-1 unknown failure.
+        detail["position_check_error"] = str(exc)
+        return False, (
+            f"position lookup failed during residual-exposure "
+            f"audit ({exc}) -- cannot confirm zero position; treating "
+            f"as unknown failure (Tier-1)"
+        )
+
+    detail["residual_position_qty"] = position_qty
+
+    if abs(position_qty) > 0:
+        return False, (
+            f"nonzero residual position after probe "
+            f"(qty={position_qty}) -- Tier-1 failure: "
+            f"probe order may have created unintended exposure"
+        )
+
+    return True, None
 
 
 def _place_probe_and_confirm_cleanup(
@@ -311,11 +377,12 @@ def _place_probe_and_confirm_cleanup(
     detail: dict[str, Any] = {
         "order_id": order_id,
         "status": status,
-        "order_type": result.get("order_type", ""),
+        "confirmed_order_type": result.get("confirmed_order_type", ""),
+        "confirmed_asset_class": result.get("confirmed_asset_class", ""),
         "side": result.get("side", ""),
         "confirmed_time_in_force": result.get("confirmed_time_in_force", ""),
         "qty": result.get("quantity", 0.0),
-        "confirmed_quantity": result.get("confirmed_quantity"),
+        "confirmed_qty": result.get("confirmed_qty"),
     }
     for field_name in expected_price_fields:
         detail[field_name] = result.get(field_name)
@@ -325,17 +392,16 @@ def _place_probe_and_confirm_cleanup(
 
     # A FILLED probe order is a distinct, MORE severe Tier-1 condition than a
     # merely-rejected one: real (paper) inventory was acquired, not just "no
-    # resting order to clean up". Query and RECORD the residual position --
-    # a bare "FILLED" status is not durable evidence of how much inventory
-    # now exists (Codex review 2026-07-12 round-2 finding 3).
+    # resting order to clean up".
     if status in _FILLED_ORDER_STATUSES:
-        detail["residual_position_qty"] = _query_residual_position(broker, symbol)
+        # Fail-closed residual check (rescued from PR #36): query order
+        # final state AND position; API errors = Tier-1 unknown failure.
+        _check_residual_exposure(broker, order_id, symbol, detail=detail)
         return (
             False,
             f"order {order_id} reports status={status!r} -- probe order "
             "FILLED instead of resting; real paper inventory acquired "
-            f"(Tier-1 condition, residual_position_qty="
-            f"{detail['residual_position_qty']!r})",
+            f"(Tier-1 condition)",
             detail,
         )
 
@@ -375,32 +441,33 @@ def _place_probe_and_confirm_cleanup(
     detail["cancel_exception"] = cancel_exception
     if not cancel_confirmed:
         # An unconfirmed cancellation is ambiguous: the order may still be
-        # resting, or it may have filled during the cancel-confirm window
-        # (a genuinely different, more severe outcome --
-        # wait_for_order_terminal_cancel returns False for EITHER case, per
-        # its own docstring). Query residual position now for durable
-        # evidence rather than leaving the operator to guess which
-        # happened -- this is the same class of race a same-package
-        # concurrent fix (execution#36, closed in favor of this PR) flagged:
-        # a resting-at-acceptance-time order can still fill before/during
-        # cleanup, which the initial synchronous FILLED-status check above
-        # cannot see.
-        detail["residual_position_qty"] = _query_residual_position(broker, symbol)
+        # resting, or it may have filled during the cancel-confirm window.
+        # Fail-closed residual check (rescued from PR #36).
+        _check_residual_exposure(broker, order_id, symbol, detail=detail)
         reason = (
             f"cancel_order raised ({cancel_exception}) and cancellation of "
             f"order {order_id} was not subsequently confirmed terminally "
             f"canceled within {cancel_confirm_timeout_seconds}s -- order may "
-            f"still be resting/uncancelled or may have filled "
-            f"(residual_position_qty={detail['residual_position_qty']!r})"
+            f"still be resting/uncancelled or may have filled"
             if cancel_exception is not None
             else (
                 f"cancellation of order {order_id} not confirmed terminally "
                 f"canceled within {cancel_confirm_timeout_seconds}s -- order "
-                f"may still be resting/uncancelled or may have filled "
-                f"(residual_position_qty={detail['residual_position_qty']!r})"
+                f"may still be resting/uncancelled or may have filled"
             )
         )
         return False, reason, detail
+
+    # Residual exposure audit AFTER confirmed cancellation (rescued from
+    # PR #36): even a confirmed cancel does not undo a fill that happened
+    # before the cancel took effect.  A resting-at-acceptance-time order
+    # can still fill during the cancel-confirm window.  Fail closed on
+    # API errors -- cannot confirm zero position = Tier-1 unknown failure.
+    clean, residual_reason = _check_residual_exposure(
+        broker, order_id, symbol, detail=detail,
+    )
+    if not clean:
+        return False, residual_reason, detail
 
     # Field validation (Codex review 2026-07-12 finding 2, strengthened per
     # round-2 finding 2), checked AFTER cleanup so a mismatched-but-resting
@@ -410,11 +477,15 @@ def _place_probe_and_confirm_cleanup(
     # != expected` pattern let an empty/unset field slip past validation
     # entirely, which is exactly backwards: we cannot confirm a field
     # matches if the broker didn't report it at all.
+    #
+    # Validates broker-confirmed fields (confirmed_*) extracted from the
+    # SDK Order object, NOT the wrapper's request-echo fields (rescued
+    # from PR #36).
     field_failures: list[str] = []
-    order_type = result.get("order_type", "")
-    if not order_type or order_type != expected_order_type:
+    confirmed_order_type = result.get("confirmed_order_type", "")
+    if not confirmed_order_type or confirmed_order_type != expected_order_type:
         field_failures.append(
-            f"order_type {order_type!r} != expected {expected_order_type!r}"
+            f"confirmed_order_type {confirmed_order_type!r} != expected {expected_order_type!r}"
         )
     side = result.get("side", "")
     if not side or side != expected_side:
@@ -422,21 +493,24 @@ def _place_probe_and_confirm_cleanup(
     tif = result.get("confirmed_time_in_force", "")
     if not tif or tif != expected_time_in_force:
         field_failures.append(
-            f"time_in_force {tif!r} != expected {expected_time_in_force!r}"
+            f"confirmed_time_in_force {tif!r} != expected {expected_time_in_force!r}"
         )
-    # confirmed_quantity reads the broker's own order.qty, NOT our
+    confirmed_asset_class = result.get("confirmed_asset_class", "")
+    if confirmed_asset_class and confirmed_asset_class != "crypto":
+        field_failures.append(
+            f"confirmed_asset_class {confirmed_asset_class!r} != expected 'crypto'"
+        )
+    # confirmed_qty reads the broker's own order.qty, NOT our
     # submitted/snapped qty echoed back (Codex round-2 review finding 1/2:
-    # validating a value against itself proves nothing) -- see
-    # place_crypto_limit_order/place_crypto_stop_limit_order's identical
-    # confirmed_quantity population.
-    confirmed_qty = result.get("confirmed_quantity")
+    # validating a value against itself proves nothing).
+    confirmed_qty = result.get("confirmed_qty")
     if confirmed_qty is None or confirmed_qty <= 0:
-        field_failures.append(f"confirmed_quantity {confirmed_qty!r} is missing or non-positive")
+        field_failures.append(f"confirmed_qty {confirmed_qty!r} is missing or non-positive")
     else:
         qty_tolerance = max(1e-9, abs(expected_qty) * 1e-6)
         if abs(float(confirmed_qty) - float(expected_qty)) > qty_tolerance:
             field_failures.append(
-                f"confirmed_quantity {confirmed_qty!r} != requested {expected_qty!r}"
+                f"confirmed_qty {confirmed_qty!r} != requested {expected_qty!r}"
             )
     for field_name, expected_value in expected_price_fields.items():
         actual = result.get(field_name)
