@@ -24,6 +24,32 @@ from renquant_execution.coverage_report import (
     verify_coverage_report,
 )
 
+_MOCK_EXEC_VERSION = "0.1.0"
+_MOCK_EXEC_COMMIT = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _mock_execution_identity(monkeypatch):
+    """Stub execution identity functions so integration tests do not
+    depend on pip-installed package metadata or git availability.
+
+    Both modules must be patched: ``coverage_report`` (where the builder
+    calls them internally) AND ``alpaca_broker`` (which imports and calls
+    ``default_execution_version`` at the call-site level for
+    ``source_version``).
+    """
+    import renquant_execution.coverage_report as cr
+    import renquant_execution.alpaca_broker as ab
+
+    monkeypatch.setattr(cr, "default_execution_version", lambda: _MOCK_EXEC_VERSION)
+    monkeypatch.setattr(
+        cr, "default_execution_source_commit", lambda: _MOCK_EXEC_COMMIT
+    )
+    monkeypatch.setattr(ab, "default_execution_version", lambda: _MOCK_EXEC_VERSION)
+    monkeypatch.setattr(
+        ab, "default_execution_source_commit", lambda: _MOCK_EXEC_COMMIT
+    )
+
 BTC = "BTC/USD"
 ETH = "ETH/USD"
 
@@ -421,6 +447,8 @@ def test_caller_cannot_authorize_zero_violations_when_broker_state_is_uncovered(
         order_ids=(),
         source_version=report.source_version,
         execution_version=report.execution_version,
+        execution_source_commit=report.execution_source_commit,
+        report_schema_version=report.report_schema_version,
         position_snapshot_hash=compute_snapshot_hash({BTC: 0.5}),
         order_snapshot_hash=compute_snapshot_hash({}),
         integrity_hash="0" * 64,  # caller has no way to derive the real hash

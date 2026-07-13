@@ -137,6 +137,7 @@ from .coverage_report import (
     COVERAGE_REPORT_SCHEMA_VERSION,
     CoverageReport,
     compute_snapshot_hash,
+    default_execution_source_commit,
     default_execution_version,
     verify_coverage_report,
 )
@@ -241,6 +242,7 @@ __all__ = [
     "compute_parent_intent_id",
     "compute_snapshot_hash",
     "crypto_no_short_violation",
+    "default_execution_source_commit",
     "default_execution_version",
     "evaluate_entry_headroom",
     "is_crypto_pair",

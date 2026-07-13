@@ -47,8 +47,10 @@ from renquant_execution.coverage_report import (
     COVERAGE_REPORT_SCHEMA_VERSION,
     CoverageReport,
     _build_coverage_report,
+    _compute_hash,
     CoverageObservation,
     compute_snapshot_hash,
+    default_execution_source_commit,
     default_execution_version,
     verify_coverage_report,
 )
@@ -61,6 +63,28 @@ _NOW = datetime(2026, 7, 12, 14, 0, 0, tzinfo=timezone.utc)
 _VALID_UUID = "12345678-1234-5678-1234-567812345678"
 _HASH_A = compute_snapshot_hash("position-data")
 _HASH_B = compute_snapshot_hash("order-data")
+_MOCK_EXEC_VERSION = "0.1.0"
+_MOCK_EXEC_COMMIT = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _mock_execution_identity(monkeypatch):
+    """Stub execution identity functions so builder-path tests do not
+    depend on pip-installed package metadata (``default_execution_version``
+    raises ``ValueError`` when the package is not installed) or git
+    availability (``default_execution_source_commit``).
+
+    Tests that exercise the REAL functions (e.g. ``TestDefaultExecutionVersion``,
+    ``TestDefaultExecutionSourceCommit``) override this fixture or call the
+    imported function directly (the ``from ... import`` binding is NOT
+    affected by ``monkeypatch.setattr`` on the module attribute).
+    """
+    import renquant_execution.coverage_report as cr
+
+    monkeypatch.setattr(cr, "default_execution_version", lambda: _MOCK_EXEC_VERSION)
+    monkeypatch.setattr(
+        cr, "default_execution_source_commit", lambda: _MOCK_EXEC_COMMIT
+    )
 
 
 def _sample_observation(**overrides) -> CoverageObservation:
@@ -101,6 +125,8 @@ def _direct_report(**overrides) -> CoverageReport:
         order_ids=(),
         source_version="1.0",
         execution_version="0.1.0",
+        execution_source_commit=_MOCK_EXEC_COMMIT,
+        report_schema_version=1,
         position_snapshot_hash=_HASH_A,
         order_snapshot_hash=_HASH_B,
         integrity_hash="a" * 64,
@@ -245,6 +271,8 @@ class TestTamperDetection:
             ("violations", 42),
             ("source_version", "0.0.0"),
             ("execution_version", "9.9.9"),
+            ("execution_source_commit", "b" * 40),
+            ("report_schema_version", 99),
             ("report_id", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
             ("position_snapshot_hash", "f" * 64),
             ("order_snapshot_hash", "f" * 64),
@@ -402,6 +430,38 @@ class TestReportValidation:
     def test_empty_execution_version_rejected(self):
         with pytest.raises(ValueError, match="execution_version"):
             _direct_report(execution_version="")
+
+    # -- execution_source_commit ----------------------------------------------
+
+    def test_empty_execution_source_commit_rejected(self):
+        with pytest.raises(ValueError, match="execution_source_commit"):
+            _direct_report(execution_source_commit="")
+
+    def test_non_hex_execution_source_commit_rejected(self):
+        with pytest.raises(ValueError, match="execution_source_commit"):
+            _direct_report(execution_source_commit="not-a-sha")
+
+    def test_wrong_length_execution_source_commit_rejected(self):
+        with pytest.raises(ValueError, match="execution_source_commit"):
+            _direct_report(execution_source_commit="a" * 64)  # 64 != 40
+
+    def test_valid_execution_source_commit_accepted(self):
+        r = _direct_report(execution_source_commit="abcdef0123456789" * 2 + "abcdef01")
+        assert len(r.execution_source_commit) == 40
+
+    # -- report_schema_version ------------------------------------------------
+
+    def test_zero_report_schema_version_rejected(self):
+        with pytest.raises(ValueError, match="report_schema_version"):
+            _direct_report(report_schema_version=0)
+
+    def test_negative_report_schema_version_rejected(self):
+        with pytest.raises(ValueError, match="report_schema_version"):
+            _direct_report(report_schema_version=-1)
+
+    def test_valid_report_schema_version_accepted(self):
+        r = _direct_report(report_schema_version=1)
+        assert r.report_schema_version == 1
 
     # -- order_ids validation ------------------------------------------------
 
@@ -562,11 +622,43 @@ class TestComputeSnapshotHash:
 
 
 class TestDefaultExecutionVersion:
-    def test_returns_a_format_compatible_string(self):
+    def test_returns_installed_version(self, monkeypatch):
+        """When the package is installed, returns its version string."""
+        import importlib.metadata
+
+        monkeypatch.setattr(importlib.metadata, "version", lambda name: "0.1.0")
         v = default_execution_version()
-        # Must pass CoverageReport's source_version regex validation.
-        r = _direct_report(source_version=v)
-        assert r.source_version == v
+        assert v == "0.1.0"
+
+    def test_raises_when_not_installed(self, monkeypatch):
+        """When package metadata is unavailable, raises ValueError instead
+        of silently accepting 0.0.0+unknown."""
+        import importlib.metadata
+
+        def _raise(name):
+            raise importlib.metadata.PackageNotFoundError(name)
+
+        monkeypatch.setattr(importlib.metadata, "version", _raise)
+        with pytest.raises(ValueError, match="[Cc]annot determine"):
+            default_execution_version()
+
+
+class TestDefaultExecutionSourceCommit:
+    def test_returns_40_char_hex(self):
+        """In a git repo, returns a valid 40-char lowercase hex SHA."""
+        sha = default_execution_source_commit()
+        assert len(sha) == 40
+        assert all(c in "0123456789abcdef" for c in sha)
+
+    def test_raises_outside_git_repo(self, monkeypatch, tmp_path):
+        """Outside a git repo, raises ValueError."""
+        import renquant_execution.coverage_report as cr
+
+        monkeypatch.setattr(
+            cr.os.path, "abspath", lambda _: str(tmp_path / "nonexistent.py")
+        )
+        with pytest.raises(ValueError, match="[Cc]annot determine"):
+            default_execution_source_commit()
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +695,12 @@ class TestCanonicalSerialization:
         d = r.to_dict()
         assert isinstance(d["timestamp_utc"], str)
         assert isinstance(d["observation_timestamp_utc"], str)
+
+    def test_to_dict_includes_new_fields(self):
+        r = _sample_report()
+        d = r.to_dict()
+        assert d["execution_source_commit"] == _MOCK_EXEC_COMMIT
+        assert d["report_schema_version"] == 1
 
     def test_from_dict_rejects_schema_version_mismatch(self):
         r = _sample_report()
@@ -788,7 +886,17 @@ class TestFakeBrokerIntegration:
         automatically -- never supplied by a caller."""
         report = _sample_report()
         assert report.execution_version
-        assert report.execution_version == default_execution_version()
+        assert report.execution_version == _MOCK_EXEC_VERSION
+
+    def test_report_carries_execution_source_commit(self):
+        """The report includes the git commit SHA of the execution package."""
+        report = _sample_report()
+        assert report.execution_source_commit == _MOCK_EXEC_COMMIT
+
+    def test_report_carries_report_schema_version(self):
+        """The report schema version is always 1 (current)."""
+        report = _sample_report()
+        assert report.report_schema_version == 1
 
     def test_report_snapshot_hashes_bind_to_observation(self):
         """The report's snapshot hashes match the observation's hashes,
@@ -868,8 +976,45 @@ class TestNoPublicAuthorizationPath:
             order_ids=(),
             source_version="1.0",
             execution_version="0.1.0",
+            execution_source_commit=_MOCK_EXEC_COMMIT,
+            report_schema_version=1,
             position_snapshot_hash=fake_hash,
             order_snapshot_hash=fake_hash,
             integrity_hash=fake_hash,
         )
         assert not verify_coverage_report(hand_built)
+
+    def test_forged_self_consistent_report_passes_verify(self):
+        """Demonstrates that hash-only verification cannot distinguish
+        execution-observed from caller-forged reports. Cryptographic
+        attestation required for entry authorization."""
+        # Step 1: hand-construct a CoverageReport with violations=0,
+        # using a placeholder integrity_hash.
+        placeholder_hash = "0" * 64
+        forged_fields = dict(
+            report_id=str(uuid.uuid4()),
+            timestamp_utc=_NOW,
+            observation_timestamp_utc=_NOW,
+            account_id="FORGED",
+            environment="live",
+            positions_covered=10,
+            positions_total=10,
+            violations=0,
+            order_ids=(),
+            source_version="1.0.0",
+            execution_version="0.1.0",
+            execution_source_commit=_MOCK_EXEC_COMMIT,
+            report_schema_version=1,
+            position_snapshot_hash="a" * 64,
+            order_snapshot_hash="b" * 64,
+        )
+        tmp = CoverageReport(**forged_fields, integrity_hash=placeholder_hash)
+
+        # Step 2: recompute the hash using the internal _compute_hash logic.
+        correct_hash = _compute_hash(tmp)
+
+        # Step 3: construct the forged report with the correctly computed hash.
+        forged = CoverageReport(**forged_fields, integrity_hash=correct_hash)
+
+        # Step 4: the forged report PASSES verify -- this is the gap.
+        assert verify_coverage_report(forged)

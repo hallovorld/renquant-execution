@@ -31,6 +31,7 @@ from .coverage_report import (
     CoverageReport,
     _build_coverage_report,
     compute_snapshot_hash,
+    default_execution_source_commit,
     default_execution_version,
 )
 from .crypto import (

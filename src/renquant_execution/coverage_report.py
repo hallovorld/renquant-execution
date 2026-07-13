@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
 import uuid
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta, timezone
@@ -45,22 +47,19 @@ __all__ = [
     "CoverageReport",
     "COVERAGE_REPORT_SCHEMA_VERSION",
     "compute_snapshot_hash",
+    "default_execution_source_commit",
     "default_execution_version",
     "verify_coverage_report",
 ]
 
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _VALID_ENVIRONMENTS = frozenset({"live", "paper"})
 _SOURCE_VERSION_RE = re.compile(
     r"^[0-9]+(\.[0-9]+){1,3}(\+[0-9A-Za-z.\-]+)?$"
 )
 
-COVERAGE_REPORT_SCHEMA_VERSION = 2
-
-# Sentinel returned by :func:`default_execution_version` when package
-# metadata isn't available (e.g. a pythonpath-based dev/test tree with no
-# ``pip install`` step).
-_FALLBACK_EXECUTION_VERSION = "0.0.0+unknown"
+COVERAGE_REPORT_SCHEMA_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -81,20 +80,56 @@ def compute_snapshot_hash(obj: Any) -> str:
 
 
 def default_execution_version() -> str:
-    """Best-effort ``renquant-execution`` package version.
+    """Installed ``renquant-execution`` package version.
 
-    Derived from installed package metadata.  Falls back to
-    :data:`_FALLBACK_EXECUTION_VERSION` when metadata isn't available
-    (e.g. a pythonpath-based dev/test tree with no ``pip install`` step).
+    Derived from installed package metadata.  Raises :class:`ValueError`
+    when the version cannot be determined (e.g. a pythonpath-based dev/test
+    tree with no ``pip install`` step) -- an unknown execution version must
+    never silently enter a coverage report that could authorize an entry.
     """
     try:
         from importlib.metadata import PackageNotFoundError, version
     except ImportError:  # pragma: no cover - py>=3.8 always has this
-        return _FALLBACK_EXECUTION_VERSION
+        raise ValueError(
+            "Cannot determine execution version: "
+            "importlib.metadata is unavailable"
+        )
     try:
         return version("renquant-execution")
     except PackageNotFoundError:
-        return _FALLBACK_EXECUTION_VERSION
+        raise ValueError(
+            "Cannot determine execution version: "
+            "renquant-execution package is not installed "
+            "(pip install required; PYTHONPATH-only trees are rejected)"
+        )
+
+
+def default_execution_source_commit() -> str:
+    """Git commit SHA of the ``renquant-execution`` source tree.
+
+    Runs ``git rev-parse HEAD`` in the package directory.  Raises
+    :class:`ValueError` if git is unavailable, the directory is not a
+    git repository, or the output is not a valid 40-character hex SHA.
+    """
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=pkg_dir,
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            if _HEX40_RE.match(sha):
+                return sha
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    raise ValueError(
+        "Cannot determine execution source commit -- "
+        "git rev-parse HEAD failed or returned an invalid SHA"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +269,8 @@ class CoverageReport:
     order_ids: tuple[str, ...]
     source_version: str
     execution_version: str
+    execution_source_commit: str
+    report_schema_version: int
     position_snapshot_hash: str
     order_snapshot_hash: str
     integrity_hash: str
@@ -246,6 +283,7 @@ class CoverageReport:
             "source_version",
             "integrity_hash",
             "execution_version",
+            "execution_source_commit",
             "position_snapshot_hash",
             "order_snapshot_hash",
         ):
@@ -267,6 +305,21 @@ class CoverageReport:
             raise ValueError(
                 "source_version must look like a version string (e.g. "
                 f"'1.2.3' or '1.2.3+abcdef'), got {self.source_version!r}"
+            )
+
+        # --- execution_source_commit: valid git SHA-1 hex -------------------
+        if not _HEX40_RE.match(self.execution_source_commit):
+            raise ValueError(
+                "execution_source_commit must be a 40-character lowercase "
+                f"hex string (git SHA-1), got {self.execution_source_commit!r}"
+            )
+
+        # --- report_schema_version ------------------------------------------
+        if not isinstance(self.report_schema_version, int) or \
+                self.report_schema_version < 1:
+            raise ValueError(
+                "report_schema_version must be a positive integer, "
+                f"got {self.report_schema_version!r}"
             )
 
         # --- timestamps must be timezone-aware UTC ---------------------------
@@ -423,12 +476,14 @@ def _build_coverage_report(
 
     ``violations`` is computed as ``positions_total - positions_covered``
     — there is no parameter to override it. ``report_id`` (UUID),
-    ``timestamp_utc``, and ``execution_version`` are auto-generated.
+    ``timestamp_utc``, ``execution_version``, ``execution_source_commit``,
+    and ``report_schema_version`` are auto-generated.
     """
     report_id = str(uuid.uuid4())
     now_utc = datetime.now(timezone.utc)
     violations = observation.positions_total - observation.positions_covered
     execution_version = default_execution_version()
+    execution_source_commit = default_execution_source_commit()
 
     placeholder_hash = "0" * 64
     shared = dict(
@@ -443,6 +498,8 @@ def _build_coverage_report(
         order_ids=observation.qualifying_order_ids,
         source_version=source_version,
         execution_version=execution_version,
+        execution_source_commit=execution_source_commit,
+        report_schema_version=1,
         position_snapshot_hash=observation.position_snapshot_hash,
         order_snapshot_hash=observation.order_snapshot_hash,
     )
