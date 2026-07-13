@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +37,25 @@ from .crypto import (
     snap_qty_to_increment,
     validate_crypto_order,
 )
+
+
+@dataclass(frozen=True)
+class CryptoQuoteSnapshot:
+    """A latest-quote lookup result with provenance and freshness evidence.
+
+    Added (2026-07-12, Codex round-2 review finding 4 on execution#34):
+    replaces a bare ``float`` reference price -- a probe deriving canary
+    order prices from market data must be able to reason about whether that
+    data is fresh and which symbol it actually came from, not just trust an
+    unadorned number.
+    """
+
+    symbol: str
+    bid_price: float
+    ask_price: float
+    mid_price: float
+    timestamp: datetime
+    age_seconds: float
 
 
 class _FractionableLookupError(RuntimeError):
@@ -888,6 +908,35 @@ class AlpacaBroker(BaseBroker):
                 return False
             time.sleep(poll_interval_seconds)
 
+    def wait_for_order_terminal_cancel(
+        self,
+        order_id: str,
+        *,
+        timeout_seconds: float = 5.0,
+        poll_interval_seconds: float = 0.25,
+    ) -> bool:
+        """Public wrapper for :meth:`_wait_for_order_terminal_cancel`.
+
+        Added (2026-07-12) so same-package callers outside this class do not
+        need to reach into the underscore-prefixed method directly. Shares
+        the exact same "confirm, don't assume" polling discipline Codex
+        required on PR #31 between two call sites: :meth:`replace_crypto_stop_limit`
+        (the protective-stop cancel-then-replace path, unchanged -- it still
+        calls the private method directly, this wrapper does not alter that
+        logic) and the crypto Stage-0 battery's transactional probes
+        (``crypto_stage0_checks.check_gtc_order_acceptance`` /
+        ``check_stop_limit_acceptance``) -- both of which request cancellation
+        of a canary order and must confirm a genuinely CONFIRMED terminal
+        ``canceled`` state before reporting PASS, not merely that
+        ``cancel_order`` didn't raise. See :meth:`_wait_for_order_terminal_cancel`
+        for the full poll-loop docstring/rationale and default timeout choice.
+        """
+        return self._wait_for_order_terminal_cancel(
+            order_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+
     def replace_crypto_stop_limit(
         self,
         old_order_id: str,
@@ -1204,9 +1253,306 @@ class AlpacaBroker(BaseBroker):
                 })
         return violations
 
+    # ── thin wrappers for crypto Stage-0 battery (2026-07-12) ──────────────
+
+    def get_account_info(self) -> dict[str, Any]:
+        """Account metadata: status, crypto_status, buying power, paper flag.
+
+        Thin wrapper over ``get_account()`` that surfaces the fields the
+        Stage-0 crypto battery needs to verify the account is crypto-enabled
+        on the correct environment -- without the battery importing alpaca-py
+        or reaching into private broker state.
+        """
+        account = self._refresh_account()
+        return {
+            "account_id": str(getattr(account, "account_number", "") or ""),
+            "status": str(getattr(account, "status", "") or "").upper(),
+            "crypto_status": str(getattr(account, "crypto_status", "") or "").upper(),
+            "buying_power": float(getattr(account, "buying_power", 0.0) or 0.0),
+            "non_marginable_buying_power": float(
+                getattr(account, "non_marginable_buying_power", 0.0) or 0.0
+            ),
+            "cash": float(getattr(account, "cash", 0.0) or 0.0),
+            "portfolio_value": float(getattr(account, "portfolio_value", 0.0) or 0.0),
+            "paper": self.paper,
+        }
+
+    def get_crypto_asset_spec(self, symbol: str) -> CryptoAssetSpec:
+        """Public wrapper for the per-pair crypto order-grid spec lookup.
+
+        Returns the ``CryptoAssetSpec`` for ``symbol`` -- either from the
+        pinned snapshot or a live ``get_asset`` lookup (fail-closed, cached
+        only on confirmed success). Raises ``RuntimeError`` on lookup
+        failure so the caller can distinguish "pair not found" from "pair
+        found with spec X".
+        """
+        try:
+            return self._resolve_crypto_spec(symbol)
+        except _CryptoSpecLookupError as exc:
+            raise RuntimeError(
+                f"crypto order-grid spec lookup for {symbol!r} failed: {exc}"
+            ) from exc
+
+    def place_crypto_limit_order(
+        self,
+        symbol: str,
+        action: str,
+        qty: float,
+        limit_price: float,
+        *,
+        time_in_force: str = "gtc",
+    ) -> dict[str, Any]:
+        """Place a crypto GTC/IOC limit order (BUY or SELL).
+
+        Thin wrapper for the SDK ``LimitOrderRequest`` -- the crypto limit
+        order type that the production market-order and stop-limit paths do
+        not cover. Primary consumer: the Stage-0 battery's GTC order
+        acceptance test (place a limit BUY far below market, verify accepted,
+        cancel immediately). Same crypto-only / paper-mode / TIF / spec
+        preflight as the other crypto order methods.
+        """
+        from alpaca.trading.enums import OrderSide
+        from alpaca.trading.requests import LimitOrderRequest
+
+        self._assert_account_active()
+        action_u = action.upper()
+        if action_u not in {"BUY", "SELL"}:
+            raise ValueError(f"unsupported action: {action!r}")
+        if not is_crypto_pair(symbol):
+            raise ValueError(
+                f"place_crypto_limit_order is crypto-only; got {symbol!r}"
+            )
+        tif = str(time_in_force or "gtc").strip().lower()
+        violation = validate_crypto_order(
+            order_type="limit", time_in_force=tif, qty=float(qty),
+        )
+        if violation is not None:
+            _, why = violation
+            raise ValueError(
+                f"crypto limit order for {symbol} rejected at preflight: {why}"
+            )
+        spec = self._resolve_crypto_spec(symbol)
+        submit_qty = snap_qty_to_increment(float(qty), spec.min_trade_increment)
+        submit_price = round_price_to_increment(float(limit_price), spec.price_increment)
+        request = LimitOrderRequest(
+            symbol=symbol,
+            qty=submit_qty,
+            side=OrderSide.BUY if action_u == "BUY" else OrderSide.SELL,
+            time_in_force=self._crypto_tif_enum(tif),
+            limit_price=submit_price,
+        )
+        order = self._require_client().submit_order(order_data=request)
+        result = _order_to_dict(order)
+        result.update({
+            "action": action_u,
+            "order_type": "limit",
+            "quantity": float(submit_qty),
+            "requested_quantity": float(qty),
+            "limit_price": float(submit_price),
+            "asset_class": ASSET_CLASS_CRYPTO,
+            "time_in_force": tif,
+            "skipped": False,
+        })
+        return result
+
+    def get_crypto_reference_quote(
+        self, symbol: str, *, max_staleness_seconds: float = 60.0
+    ) -> "CryptoQuoteSnapshot":
+        """Latest bid/ask quote for a crypto pair, with provenance and a
+        freshness check, via the market-data ``CryptoHistoricalDataClient``
+        -- NOT the trading client.
+
+        Added (2026-07-12, Codex review finding 3 on execution#34) so the
+        Stage-0 battery's transactional probes can derive canary prices from
+        the pair's REAL current price instead of universal magic constants
+        ($0.01 buy-limit / $999,999,999 stop) that say nothing about
+        whether a given pair's actual price band/tick grid would even
+        accept an order at all -- a rejection at an implausible fixed price
+        proves nothing about genuine GTC/stop-limit support.
+
+        Strengthened (2026-07-12, Codex round-2 review finding 4): the
+        original version returned a bare ``float`` with no quote timestamp,
+        source, or symbol identity, so a probe could silently derive prices
+        from a stale or mismatched quote. Returns a typed
+        :class:`CryptoQuoteSnapshot` and raises if the quote's own
+        ``timestamp`` is missing or older than ``max_staleness_seconds`` --
+        deliberately scoped: this is a single latest-quote lookup with a
+        staleness gate, not a versioned price-band/quote-schema system.
+        """
+        from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+        from alpaca.data.requests import CryptoLatestQuoteRequest
+
+        client = CryptoHistoricalDataClient(self.api_key, self.secret_key)
+        request = CryptoLatestQuoteRequest(symbol_or_symbols=symbol)
+        try:
+            quotes = client.get_crypto_latest_quote(request)
+            quote = quotes[symbol] if hasattr(quotes, "__getitem__") else quotes
+        except Exception as exc:
+            raise RuntimeError(
+                f"crypto latest-quote lookup for {symbol!r} failed: {exc}"
+            ) from exc
+        quote_symbol = str(getattr(quote, "symbol", "") or symbol)
+        raw_timestamp = getattr(quote, "timestamp", None)
+        if raw_timestamp is None:
+            raise RuntimeError(
+                f"crypto latest-quote for {symbol!r} has no timestamp -- "
+                "cannot verify freshness before deriving a canary price"
+            )
+        timestamp = raw_timestamp if raw_timestamp.tzinfo else raw_timestamp.replace(
+            tzinfo=timezone.utc
+        )
+        age_seconds = (
+            datetime.now(timezone.utc) - timestamp
+        ).total_seconds()
+        if age_seconds > max_staleness_seconds:
+            raise RuntimeError(
+                f"crypto latest-quote for {symbol!r} is stale: "
+                f"{age_seconds:.1f}s old (max {max_staleness_seconds}s) -- "
+                f"quote timestamp={timestamp.isoformat()}"
+            )
+        if age_seconds < -5.0:
+            raise RuntimeError(
+                f"crypto latest-quote for {symbol!r} has an implausible "
+                f"future timestamp {timestamp.isoformat()} "
+                f"({-age_seconds:.1f}s ahead of now)"
+            )
+        bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
+        ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
+        if bid > 0.0 and ask > 0.0:
+            mid = (bid + ask) / 2.0
+        elif ask > 0.0:
+            mid = ask
+        elif bid > 0.0:
+            mid = bid
+        else:
+            raise RuntimeError(f"no usable bid/ask quote for {symbol!r}")
+        return CryptoQuoteSnapshot(
+            symbol=quote_symbol,
+            bid_price=bid,
+            ask_price=ask,
+            mid_price=mid,
+            timestamp=timestamp,
+            age_seconds=age_seconds,
+        )
+
+    def get_crypto_reference_price(
+        self, symbol: str, *, max_staleness_seconds: float = 60.0
+    ) -> float:
+        """Convenience wrapper: mid/bid/ask price only, no quote provenance.
+
+        Prefer :meth:`get_crypto_reference_quote` for anything that needs to
+        reason about quote freshness or identity -- this exists only for
+        callers that genuinely just want a number.
+        """
+        return self.get_crypto_reference_quote(
+            symbol, max_staleness_seconds=max_staleness_seconds
+        ).mid_price
+
+    def place_crypto_stop_limit_order(
+        self,
+        symbol: str,
+        action: str,
+        qty: float,
+        stop_price: float,
+        limit_price: float,
+        *,
+        time_in_force: str = "gtc",
+    ) -> dict[str, Any]:
+        """Place a crypto GTC/IOC stop-limit order (BUY or SELL).
+
+        General-purpose stop-limit wrapper that handles both sides -- unlike
+        the protective-SELL-only :meth:`place_crypto_stop_limit` which
+        carries E11 no-short / held-qty / Tier-1 safety gates. Primary
+        consumer: the Stage-0 battery's stop-limit acceptance test (place a
+        BUY stop-limit at unreachable prices, verify accepted, cancel
+        immediately).
+
+        Price validation: BUY stop-limit requires ``limit_price >= stop_price``
+        (the limit caps how HIGH you pay after the stop triggers). SELL
+        stop-limit requires ``limit_price <= stop_price`` (same as the
+        protective path).
+        """
+        from alpaca.trading.enums import OrderSide
+        from alpaca.trading.requests import StopLimitOrderRequest
+
+        self._assert_account_active()
+        action_u = action.upper()
+        if action_u not in {"BUY", "SELL"}:
+            raise ValueError(f"unsupported action: {action!r}")
+        if not is_crypto_pair(symbol):
+            raise ValueError(
+                f"place_crypto_stop_limit_order is crypto-only; got {symbol!r}"
+            )
+        tif = str(time_in_force or "gtc").strip().lower()
+        violation = validate_crypto_order(
+            order_type="stop_limit", time_in_force=tif, qty=float(qty),
+        )
+        if violation is not None:
+            _, why = violation
+            raise ValueError(
+                f"crypto stop-limit order for {symbol} rejected at preflight: {why}"
+            )
+        stop_f = float(stop_price)
+        limit_f = float(limit_price)
+        if not (stop_f > 0.0 and limit_f > 0.0):
+            raise ValueError(
+                f"stop/limit prices must be positive: stop={stop_price!r}, "
+                f"limit={limit_price!r}"
+            )
+        if action_u == "BUY" and limit_f < stop_f:
+            raise ValueError(
+                f"BUY stop-limit requires limit >= stop (the limit caps how "
+                f"high you pay); got stop={stop_f}, limit={limit_f}"
+            )
+        if action_u == "SELL" and limit_f > stop_f:
+            raise ValueError(
+                f"SELL stop-limit requires limit <= stop; "
+                f"got stop={stop_f}, limit={limit_f}"
+            )
+        spec = self._resolve_crypto_spec(symbol)
+        submit_qty = snap_qty_to_increment(float(qty), spec.min_trade_increment)
+        submit_stop = round_price_to_increment(stop_f, spec.price_increment)
+        submit_limit = round_price_to_increment(limit_f, spec.price_increment)
+        request = StopLimitOrderRequest(
+            symbol=symbol,
+            qty=submit_qty,
+            side=OrderSide.BUY if action_u == "BUY" else OrderSide.SELL,
+            time_in_force=self._crypto_tif_enum(tif),
+            stop_price=submit_stop,
+            limit_price=submit_limit,
+        )
+        order = self._require_client().submit_order(order_data=request)
+        result = _order_to_dict(order)
+        result.update({
+            "action": action_u,
+            "order_type": "stop_limit",
+            "quantity": float(submit_qty),
+            "requested_quantity": float(qty),
+            "stop_price": float(submit_stop),
+            "limit_price": float(submit_limit),
+            "asset_class": ASSET_CLASS_CRYPTO,
+            "time_in_force": tif,
+            "skipped": False,
+        })
+        return result
+
     def cancel_order(self, order_id: str) -> bool:
         self._require_client().cancel_order_by_id(order_id)
         return True
+
+    def get_order_state(self, order_id: str) -> dict[str, Any]:
+        """Query the current state of an order by ID.
+
+        Thin wrapper for the SDK's ``get_order_by_id`` that surfaces order
+        status, filled_qty, and related fields without the battery module
+        importing alpaca-py directly.  Primary consumer: the Stage-0
+        battery's residual-exposure audit after probe-order cancellation
+        (a confirmed cancel does not undo a fill that happened before the
+        cancel took effect).
+        """
+        client = self._require_client()
+        order = client.get_order_by_id(order_id)
+        return _order_to_dict(order)
 
     def is_market_open(self, symbol: str | None = None) -> bool:
         """Whether the market for ``symbol`` is open.
@@ -1269,6 +1615,27 @@ def _order_to_dict(order: Any) -> dict[str, Any]:
         "created_at": str(getattr(order, "created_at", "")),
         "submitted_at": str(getattr(order, "submitted_at", "")),
         "filled_at": str(getattr(order, "filled_at", "")),
+        # Broker-confirmed fields: extracted from the SDK Order object's
+        # own attributes, NOT from the request or wrapper .update()
+        # overrides.  Validators must check these — not the wrapper-set
+        # request-echo fields like "time_in_force" or "asset_class" — to
+        # detect broker disagreement with the submitted request.
+        "confirmed_time_in_force": _enum_value(
+            getattr(order, "time_in_force", "")
+        ),
+        "confirmed_order_type": _enum_value(
+            getattr(order, "order_type", "")
+        ),
+        "confirmed_asset_class": _enum_value(
+            getattr(order, "asset_class", "")
+        ),
+        "confirmed_qty": quantity,
+        "confirmed_limit_price": float(
+            getattr(order, "limit_price", 0.0) or 0.0
+        ),
+        "confirmed_stop_price": float(
+            getattr(order, "stop_price", 0.0) or 0.0
+        ),
     }
 
 
