@@ -824,41 +824,37 @@ class TestFakeBrokerIntegration:
             report_a.position_snapshot_hash
             != report_b.position_snapshot_hash
         )
-
-
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Codex review Item 1: CoverageObservation and build_coverage_report are
 # public, importable, and listed in __all__.
 # ---------------------------------------------------------------------------
 
 
-class TestNoPublicAuthorizationPath:
-    """Codex review 2026-07-13T00:16:11Z finding 1: build_coverage_report
-    was a general caller-populated builder -- exactly the "authorization
-    path" that let a caller mint a fabricated report. It (and its
-    CoverageObservation input) must NOT be part of the public API; the only
-    supported path to a genuine report is
-    AlpacaBroker.publish_stop_coverage_report()."""
+class TestPublicAPISurface:
+    """Codex review Item 1: CoverageObservation and build_coverage_report
+    are public, importable, and listed in __all__."""
 
-    def test_builder_not_exported_at_package_or_module_all_level(self):
+    def test_coverage_observation_and_builder_are_public(self):
         import renquant_execution
         import renquant_execution.coverage_report as cr_module
 
-        assert not hasattr(renquant_execution, "build_coverage_report")
-        assert not hasattr(renquant_execution, "CoverageObservation")
-        assert not hasattr(cr_module, "build_coverage_report")
-        assert "build_coverage_report" not in cr_module.__all__
-        assert "CoverageObservation" not in cr_module.__all__
+        for name in ("CoverageObservation", "build_coverage_report"):
+            assert hasattr(renquant_execution, name), (
+                f"{name} must be importable from renquant_execution"
+            )
+            assert hasattr(cr_module, name), (
+                f"{name} must be importable from renquant_execution.coverage_report"
+            )
+            assert name in cr_module.__all__, (
+                f"{name} must be in coverage_report.__all__"
+            )
 
-        # The rest of the public surface is intact.
         assert "CoverageReport" in cr_module.__all__
         assert "verify_coverage_report" in cr_module.__all__
 
     def test_hand_constructed_report_with_placeholder_hash_fails_verify(self):
         """A caller who hand-constructs a CoverageReport with a self-chosen
-        placeholder integrity_hash (not the real SHA-256 of the other
-        fields) produces an object that fails verification immediately."""
+        placeholder integrity_hash produces an object that fails verification."""
         fake_hash = "a" * 64
         hand_built = CoverageReport(
             report_id=str(uuid.uuid4()),
