@@ -134,8 +134,10 @@ from .order_state_machine import (
 from .paper_broker import PaperBroker
 from .paper_broker_port import PaperBrokerPort
 from .coverage_report import (
+    COVERAGE_REPORT_SCHEMA_VERSION,
     CoverageReport,
-    build_coverage_report,
+    compute_snapshot_hash,
+    default_execution_version,
     verify_coverage_report,
 )
 from .readonly_broker import (
@@ -162,6 +164,7 @@ __all__ = [
     "BrokerPortContractError",
     "BrokerRegimeSnapshot",
     "CashLedgerPort",
+    "COVERAGE_REPORT_SCHEMA_VERSION",
     "CoverageReport",
     "CostContractUnavailableError",
     "DEFAULT_RESERVATION_TTL_SECONDS",
@@ -223,7 +226,6 @@ __all__ = [
     "account_cash_ledger_db_path",
     "account_cash_ledger_enabled",
     "assert_crypto_no_short",
-    "build_coverage_report",
     "broker_submitter",
     "build_shared_account_cash_ledger_for_broker",
     "build_live_persistence_alert_event",
@@ -237,7 +239,9 @@ __all__ = [
     "classify_terminal_status",
     "commit_live_persistence",
     "compute_parent_intent_id",
+    "compute_snapshot_hash",
     "crypto_no_short_violation",
+    "default_execution_version",
     "evaluate_entry_headroom",
     "is_crypto_pair",
     "round_price_to_increment",
