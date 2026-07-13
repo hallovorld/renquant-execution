@@ -25,6 +25,7 @@ from renquant_execution.crypto_stage0_checks import (
     StepStatus,
     _check_gtc_order_acceptance,
     _check_stop_limit_acceptance,
+    _place_probe_and_confirm_cleanup,
     check_buying_power_behavior,
     check_crypto_account_status,
     check_data_parity,
@@ -601,6 +602,139 @@ def test_gtc_acceptance_fails_when_reference_price_lookup_fails() -> None:
     assert "reference quote lookup failed" in result.detail
     # Never even attempted to place an order without a reference price.
     assert client.submitted == []
+
+
+# ── _place_probe_and_confirm_cleanup pending->resting polling ──────────────
+#
+# Alpaca crypto orders often start as pending_new and transition to
+# new/accepted within ~1s -- _place_probe_and_confirm_cleanup polls briefly
+# before rejecting rather than rejecting on the initial pending_new snapshot.
+# These tests drive that poll loop directly with a minimal broker double
+# exposing only get_order_state/cancel_order/wait_for_order_terminal_cancel/
+# get_position, rather than going through _FakeTradingClient's
+# order_status_sequence (which is shared across three different poll sites
+# -- acceptance, cancel-confirm, residual-exposure -- and isn't suited to
+# pinning down just the acceptance poll in isolation).
+
+
+def _pending_place_result(**overrides: Any) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "order_id": "ord-1",
+        "status": "pending_new",
+        "confirmed_order_type": "limit",
+        "confirmed_asset_class": "crypto",
+        "side": "buy",
+        "confirmed_time_in_force": "gtc",
+        "quantity": 0.0001,
+        "confirmed_qty": 0.0001,
+        "confirmed_limit_price": 30_000.0,
+    }
+    result.update(overrides)
+    return result
+
+
+class _FakePollingBroker:
+    """Minimal broker double exposing only the methods
+    ``_place_probe_and_confirm_cleanup`` calls after ``place_fn`` returns."""
+
+    def __init__(
+        self,
+        order_state_sequence: list[dict[str, Any]] | None = None,
+        *,
+        raise_on_poll: bool = False,
+        cancel_confirmed: bool = True,
+        position_qty: float = 0.0,
+    ) -> None:
+        self._sequence = list(order_state_sequence or [])
+        self._raise_on_poll = raise_on_poll
+        self._cancel_confirmed = cancel_confirmed
+        self._position_qty = position_qty
+        self.get_order_state_calls = 0
+        self.cancel_called = False
+
+    def get_order_state(self, order_id: str) -> dict[str, Any]:
+        self.get_order_state_calls += 1
+        if self._raise_on_poll:
+            raise RuntimeError("network error during poll")
+        if len(self._sequence) > 1:
+            return self._sequence.pop(0)
+        return self._sequence[0]
+
+    def cancel_order(self, order_id: str) -> bool:
+        self.cancel_called = True
+        return True
+
+    def wait_for_order_terminal_cancel(
+        self, order_id: str, *, timeout_seconds: float, poll_interval_seconds: float
+    ) -> bool:
+        return self._cancel_confirmed
+
+    def get_position(self, symbol: str) -> float:
+        return self._position_qty
+
+
+def _run_probe_cleanup(broker: Any, **place_overrides: Any):
+    return _place_probe_and_confirm_cleanup(
+        broker,
+        symbol=BTC,
+        place_fn=lambda: _pending_place_result(**place_overrides),
+        expected_order_type="limit",
+        expected_side="buy",
+        expected_time_in_force="gtc",
+        expected_qty=0.0001,
+        expected_price_fields={"confirmed_limit_price": 30_000.0},
+        cancel_confirm_timeout_seconds=_FAST_CANCEL_TIMEOUT_SECONDS,
+        cancel_confirm_poll_interval_seconds=_FAST_CANCEL_POLL_INTERVAL_SECONDS,
+    )
+
+
+def test_probe_cleanup_accepts_pending_new_that_resolves_to_new() -> None:
+    """get_order_state returns pending_new initially, then new on a
+    subsequent poll -- the probe must be accepted, not rejected on the
+    stale initial snapshot."""
+    broker = _FakePollingBroker(
+        order_state_sequence=[
+            {"status": "new", "filled_qty": 0.0, "filled_avg_price": 0.0},
+        ],
+    )
+    ok, reason, detail = _run_probe_cleanup(broker)
+    assert ok is True
+    assert reason is None
+    assert detail["status"] == "new"
+    assert broker.get_order_state_calls >= 1
+    assert broker.cancel_called is True
+
+
+def test_probe_cleanup_rejects_pending_new_that_never_resolves() -> None:
+    """get_order_state keeps returning pending_new on every poll until the
+    cancel-confirm timeout elapses -- the probe must be rejected, and no
+    cancel should be attempted against a never-resting order."""
+    broker = _FakePollingBroker(
+        order_state_sequence=[
+            {"status": "pending_new", "filled_qty": 0.0, "filled_avg_price": 0.0},
+        ],
+    )
+    ok, reason, detail = _run_probe_cleanup(broker)
+    assert ok is False
+    assert reason is not None
+    assert "rejected the probe" in reason
+    assert detail["status"] == "pending_new"
+    assert broker.get_order_state_calls >= 1
+    assert broker.cancel_called is False
+
+
+def test_probe_cleanup_rejects_using_stale_status_when_polling_raises() -> None:
+    """get_order_state raises during polling -- the poll loop must break
+    (not crash) and reject using the last known (stale, pre-exception)
+    status, never treat an API error as a resting/accepted order."""
+    broker = _FakePollingBroker(raise_on_poll=True)
+    ok, reason, detail = _run_probe_cleanup(broker)
+    assert ok is False
+    assert reason is not None
+    assert "rejected the probe" in reason
+    # Stale pre-exception status is preserved, not corrupted by the failure.
+    assert detail["status"] == "pending_new"
+    assert broker.cancel_called is False
 
 
 # ── _check_stop_limit_acceptance ────────────────────────────────────────────
