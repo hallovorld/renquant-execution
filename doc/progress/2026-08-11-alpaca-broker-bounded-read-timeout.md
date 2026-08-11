@@ -13,9 +13,13 @@ its socket semantics are byte-for-byte unchanged.
 WHY/DIR: closes the P-BROKER-CONNECT single-blip abort (2026-08-11 07:00 intraday
 cycle lost, no orders for ~12 min). Pairs with the renquant-pipeline
 P-BROKER-CONNECT bounded-retry PR (#286): the pipeline retries
-`connect()`+`get_account_value()` a bounded 3× and those retries only stay well
-under the ~12-min intraday cadence BECAUSE this change makes each attempt fail in
-seconds rather than ~82s. Neither is complete alone; the umbrella advances both
+`connect()`+`get_account_value()` a bounded 3×, which is only defensible
+because this change bounds NO-PROGRESS stalls — the failure mode actually
+observed (a socket delivering nothing for ~82s). It is NOT a wall-clock cap on
+every cycle: Requests' `timeout` is an inactivity timer, so a peer that keeps
+trickling bytes outlasts it indefinitely
+`[VERIFIED — measured 30.1s of wall clock under `timeout=(5,10)` against a
+local server sending 1 byte every 2s; the read timer never fired]`. Neither is complete alone; the umbrella advances both
 subrepo pins in one cutover.
 
 EVIDENCE:
@@ -88,7 +92,7 @@ artifact:      src/renquant_execution/alpaca_broker.py (`_bounded_account_timeou
 prod or exp:   prod (production broker adapter); change confined to the two account-read calls' socket timeout, applied by wrapping the session's `request` only inside that context
 existing data: yes — the defect was read from a live fleet log (`intraday_104` 2026-08-11 07:00→07:01, `read timeout=None`); no data generated
 best-known?:   yes — wrap-not-replace is the minimal surface that reaches the SDK's internal `session.request` WITHOUT dropping any session state; strictly better than the earlier replace-the-session variant Codex rejected (which reset proxies/verify/cert/cookies/hooks/params/auth)
-scope:         "this is src/renquant_execution/alpaca_broker.py `_bounded_account_timeout` (prod), vs existing best = today's UNBOUNDED account read (`timeout=None`, ~82s OS-TCP hang); the wrap bounds only the two preflight reads to (5s,10s) and leaves order submission byte-for-byte unchanged"
+scope:         "this is src/renquant_execution/alpaca_broker.py `_bounded_account_timeout` (prod), vs existing best = today's UNBOUNDED account read (`timeout=None`, ~82s OS-TCP hang); the wrap bounds no-progress connect/read stalls on the two preflight reads to (5s,10s) — an inactivity bound, not a wall-clock bound on the whole request — and leaves order submission byte-for-byte unchanged"
 
 NEXT: land alongside the pipeline P-BROKER-CONNECT retry PR (#286); the umbrella
 advances both subrepo pins together so the intraday preflight gets fast-failing
