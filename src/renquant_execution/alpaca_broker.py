@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -45,6 +46,66 @@ from .crypto import (
     snap_qty_to_increment,
     validate_crypto_order,
 )
+
+
+# Bounded (connect, read) timeout for the account-read calls the
+# P-BROKER-CONNECT preflight makes (``connect()`` / ``get_account_value()``).
+# The alpaca-py ``RESTClient`` builds every HTTP call with NO ``timeout`` key
+# (``alpaca/common/rest.py::_one_request`` -> ``self._session.request(...)``),
+# so ``requests`` defaults to ``timeout=None`` and a stalled socket hangs until
+# the OS-level TCP timeout (~82s observed on the 2026-08-11 07:00 intraday abort:
+# ``read timeout=None``) before the preflight can even fail. A bounded default
+# makes a stalled read fail FAST so the pipeline's bounded connect-retry can act
+# well within the intraday cadence. Values chosen deliberately: a healthy Alpaca
+# ``GET /v2/account`` returns in well under a second, so 5s connect / 10s read is
+# ample slack for a transient blip without tolerating an open-ended hang.
+_DEFAULT_BROKER_CONNECT_TIMEOUT_SECONDS = 5.0
+_DEFAULT_BROKER_READ_TIMEOUT_SECONDS = 10.0
+
+# Cache for the lazily-built ``requests.Session`` subclass. Built on first use
+# (inside a connected broker) rather than at module import, so importing
+# ``renquant_execution`` still needs neither ``requests`` nor the ``alpaca``
+# extra -- consistent with this module's lazy ``alpaca`` import (paper/shadow
+# orchestration import it without the broker SDK installed).
+_BOUNDED_TIMEOUT_SESSION_CLS: type | None = None
+
+
+def _bounded_timeout_session_class() -> type:
+    """Lazily build (once) the ``requests.Session`` subclass that injects a
+    bounded ``(connect, read)`` timeout into any request lacking one.
+
+    Why a substituted session at all: the alpaca-py SDK exposes NO timeout knob
+    on ``TradingClient`` / the base ``RESTClient`` ([VERIFIED] alpaca-py 0.43.5)
+    -- it issues every call as ``self._session.request(method, url, **opts)``
+    with ``opts`` carrying only ``headers`` / ``allow_redirects`` /
+    ``params`` | ``json``, never a ``timeout``. Rather than fork or monkeypatch
+    the SDK request loop, we replace the session object and supply the default
+    from here. ``requests`` is imported here (not at module top) because it only
+    ships with the ``alpaca`` extra, and this class is only ever needed AFTER
+    ``connect()`` has already imported the SDK.
+
+    The default is applied ONLY while ``default_timeout`` is set (armed by
+    :meth:`AlpacaBroker._bounded_account_timeout` around the two account-read
+    calls the preflight exercises). It stays ``None`` for every other call --
+    notably order submission -- so those keep their existing, unbounded socket
+    semantics byte-for-byte. A caller that passes its own ``timeout`` wins.
+    """
+    global _BOUNDED_TIMEOUT_SESSION_CLS
+    if _BOUNDED_TIMEOUT_SESSION_CLS is None:
+        import requests
+
+        class _BoundedTimeoutSession(requests.Session):
+            def __init__(self, *args: Any, default_timeout: Any = None, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.default_timeout = default_timeout
+
+            def request(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+                if self.default_timeout is not None and kwargs.get("timeout") is None:
+                    kwargs["timeout"] = self.default_timeout
+                return super().request(*args, **kwargs)
+
+        _BOUNDED_TIMEOUT_SESSION_CLS = _BoundedTimeoutSession
+    return _BOUNDED_TIMEOUT_SESSION_CLS
 
 
 @dataclass(frozen=True)
@@ -114,12 +175,21 @@ class AlpacaBroker(BaseBroker):
         env_prefix: str = "ALPACA",
         label: str | None = None,
         crypto_asset_specs: dict[str, CryptoAssetSpec] | None = None,
+        connect_timeout_seconds: float = _DEFAULT_BROKER_CONNECT_TIMEOUT_SECONDS,
+        read_timeout_seconds: float = _DEFAULT_BROKER_READ_TIMEOUT_SECONDS,
     ) -> None:
         self.api_key = api_key
         self.secret_key = secret_key
         self.paper = bool(paper)
         self.env_prefix = env_prefix
         self.label = label
+        # Bounded (connect, read) timeout armed only around the preflight
+        # account-read calls (connect / get_account_value); see
+        # _bounded_timeout_session_class and _bounded_account_timeout.
+        # Order-submission calls are never armed, so their socket semantics are
+        # unchanged.
+        self._connect_timeout = float(connect_timeout_seconds)
+        self._read_timeout = float(read_timeout_seconds)
         self._trading_client: Any | None = None
         self._account: Any | None = None
         # Cache of symbol -> fractionable (Alpaca asset attribute). Avoids a
@@ -153,7 +223,13 @@ class AlpacaBroker(BaseBroker):
             )
 
         self._trading_client = TradingClient(api_key, secret_key, paper=self.paper)
-        self._account = self._trading_client.get_account()
+        # Give the account-read calls a bounded read/connect timeout so a
+        # stalled Alpaca socket fails FAST instead of hanging on the OS TCP
+        # timeout (the 2026-08-11 07:00 P-BROKER-CONNECT abort). Scoped to the
+        # preflight account reads only -- order submission stays unbounded.
+        self._install_bounded_timeout_session()
+        with self._bounded_account_timeout():
+            self._account = self._trading_client.get_account()
 
         if not self.paper:
             expected_account = os.environ.get("RENQUANT_EXPECTED_LIVE_ACCOUNT")
@@ -200,7 +276,12 @@ class AlpacaBroker(BaseBroker):
         return account_id
 
     def get_account_value(self) -> float:
-        account = self._refresh_account()
+        # Bounded-timeout scope: this is one of the two P-BROKER-CONNECT
+        # preflight reads. Arming here (not inside _refresh_account) keeps every
+        # other _refresh_account caller -- e.g. _assert_account_active on the
+        # order path -- at its existing, unbounded behaviour.
+        with self._bounded_account_timeout():
+            account = self._refresh_account()
         return float(getattr(account, "portfolio_value", 0.0))
 
     def get_cash(self) -> float:
@@ -1725,6 +1806,59 @@ class AlpacaBroker(BaseBroker):
         if self._trading_client is None:
             raise RuntimeError("AlpacaBroker is not connected")
         return self._trading_client
+
+    def _install_bounded_timeout_session(self) -> None:
+        """Swap the trading client's HTTP session for the bounded-timeout
+        ``requests.Session`` subclass (:func:`_bounded_timeout_session_class`).
+
+        The replacement starts UNARMED (``default_timeout=None``), so it is
+        behaviourally identical to the SDK's own ``requests.Session`` for every
+        call -- including order submission -- until
+        :meth:`_bounded_account_timeout` arms it for a preflight account read.
+        Any headers the SDK configured are carried over. This never fails the
+        broker: if the SDK's session cannot be read/replaced we leave it as-is
+        (the calls just run unbounded, i.e. today's behaviour).
+        """
+        cls = _bounded_timeout_session_class()
+        client = self._trading_client
+        old = getattr(client, "_session", None)
+        if isinstance(old, cls):
+            return
+        new = cls(default_timeout=None)
+        if old is not None:
+            try:
+                new.headers.update(getattr(old, "headers", {}) or {})
+            except Exception:  # noqa: BLE001 -- header copy is best-effort
+                pass
+        try:
+            client._session = new
+        except Exception:  # noqa: BLE001 -- never fail the broker over this
+            pass
+
+    @contextmanager
+    def _bounded_account_timeout(self) -> Any:
+        """Temporarily arm the bounded ``(connect, read)`` timeout on the
+        trading client's HTTP session for the duration of a preflight account
+        read (``connect()`` / ``get_account_value()``), then restore the prior
+        state.
+
+        Scoped deliberately: order-submission calls never execute inside this
+        context, so their socket semantics are unchanged. If the SDK session is
+        not the bounded subclass (SDK internals changed, or install failed),
+        this is a no-op that runs the call unbounded -- a resilience
+        optimisation must never itself become a new failure mode.
+        """
+        cls = _bounded_timeout_session_class()
+        session = getattr(self._trading_client, "_session", None)
+        if not isinstance(session, cls):
+            yield
+            return
+        previous = session.default_timeout
+        session.default_timeout = (self._connect_timeout, self._read_timeout)
+        try:
+            yield
+        finally:
+            session.default_timeout = previous
 
 
 def _is_not_found_error(exc: Exception) -> bool:
